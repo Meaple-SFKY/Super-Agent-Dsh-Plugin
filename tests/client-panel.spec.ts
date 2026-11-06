@@ -692,6 +692,8 @@ describe('setup wizard state machine', () => {
     expect(internals.canAdvance(1, wizard)).toBe(false)
     wizard.github = { ...wizard.github, selected: ['acme/widgets'], operator: 'alice' }
     expect(internals.canAdvance(1, wizard)).toBe(true)
+    wizard.github = { ...wizard.github, status: 'validated', selected: ['*'], operator: 'alice' }
+    expect(internals.canAdvance(1, wizard)).toBe(true)
     wizard.github = { ...wizard.github, operator: '' }
     expect(internals.canAdvance(1, wizard)).toBe(false)
     wizard.github = { ...wizard.github, operator: 'alice' }

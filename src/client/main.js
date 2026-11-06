@@ -232,7 +232,11 @@ function build(require) {
     'github.identityNote': '提交与 PR 会以上面的 bot 账号身份出现；你的个人账号只作为 collaborator 与触发者。',
     'github.private': '私有',
     'github.pushed': '最近推送',
-    'github.emptyRepos': '这个 token 看不到任何仓库；确认授权范围。',
+    'github.emptyRepos': '这个 token 看不到任何仓库；可以监听全部可见仓库（*），bot 获得权限后会自动发现。',
+    'github.allRepos': '全部可见仓库（*）',
+    'github.allReposHint': '适合个人使用；bot 以后被邀请进新仓库时会自动纳入监听。',
+    'github.useAllRepos': '监听全部可见仓库（*）',
+    'github.emptyWildcard': '未发现可列出的仓库：已选择监听全部可见仓库（*），bot 获得仓库权限后会自动加入。',
     'github.skip': '先跳过 GitHub',
     'github.skipped': '已跳过 GitHub，本次不会启用该来源。',
     'github.error': '校验失败',
@@ -521,7 +525,11 @@ function build(require) {
     'github.identityNote': 'Commits and pull requests appear as the bot account above; your personal account only acts as the collaborator and trigger.',
     'github.private': 'Private',
     'github.pushed': 'Last push',
-    'github.emptyRepos': 'This token cannot see any repository; check its access scope.',
+    'github.emptyRepos': 'This token cannot see any repository; you can watch all visible repositories (*) and they will be discovered once the bot gains access.',
+    'github.allRepos': 'All visible repositories (*)',
+    'github.allReposHint': 'Good for personal use; repositories the bot is invited to later are picked up automatically.',
+    'github.useAllRepos': 'Watch all visible repositories (*)',
+    'github.emptyWildcard': 'No repositories are listed: all visible repositories (*) are selected and will be discovered once the bot gains access.',
     'github.skip': 'Skip GitHub for now',
     'github.skipped': 'GitHub skipped; this source stays disabled.',
     'github.error': 'Validation failed',
@@ -945,7 +953,7 @@ function build(require) {
         status: github.configured === true ? 'validated' : 'idle',
         login: typeof github.login === 'string' ? github.login : '',
         repositories,
-        selected: [...existing],
+        selected: existing.length === 0 && github.configured === true ? ['*'] : [...existing],
         allowSelf: false,
         operator: listOf(github.allowedLogins)[0] || listOf(github.collaborators)[0] || '',
         personalToken: '',
@@ -2662,7 +2670,13 @@ function build(require) {
         'div',
         null,
         repositories.length === 0
-          ? h('div', { className: 'sa-note', style: { marginTop: 8 } }, t('github.emptyRepos'))
+          ? h('div', { className: 'sa-note', style: { marginTop: 8 } },
+              h('div', null, t('github.emptyRepos')),
+              h('div', { style: { marginTop: 8 } },
+                h(Button, {
+                  size: 'sm',
+                  onClick: () => patchGithub({ selected: ['*'] }),
+                }, t('github.useAllRepos'))))
           : h(
               'div',
               null,
@@ -2692,8 +2706,16 @@ function build(require) {
               h(
                 'div',
                 { className: 'sa-repolist' },
+                h(CheckboxRow, {
+                  key: '*',
+                  title: t('github.allRepos'),
+                  meta: t('github.allReposHint'),
+                  checked: selectedSet.has('*'),
+                  onChange: on => toggle('*', on),
+                }),
                 filtered.length === 0
-                  ? h('div', { className: 'sa-note', style: { padding: 10 } }, t('github.emptyRepos'))
+                  ? h('div', { className: 'sa-note', style: { padding: 10 } },
+                      selectedSet.has('*') ? t('github.emptyWildcard') : t('github.emptyRepos'))
                   : filtered.map(repo =>
                       h(CheckboxRow, {
                         key: repo.fullName,
@@ -3469,7 +3491,10 @@ function build(require) {
       const repositories = listOf(data.repositories).map(repoEntry).filter(Boolean)
       setWizard(current => {
         const existing = new Set(current.github.selected)
-        const selected = repositories.map(repo => repo.fullName).filter(name => existing.has(name))
+        const wildcard = existing.has('*') || repositories.length === 0
+        const selected = wildcard
+          ? ['*']
+          : repositories.map(repo => repo.fullName).filter(name => existing.has(name))
         return {
           ...current,
           github: {
