@@ -219,6 +219,8 @@ export interface Report {
   /** A concrete question for a person, required for `blocked`. */
   question?: string
   pullRequest?: PullRequestRef
+  /** Local files the worker produced and wants delivered to the user. */
+  files?: Array<{ path: string; name?: string; caption?: string; kind?: 'photo' | 'document' }>
   facts?: Record<string, unknown>
 }
 
@@ -286,6 +288,15 @@ export interface Ticket {
 // Messages and receipts
 // ---------------------------------------------------------------------------
 
+export interface OutboundAttachment {
+  kind: 'photo' | 'document'
+  /** Absolute local path of the file to send. */
+  path: string
+  name?: string
+  caption?: string
+  mime?: string
+}
+
 export type ReplyPurpose =
   | 'acknowledgement'
   | 'answer'
@@ -301,6 +312,8 @@ export interface OutboundMessage {
   channel: ChannelAddress
   text: string
   markdown?: 'plain' | 'telegram' | 'github'
+  /** Files to send with the message, when the Source supports them. */
+  attachments?: OutboundAttachment[]
   at: IsoTime
   meta?: Record<string, unknown>
 }

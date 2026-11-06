@@ -37,6 +37,7 @@ import type {
   Input,
   IsoTime,
   Mandate,
+  OutboundAttachment,
   OutboundMessage,
   Policy,
   Reason,
@@ -156,6 +157,10 @@ export interface EngineDeps {
 
 const DEFAULT_EVAL_TIMEOUT_MS = 10 * 60_000
 const DEFAULT_MESSAGE_CHARS = 100
+/** Telegram (and the panel) accept at most this many files per message. */
+const MAX_ATTACHMENTS = 10
+/** Caption bound accepted by Telegram for one document/photo. */
+const MAX_ATTACHMENT_CAPTION = 1_024
 
 /** Ticket stages' retry/recovery note. */
 const RECOVERY_NOTE =
@@ -890,7 +895,7 @@ export class Engine implements EnginePort {
         case 'waiting':
           break
         case 'ready':
-          this.queueAttention(ticket, 'result', this.readyText(reportInput), now)
+          this.queueAttention(ticket, 'result', this.readyText(reportInput), now, reportInput)
           this.enqueueRelay(ticket, assignment, reportInput, now)
           // A `ready` Report is terminal for the Ticket: the work is done.
           // Waiting for `followsDone` left Tickets "awaiting review" forever
@@ -904,11 +909,11 @@ export class Engine implements EnginePort {
           )
           break
         case 'blocked':
-          this.queueAttention(ticket, 'attention', this.blockedText(reportInput), now)
+          this.queueAttention(ticket, 'attention', this.blockedText(reportInput), now, reportInput)
           this.enqueueRelay(ticket, assignment, reportInput, now)
           break
         case 'failed':
-          this.queueAttention(ticket, 'attention', this.failedText(reportInput), now)
+          this.queueAttention(ticket, 'attention', this.failedText(reportInput), now, reportInput)
           this.enqueueRelay(ticket, assignment, reportInput, now)
           break
         case 'dropped':
@@ -1529,9 +1534,16 @@ export class Engine implements EnginePort {
     return latest?.closed?.outcome ?? 'completed'
   }
 
-  private queueAttention(ticket: Ticket, purpose: 'result' | 'attention', text: string, now: IsoTime): void {
+  private queueAttention(
+    ticket: Ticket,
+    purpose: 'result' | 'attention',
+    text: string,
+    now: IsoTime,
+    report?: Report,
+  ): void {
     const channel = ticket.channels[0]
     if (channel === undefined) return
+    const attachments = report === undefined ? undefined : this.attachmentsOf(report)
     this.outbox.queue({
       id: this.newId('msg'),
       ticketId: ticket.id,
@@ -1539,8 +1551,32 @@ export class Engine implements EnginePort {
       channel,
       text: truncate(text, this.maxMessageChars),
       markdown: 'plain',
+      ...(attachments === undefined ? {} : { attachments }),
       at: now,
     })
+  }
+
+  /**
+   * The files a Report wants delivered to the person. The Engine does not read
+   * paths (the Source decides whether a file can be sent); it only normalizes
+   * the shape: absolute paths, `document` unless the worker said `photo`, at
+   * most ten entries, captions cut to a messenger-friendly length.
+   */
+  private attachmentsOf(report: Report): OutboundAttachment[] | undefined {
+    const files = report.files
+    if (files === undefined || files.length === 0) return undefined
+    const attachments: OutboundAttachment[] = []
+    for (const file of files) {
+      if (attachments.length >= MAX_ATTACHMENTS) break
+      if (typeof file.path !== 'string' || file.path.trim() === '') continue
+      attachments.push({
+        kind: file.kind === 'photo' ? 'photo' : 'document',
+        path: file.path,
+        ...(file.name === undefined ? {} : { name: file.name }),
+        ...(file.caption === undefined ? {} : { caption: truncate(file.caption, MAX_ATTACHMENT_CAPTION) }),
+      })
+    }
+    return attachments.length === 0 ? undefined : attachments
   }
 
   private enqueueRelay(ticket: Ticket, assignment: Assignment, report: Report, now: IsoTime): void {

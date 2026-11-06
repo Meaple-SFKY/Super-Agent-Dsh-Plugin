@@ -598,3 +598,163 @@ describe('language', () => {
     expect(text.endsWith('…')).toBe(true)
   })
 })
+
+describe('report attachments', () => {
+  it('maps report files to message attachments on a ready report', () => {
+    const harness = localizedHarness('en')
+    const ticket = acceptTrigger(harness, 'tr_1')
+    const assignment = startAssignment(harness, ticket)
+
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: {
+        kind: 'ready',
+        summary: 'see the attached report',
+        at: harness.clock.now(),
+        files: [
+          { path: '/tmp/superagent/report.pdf', name: 'report.pdf', caption: 'the full report' },
+          { path: '/tmp/superagent/screenshot.png', kind: 'photo', caption: 'screenshot' },
+        ],
+      },
+    })
+
+    const message = harness.outbox.messages[0]!
+    // The text is unchanged by attachments.
+    expect(message.text).toBe('Ready for review: see the attached report')
+    expect(message.attachments).toEqual([
+      { kind: 'document', path: '/tmp/superagent/report.pdf', name: 'report.pdf', caption: 'the full report' },
+      { kind: 'photo', path: '/tmp/superagent/screenshot.png', caption: 'screenshot' },
+    ])
+  })
+
+  it('maps files on blocked and failed reports too', () => {
+    const harness = localizedHarness('en')
+    const ticket = acceptTrigger(harness, 'tr_1')
+    const assignment = startAssignment(harness, ticket)
+
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: {
+        kind: 'blocked',
+        summary: 'two ways to go',
+        question: 'which mock?',
+        at: harness.clock.now(),
+        files: [{ path: '/tmp/superagent/diff.txt' }],
+      },
+    })
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: {
+        kind: 'failed',
+        summary: 'the build log explains it',
+        at: harness.clock.now(),
+        files: [{ path: '/tmp/superagent/build.log', name: 'build.log' }],
+      },
+    })
+
+    expect(harness.outbox.messages[0]?.attachments).toEqual([{ kind: 'document', path: '/tmp/superagent/diff.txt' }])
+    expect(harness.outbox.messages[1]?.attachments).toEqual([
+      { kind: 'document', path: '/tmp/superagent/build.log', name: 'build.log' },
+    ])
+  })
+
+  it('does not add an attachments field when the report has no files', () => {
+    const harness = localizedHarness('en')
+    const ticket = acceptTrigger(harness, 'tr_1')
+    const assignment = startAssignment(harness, ticket)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: { kind: 'ready', summary: 'plain result', at: harness.clock.now() },
+    })
+
+    const message = harness.outbox.messages[0]!
+    expect(message.text).toBe('Ready for review: plain result')
+    expect('attachments' in message).toBe(false)
+    expect(message.attachments).toBeUndefined()
+  })
+
+  it('keeps at most ten attachments, in report order', () => {
+    const harness = localizedHarness('en')
+    const ticket = acceptTrigger(harness, 'tr_1')
+    const assignment = startAssignment(harness, ticket)
+    const files = Array.from({ length: 14 }, (_value, index) => ({
+      path: `/tmp/superagent/file-${index}.txt`,
+      name: `file-${index}.txt`,
+    }))
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: { kind: 'ready', summary: 'many files', at: harness.clock.now(), files },
+    })
+
+    const attachments = harness.outbox.messages[0]!.attachments!
+    expect(attachments).toHaveLength(10)
+    expect(attachments[0]?.path).toBe('/tmp/superagent/file-0.txt')
+    expect(attachments[9]?.path).toBe('/tmp/superagent/file-9.txt')
+  })
+
+  it('skips files without a usable path and drops attachments when none survive', () => {
+    const harness = localizedHarness('en')
+    const ticket = acceptTrigger(harness, 'tr_1')
+    const assignment = startAssignment(harness, ticket)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: {
+        kind: 'ready',
+        summary: 'only junk',
+        at: harness.clock.now(),
+        files: [{ path: '   ' }, { path: '' }] as unknown as Array<{ path: string }>,
+      },
+    })
+
+    expect(harness.outbox.messages[0]?.attachments).toBeUndefined()
+  })
+
+  it('truncates long captions without touching the message text', () => {
+    const harness = localizedHarness('en')
+    const ticket = acceptTrigger(harness, 'tr_1')
+    const assignment = startAssignment(harness, ticket)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: {
+        kind: 'ready',
+        summary: 'long caption',
+        at: harness.clock.now(),
+        files: [{ path: '/tmp/superagent/log.txt', caption: 'x'.repeat(4_000) }],
+      },
+    })
+
+    const attachment = harness.outbox.messages[0]!.attachments![0]!
+    expect(attachment.caption).toBeDefined()
+    expect(attachment.caption!.length).toBe(1_024)
+    expect(attachment.caption!.endsWith('…')).toBe(true)
+    expect(harness.outbox.messages[0]!.text).toBe('Ready for review: long caption')
+  })
+
+  it('keeps the message text truncation independent of attachments', () => {
+    const harness = localizedHarness('en', { maxMessageChars: 30 })
+    const ticket = acceptTrigger(harness, 'tr_1')
+    const assignment = startAssignment(harness, ticket)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: {
+        kind: 'ready',
+        summary: 's'.repeat(200),
+        at: harness.clock.now(),
+        files: [{ path: '/tmp/superagent/report.pdf' }],
+      },
+    })
+
+    const message = harness.outbox.messages[0]!
+    expect(message.text).toHaveLength(30)
+    expect(message.text.endsWith('…')).toBe(true)
+    expect(message.attachments).toHaveLength(1)
+  })
+})
