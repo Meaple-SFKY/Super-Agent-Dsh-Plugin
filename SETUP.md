@@ -4,7 +4,7 @@
 
 - 目标环境：macOS，DeepSeek Harness 0.2.2-rc.1（`engines.dsh` 限定 `>=0.2.2-rc.1 <0.3.0`），Node 22.19+ / 24+。
 - 所有命令都在本仓库根目录执行。不要编辑 `~/.dsh/profiles/<profile>/` 里除 `cordis.patch.yml` 之外的任何文件。
-- 密钥**只**放环境变量或 `~/.config/superagent/*` 的 600 文件里。不要贴进聊天、Issue、日志或本仓库。
+- 密钥**只**放环境变量或 `~/.dsh/state/superagent/secrets/*` 的 600 文件里。不要贴进聊天、Issue、日志或本仓库。
 
 ## 0. 前置条件
 
@@ -29,9 +29,9 @@
 3. 拿到后立刻保存为本地文件（**如果打算用面板向导，可跳过这一步**：向导会在校验通过后自动写入 `<stateDir>/secrets/telegram-token`）：
 
 ```sh
-mkdir -p ~/.config/superagent && chmod 700 ~/.config/superagent
-printf '%s' '<token>' > ~/.config/superagent/telegram-token
-chmod 600 ~/.config/superagent/telegram-token
+mkdir -p ~/.dsh/state/superagent/secrets && chmod 700 ~/.dsh/state/superagent/secrets
+printf '%s' '<token>' > ~/.dsh/state/superagent/secrets/telegram-token
+chmod 600 ~/.dsh/state/superagent/secrets/telegram-token
 ```
 
 4. 获取你自己的 Telegram 数字 id（不是用户名）：给 [@userinfobot](https://t.me/userinfobot) 发任意消息，它会回复 `Id: 123456789`。这个数字填进配置的 `allowedUserIds`，只有名单里的人能让 agent 接活。
@@ -50,8 +50,8 @@ chmod 600 ~/.config/superagent/telegram-token
 4. 生成后同样只显示一次，保存（或用面板向导在 GitHub 步骤里粘贴，由向导写入 `<stateDir>/secrets/github-token`）：
 
 ```sh
-printf '%s' '<github_pat>' > ~/.config/superagent/github-token
-chmod 600 ~/.config/superagent/github-token
+printf '%s' '<github_pat>' > ~/.dsh/state/superagent/secrets/github-token
+chmod 600 ~/.dsh/state/superagent/secrets/github-token
 ```
 
 5. 记下 token 属于哪个 GitHub 账号（`login`），填进配置的 `login`。不要用主账号的经典 token；专用账号或最小 scope 的 fine-grained PAT 更安全。
@@ -61,6 +61,33 @@ chmod 600 ~/.config/superagent/github-token
    - 面板向导的 GitHub 步骤有一个「我使用自己的 GitHub 账号（允许我自己的事件触发）」复选框，勾选即写入 `sources.github.allowSelf: true`；默认不勾（安全）。
 
 > 环境变量方式（`SUPERAGENT_TELEGRAM_TOKEN` / `SUPERAGENT_GITHUB_TOKEN`）也可用，但 macOS 桌面版从 Dock/Spotlight 启动时通常**不继承** shell 环境变量。长期运行优先用 `tokenFile`，或把变量写进启动 DSH 的 LaunchAgent。`scripts/setup.mjs` 只检查“有没有”，从不打印值。
+
+### 1.3 专用 GitHub 账号（可选，推荐长期自主使用）
+
+日常用个人账号、又不想让 agent 的评论/PR 顶着你的名字出现时，给 agent 建一个专用 GitHub 账号。**向导会自动完成绝大多数配置，不需要手写 SSH key。**
+
+- **commits / PR / review 以 bot 账号身份出现**，你的个人账号只作为 collaborator 审批/验收，并作为 `allowedLogins` 的触发者；
+- 面板会显示「插件自动完成 / 需要你手动」两张清单，做完手动项即可；
+- SSH 密钥由插件生成，你只需要复制公钥到 bot 账号。
+
+步骤：
+
+1. **创建 bot 账号**：新 GitHub 账号，开启 2FA，完成邮箱/人机验证。记录登录名，例如 `acme-superagent`。
+2. **用 bot 账号创建 fine-grained PAT**：Contents / Issues / Pull requests 读写；看 CI 再加 Checks 或 Actions 只读；只授权目标仓库。
+3. **邀请 bot 到现有仓库**：现有仓库 → Settings → Collaborators → 加 bot 账号并给 **Write**（bot 账号登录接受）。若让 bot 新建仓库，向导会把个人账号填进 `sources.github.collaborators` 自动邀请你。
+4. **打开面板 → 设置 → GitHub**：
+   - 填「你的个人 GitHub 登录名」（个人账号）和「bot 的 fine-grained PAT」；
+   - 可选填「你的个人 PAT」：用于自动接受仓库邀请/把 bot 加入现有仓库（只在本机使用，不写入配置、不回显）；
+   - 校验通过后选择要监听的仓库。
+5. **展开「高级（SSH 密钥 / 已有密钥）」→ 点「生成 SSH 密钥」**：插件生成本机私钥并返回公钥；点复制或“打开 GitHub SSH keys”，**用 bot 账号**粘贴公钥保存。私钥只留在本机，不要提交、不要发到聊天里。已有私钥时可在「使用已有密钥路径」填绝对路径（fallback，可留空）。
+6. **保存配置**：向导会自动写入 `sources.github.login = bot`、`allowedLogins = [你的个人账号]`、`collaborators = [你的个人账号]`、`allowSelf = false`，并把 `executor.gitSshKeyFile` 指向生成的私钥；git 提交身份（name/email）由 runtime 用 bot 登录名与 `<login>@users.noreply.github.com` 自动推导。
+7. **验收**：用个人账号在 Issue / PR 里 @ bot，确认 bot 接单、提交与 PR 以 bot 身份出现；个人账号作为 collaborator 收到 review 请求。
+
+> 插件还会：自动邀请个人账号为 collaborator、在提供个人 PAT 时自动接受 bot 的仓库邀请、自动配置 clone/push 的提交身份、写 0600 token 文件并生成 git 凭据；自动接受邀请由 sources 持续完善，未提供个人 PAT 时需要你手动接受一次邀请。
+>
+> 手动兜底（高级，通常不需要）：`ssh-keygen -t ed25519 -C "superagent-bot" -f ~/.ssh/superagent_bot -N ''`，把 `.pub` 加到 bot 账号 Settings → SSH and GPG keys，然后把 `executor.gitSshKeyFile` 指向该私钥路径。
+
+> 专用 bot 账号是**可选**的：默认单账号模式（用你自己的 PAT）也能完整工作，只是提交/评论会以你的身份出现。只有希望审计区分、长期自主运行或公开仓库时才建议切换。
 
 ## 2. 安装 bundle
 
@@ -107,7 +134,7 @@ dsh plugin --profile "$PROFILE" add "link:$PWD"
 装好 bundle 并重启 DSH 后，打开左侧栏 **Superagent → 设置**，按向导三步完成，**不需要手改 YAML**：
 
 1. **Telegram**：粘贴 @BotFather 的 token → 校验 → 显示 bot 用户名和 Start 链接（bot 不能主动发起会话，需你先点 Start）。
-2. **GitHub**：粘贴 fine-grained PAT → 校验 → 勾选要监听的仓库；如果你就是 agent 账号，勾选「我使用自己的 GitHub 账号（允许我自己的事件触发）」（写入 `allowSelf`）。
+2. **GitHub**：填个人 GitHub 登录名与 bot 的 fine-grained PAT → 校验 → 勾选要监听的仓库；使用专用 bot 账号时展开「高级（SSH 密钥 / 已有密钥）」点「生成 SSH 密钥」，把公钥复制到 bot 账号的 GitHub SSH keys（见 §1.3）。
 3. **行为**：填允许的 Telegram user id、选择 `observe`（先观察，推荐）或 `auto`、设置并行 Worker 数。
 4. **完成**：保存后插件自动重启；向导轮询到 `plugin.status=ready` 即完成。
 
@@ -210,6 +237,9 @@ node scripts/watchdog.mjs --state-dir "$HOME/.dsh/state/superagent" --dry-run
 | `sources.github.repositories` | `[]` | `owner/name` 列表；`["*"]` 表示自动发现你可访问的全部仓库（每 10 分钟刷新） |
 | `sources.github.login` | — | token 所属账号，用于识别 @ |
 | `sources.github.allowSelf` | `false` | 允许 token 所属账号自己的 Issue/PR/评论触发工作。用自己账号当 agent 时打开；专用机器账号保持关闭（agent 自身输出仍按 marker 过滤） |
+| `sources.github.collaborators` | `[]` | bot 新建仓库时自动邀请为 collaborator 的 GitHub 登录名（通常是你的个人账号） |
+| `executor.gitSshKeyFile` | — | bot 账号的 SSH 私钥路径；向导生成后自动写入，也可手填已有私钥的绝对路径 |
+| `executor.gitName` / `gitEmail` | — | bot 账号的 git 提交作者名/邮箱；留空由 runtime 用 bot login 与 `<login>@users.noreply.github.com` 推导 |
 | `sources.github.observe*` | `false` | 是否也收未 @ 的 Issue/PR/评论/CI；建议 `observeComments`、`observeCi` 设为 `true`，否则已订阅线程的后续讨论/CI 结果收不到 |
 | `language` | `zh` | 机器人对你说话/汇报使用的语言：`zh` 或 `en`（面板 UI 语言独立） |
 | `policy.mode` | `observe` | `off` 只接明确请求；`observe` 只记录；`auto` 接推断候选 |
@@ -277,6 +307,8 @@ node scripts/watchdog.mjs --state-dir "$HOME/.dsh/state/superagent" --dry-run
 
 ## 8. 卸载
 
+> 所有 token、SSH 私钥与密钥对都保存在 `<stateDir>/secrets/` 内；删除插件时执行 `./scripts/uninstall.sh --purge-state` 会连同这些凭据一起删除，不会在 `~/.config` 等位置留下副本。
+
 ```sh
 # 1) 停看门狗（保留 state）
 ./scripts/uninstall.sh
@@ -288,4 +320,4 @@ dsh plugin --profile superagent remove dsh-superagent-personal
 ./scripts/uninstall.sh --purge-state --state-dir "$HOME/.dsh/state/superagent"
 ```
 
-撤销 Telegram bot：@BotFather → `/deletebot`。撤销 GitHub PAT：GitHub → Settings → Developer settings → Fine-grained tokens → Revoke。密钥文件删除：`rm -rf ~/.config/superagent`。
+撤销 Telegram bot：@BotFather → `/deletebot`。撤销 GitHub PAT：GitHub → Settings → Developer settings → Fine-grained tokens → Revoke。密钥文件删除：`rm -rf ~/.dsh/state/superagent/secrets`。

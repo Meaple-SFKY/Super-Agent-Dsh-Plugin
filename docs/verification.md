@@ -157,7 +157,7 @@ Tests 19 passed — verify-flow(5) + verify-plugin-boot(5) + verify-packaging(9)
 | token 泄漏 | ✅ status/heartbeat/API 响应中 grep token 前缀 0 命中 |
 | 提交与推送 | ✅ `main` 已推送到 `github.com/Meaple-SFKY/Super-Agent-Dsh-Plugin` |
 
-待完成（需要操作者）：写入 Telegram bot token、GitHub PAT（`~/.config/superagent/`，600）、填写 allowedUserIds/repositories/login，启用 sources 并重启插件；之后按 §7 复核 `/status`、真实消息链路与 watchdog 安装。
+待完成（需要操作者）：写入 Telegram bot token、GitHub PAT（`<stateDir>/secrets/`，600）、填写 allowedUserIds/repositories/login，启用 sources 并重启插件；之后按 §7 复核 `/status`、真实消息链路与 watchdog 安装。
 
 ## 9. 真机验收记录（2026-11-06 19:00–19:20，Lead）
 

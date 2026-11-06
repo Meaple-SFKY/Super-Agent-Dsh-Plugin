@@ -43,6 +43,15 @@ interface Wizard {
     repositories: Array<{ fullName: string; private?: boolean; pushedAt?: string }>
     selected: string[]
     allowSelf: boolean
+    operator: string
+    personalToken: string
+    sshKeyFile: string
+    sshKeyPublic: string
+    sshKeyGenerated: boolean
+    sshKeyExisting: boolean
+    sshKeyGenerating: boolean
+    sshKeyRestarting: boolean
+    sshKeyError: string
     error: string
     skipped: boolean
   }
@@ -70,11 +79,20 @@ interface Internals {
     language: string
     sources: {
       telegram: { enabled: boolean; tokenFile?: string; allowedUserIds?: string[] }
-      github: { enabled: boolean; tokenFile?: string; repositories?: string[]; allowSelf?: boolean }
+      github: {
+        enabled: boolean
+        tokenFile?: string
+        repositories?: string[]
+        allowSelf?: boolean
+        allowedLogins?: string[]
+        collaborators?: string[]
+        login?: string
+      }
     }
     policy: { mode: string }
-    executor: { maxWorkers: number }
+    executor: { maxWorkers: number; gitSshKeyFile?: string; gitName?: string; gitEmail?: string }
   }
+  parseList: (value: string) => string[]
   parseUserIds: (value: string) => string[]
   setupLanguage: (setup: unknown) => string
   PERMISSION_KEYS: Record<string, string>
@@ -251,6 +269,7 @@ function validatedWizard(module: FakeModule): Wizard {
     ...wizard.github,
     status: 'validated',
     login: 'agent-account',
+    operator: 'alice',
     tokenFile: '/tmp/superagent/secrets/github-token',
     repositories: [{ fullName: 'acme/widgets' }, { fullName: 'acme/docs' }],
     selected: ['acme/widgets', 'acme/docs'],
@@ -304,6 +323,7 @@ describe('src/client/main.js', () => {
       '${API}/setup/state',
       '${API}/setup/telegram',
       '${API}/setup/github',
+      '${API}/setup/github/ssh-key',
       '${API}/setup/config',
       '${API}/setup/permissions',
     ]) {
@@ -363,6 +383,60 @@ describe('src/client/main.js', () => {
     expect(source).not.toMatch(/style: \{ display: 'flex', flexDirection: 'column', gap: (12|16|20|24|28|32) \}/)
   })
 
+  it('offers SSH key generation via the setup API and keeps the advanced section closed by default', async () => {
+    const source = await readFile(join(root, 'src', 'client', 'main.js'), 'utf8')
+    expect(source).toContain('setupGithubSshKey')
+    expect(source).toContain("${API}/setup/github/ssh-key")
+    expect(source).toContain('github.generateKey')
+    expect(source).toContain('github.publicKey')
+    expect(source).toContain("'https://github.com/settings/keys'")
+    expect(source).toContain('sa-checklist')
+    expect(source).toContain('github.automationTitle')
+    expect(source).toContain('github.manualTitle')
+    expect(source).toContain('sshKeyRestarting')
+    expect(source).toContain('waitForSetupReady')
+    expect(source).toContain('github.keyExisting')
+    expect(source).toContain('git.publicKey')
+
+    const { entry } = loadClient(source)
+    const react = renderableReact()
+    const factory = entry.factory
+    if (factory === undefined) throw new Error('client module registered no factory')
+    const module = factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error(`unexpected require: ${specifier}`)
+    }) as FakeModule
+    const internals = internalsOf(module)
+    const setup = { data: setupState(), error: '', loading: false, at: '' }
+    const noop = () => undefined
+    const wizard = validatedWizard(module)
+    wizard.step = 1
+    wizard.github = { ...wizard.github, sshKeyPublic: 'ssh-ed25519 AAAA-TEST-KEY', sshKeyGenerated: true }
+
+    react.reset()
+    const tree = JSON.stringify(
+      internals.views.SetupView({
+        t: (key: string) => key,
+        wizard,
+        setup,
+        busy: '',
+        saving: false,
+        onSetWizard: noop,
+        onValidateTelegram: noop,
+        onValidateGithub: noop,
+        onSave: noop,
+        onSkipTelegram: noop,
+        onSkipGithub: noop,
+        onGenerateSshKey: noop,
+        onOpenDashboard: noop,
+        onReconfigure: noop,
+      }),
+    )
+    expect(tree).toContain('github.advanced')
+    expect(tree).toContain('github.automationTitle')
+    expect(tree).not.toContain('AAAA-TEST-KEY')
+  })
+
   it('clamps long source and health details instead of stretching cards', async () => {
     const source = await readFile(join(root, 'src', 'client', 'main.js'), 'utf8')
     expect(source).toContain('function ExpandableDetail')
@@ -405,6 +479,13 @@ describe('setup wizard state machine', () => {
     expect(wizard.behavior.mode).toBe('observe')
     expect(wizard.behavior.maxWorkers).toBe(2)
     expect(wizard.behavior.language).toBe('zh')
+    expect(wizard.github.operator).toBe('')
+    expect(wizard.github.personalToken).toBe('')
+    expect(wizard.github.sshKeyFile).toBe('')
+    expect(wizard.github.sshKeyPublic).toBe('')
+    expect(wizard.github.sshKeyGenerated).toBe(false)
+    expect(wizard.github.sshKeyExisting).toBe(false)
+    expect(wizard.github.sshKeyRestarting).toBe(false)
     expect(internalsOf(module).stepStates(wizard)).toEqual(['current', 'todo', 'todo', 'todo'])
     expect(internalsOf(module).canAdvance(0, wizard)).toBe(false)
   })
@@ -417,7 +498,23 @@ describe('setup wizard state machine', () => {
         language: 'en',
         accounts: {
           telegram: { configured: true, enabled: true, botUsername: 'demo_bot' },
-          github: { configured: true, enabled: true, login: 'agent', repositories: ['acme/widgets'], count: 1, allowSelf: true },
+          github: {
+            configured: true,
+            enabled: true,
+            login: 'agent',
+            repositories: ['acme/widgets'],
+            count: 1,
+            allowSelf: true,
+            allowedLogins: ['alice'],
+            collaborators: ['alice', 'bob'],
+          },
+        },
+        git: {
+          name: 'Superagent Bot',
+          email: 'bot@example.com',
+          sshKeyFile: '/home/me/.ssh/superagent_bot',
+          sshKeyConfigured: true,
+          publicKey: 'ssh-ed25519 AAAA-TEST user@example',
         },
       }),
     )
@@ -425,8 +522,12 @@ describe('setup wizard state machine', () => {
     expect(configured.telegram.botUsername).toBe('demo_bot')
     expect(configured.github.status).toBe('validated')
     expect(configured.github.selected).toEqual(['acme/widgets'])
-    expect(configured.github.allowSelf).toBe(true)
+    expect(configured.github.allowSelf).toBe(false)
     expect(configured.behavior.language).toBe('en')
+    expect(configured.github.operator).toBe('alice')
+    expect(configured.github.sshKeyFile).toBe('/home/me/.ssh/superagent_bot')
+    expect(configured.github.sshKeyGenerated).toBe(true)
+    expect(configured.github.sshKeyPublic).toBe('ssh-ed25519 AAAA-TEST user@example')
     expect(internals.isSetupConfigured(setupState({ accounts: { telegram: { configured: true }, github: {} } }))).toBe(true)
     expect(internals.isSetupConfigured(setupState())).toBe(false)
     expect(internals.wizardFromSetup(setupState()).behavior.language).toBe('zh')
@@ -444,8 +545,11 @@ describe('setup wizard state machine', () => {
 
     wizard.github = { ...wizard.github, status: 'validated', selected: [] }
     expect(internals.canAdvance(1, wizard)).toBe(false)
-    wizard.github = { ...wizard.github, selected: ['acme/widgets'] }
+    wizard.github = { ...wizard.github, selected: ['acme/widgets'], operator: 'alice' }
     expect(internals.canAdvance(1, wizard)).toBe(true)
+    wizard.github = { ...wizard.github, operator: '' }
+    expect(internals.canAdvance(1, wizard)).toBe(false)
+    wizard.github = { ...wizard.github, operator: 'alice' }
 
     wizard.telegram = { ...wizard.telegram, skipped: false, status: 'validated' }
     wizard.behavior = { allowedUserIds: '', mode: 'observe', maxWorkers: 2, language: 'zh' }
@@ -479,6 +583,8 @@ describe('setup wizard state machine', () => {
       allowSelf: false,
       login: 'agent-account',
       tokenFile: '/tmp/superagent/secrets/github-token',
+      allowedLogins: ['alice'],
+      collaborators: ['alice'],
     })
     expect(config.language).toBe('zh')
     expect(config.policy).toEqual({ mode: 'auto' })
@@ -498,15 +604,43 @@ describe('setup wizard state machine', () => {
     expect(internals.setupLanguage(undefined)).toBe('zh')
   })
 
-  it('writes sources.github.allowSelf when the single-account option is on', async () => {
+  it('always writes allowSelf=false for the dedicated-bot flow', async () => {
     const module = await loadModule()
     const internals = internalsOf(module)
     const wizard = validatedWizard(module)
     wizard.github = { ...wizard.github, allowSelf: true }
-    const config = internals.buildConfig(wizard)
-    expect(config.sources.github.allowSelf).toBe(true)
+    expect(internals.buildConfig(wizard).sources.github.allowSelf).toBe(false)
     // A not-yet-validated source is sent as disabled and carries no options.
     expect(internals.buildConfig(baseWizard(module)).sources.github).toEqual({ enabled: false })
+  })
+
+  it('writes the operator identity and generated SSH key path only when set', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    const wizard = validatedWizard(module)
+
+    // validatedWizard carries operator `alice`, so both lists derive from it.
+    const withOperator = internals.buildConfig(wizard)
+    expect(withOperator.sources.github.allowedLogins).toEqual(['alice'])
+    expect(withOperator.sources.github.collaborators).toEqual(['alice'])
+    expect(withOperator.executor.gitSshKeyFile).toBeUndefined()
+
+    // Empty operator / SSH path keep the existing config untouched.
+    wizard.github = { ...wizard.github, operator: '   ', sshKeyFile: '   ' }
+    const plain = internals.buildConfig(wizard)
+    expect(plain.sources.github.allowedLogins).toBeUndefined()
+    expect(plain.sources.github.collaborators).toBeUndefined()
+    expect(plain.executor.gitSshKeyFile).toBeUndefined()
+
+    // Values are trimmed before writing.
+    wizard.github = { ...wizard.github, operator: 'bob', sshKeyFile: ' /home/me/.ssh/superagent_bot ' }
+    const generated = internals.buildConfig(wizard)
+    expect(generated.sources.github.allowedLogins).toEqual(['bob'])
+    expect(generated.sources.github.collaborators).toEqual(['bob'])
+    expect(generated.executor.gitSshKeyFile).toBe('/home/me/.ssh/superagent_bot')
+    expect(generated.executor.gitName).toBeUndefined()
+    expect(generated.executor.gitEmail).toBeUndefined()
+    expect(internals.parseList('a, b a; c')).toEqual(['a', 'b', 'c'])
   })
 
   it('disables skipped sources instead of sending half a configuration', async () => {

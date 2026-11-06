@@ -25,9 +25,9 @@ import { fileURLToPath } from 'node:url'
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const TELEGRAM_ENV = 'SUPERAGENT_TELEGRAM_TOKEN'
 const GITHUB_ENV = 'SUPERAGENT_GITHUB_TOKEN'
-const CONFIG_ENV_DIR = join(homedir(), '.config', 'superagent')
-const TELEGRAM_FILE = join(CONFIG_ENV_DIR, 'telegram-token')
-const GITHUB_FILE = join(CONFIG_ENV_DIR, 'github-token')
+// All generated secrets and keys live under the plugin's own state directory,
+// so removing the state directory removes every credential too.
+const SECRETS_DIRNAME = 'secrets'
 
 const results = []
 const ok = message => results.push({ level: 'ok', message })
@@ -266,8 +266,10 @@ async function main() {
   }
 
   // -- secrets (presence only; values are never read) -----------------------
-  await checkSecret('Telegram bot token', TELEGRAM_ENV, TELEGRAM_FILE)
-  await checkSecret('GitHub token', GITHUB_ENV, GITHUB_FILE)
+  const secretsDir = join(stateDir, SECRETS_DIRNAME)
+  await mkdir(secretsDir, { recursive: true, mode: 0o700 }).catch(() => {})
+  await checkSecret('Telegram bot token', TELEGRAM_ENV, join(secretsDir, 'telegram-token'))
+  await checkSecret('GitHub token', GITHUB_ENV, join(secretsDir, 'github-token'))
 
   // -- summary --------------------------------------------------------------
   report()
@@ -282,7 +284,7 @@ async function main() {
   process.stdout.write(`  4. Restart DeepSeek Harness, open the Superagent panel, and send /status to your bot.\n`)
   process.stdout.write(`  5. When candidates look right, switch policy.mode to auto.\n`)
   process.stdout.write(`  6. Install the watchdog: ./scripts/install-launchd.sh --state-dir ${shortPath(stateDir)}\n`)
-  process.stdout.write(`\nSecrets stay in ${shortPath(CONFIG_ENV_DIR)} (mode 600) or in environment variables; never in the repo or chat.\n`)
+  process.stdout.write(`\nSecrets stay in ${shortPath(join(stateDir, SECRETS_DIRNAME))} (mode 600, inside the plugin state directory) or in environment variables; never in the repo or chat.\n`)
 
   process.exitCode = failed > 0 ? 1 : 0
 }

@@ -59,6 +59,7 @@ function build(require) {
     setupState: `${API}/setup/state`,
     setupTelegram: `${API}/setup/telegram`,
     setupGithub: `${API}/setup/github`,
+    setupGithubSshKey: `${API}/setup/github/ssh-key`,
     setupConfig: `${API}/setup/config`,
     setupPermissions: `${API}/setup/permissions`,
     permissions: `${API}/permissions`,
@@ -185,6 +186,40 @@ function build(require) {
     'github.selected': '已选 {count} 个',
     'github.allowSelf': '我使用自己的 GitHub 账号（允许我自己的事件触发）',
     'github.allowSelfHint': '默认关闭，避免 agent 自己的评论/PR 事件反过来触发新工作。大多数人用自己的账号当 agent 时需要打开；有专用机器账号时保持关闭（只处理别人的事件）。',
+    'github.advanced': '高级（SSH 密钥 / 已有密钥）',
+    'github.advancedHint': '插件会为 bot 生成专用 SSH 密钥，通常不需要打开这里；只有想复用已有私钥时才填路径。',
+    'github.generateKey': '生成 SSH 密钥',
+    'github.generatingKey': '生成中…',
+    'github.keyGenerated': '密钥已生成',
+    'github.keyMissing': '未生成密钥',
+    'github.keyExisting': '已存在密钥',
+    'github.keyRestarting': '插件重启中，正在等待就绪…',
+    'github.keyRestartTimeout': '密钥路径已保存，但插件在 60 秒内没有回到 ready；请稍后刷新或重启 DSH。',
+    'github.publicKey': '公钥（复制到 bot 账号的 SSH keys）',
+    'github.openGithubKeys': '打开 GitHub SSH keys',
+    'github.keyHint': '用 bot 账号打开上面的链接，粘贴公钥并保存。私钥只留在本机，不要提交、不要发到聊天里。',
+    'github.sshKeyFile': '使用已有密钥路径（可选）',
+    'github.sshKeyFileHint': '已有 ed25519 私钥时填绝对路径；留空则使用插件生成/默认的密钥。',
+    'github.operator': '你的个人 GitHub 登录名',
+    'github.operatorHint': '用于触发与验收；插件会写入 allowedLogins 和 collaborators。',
+    'github.operatorRequired': '请填写你的个人 GitHub 登录名后才能继续。',
+    'github.personalToken': '你的个人 PAT（可选）',
+    'github.personalTokenHint': '可选：用于自动邀请/接受仓库邀请；只在本机使用，不写入配置，也不回显。',
+    'github.personalTokenPlaceholder': 'github_pat_…（可选）',
+    'github.botTokenSection': 'bot 的 fine-grained PAT',
+    'github.automationTitle': '插件自动完成',
+    'github.auto1': '把 bot token 写成 0600 文件，并生成 git 凭据（HTTPS/PAT 或插件生成的 SSH key）',
+    'github.auto2': '把 clone/push 的提交身份设为 bot 账号',
+    'github.auto3': '把 bot 加入要监听的仓库（提供个人 PAT 时可自动接受邀请）',
+    'github.auto4': '把你（个人账号）邀请为 collaborator，并加入 allowedLogins',
+    'github.auto5': '校验 Telegram/GitHub 来源并等待插件就绪',
+    'github.manualTitle': '需要你手动',
+    'github.manual1': '注册 bot 的 GitHub 账号并开启 2FA',
+    'github.manual2': '用 bot 账号创建 fine-grained PAT（Contents/Issues/PRs 读写；CI 可选 Checks/Actions 只读）',
+    'github.manual3': '在 bot 账号里完成 GitHub 的人机验证/邮箱验证',
+    'github.manual4': '没有填个人 PAT 时：手动在 GitHub 接受 bot 的仓库邀请',
+    'github.manualAcceptHint': '不使用个人 PAT 时，邀请需要你在 GitHub 上手动接受；填了个人 PAT 可自动完成。',
+    'github.identityNote': '提交与 PR 会以上面的 bot 账号身份出现；你的个人账号只作为 collaborator 与触发者。',
     'github.private': '私有',
     'github.pushed': '最近推送',
     'github.emptyRepos': '这个 token 看不到任何仓库；确认授权范围。',
@@ -220,6 +255,7 @@ function build(require) {
     'finish.github': 'GitHub',
     'finish.mode': '接受模式',
     'finish.workers': 'Worker 数',
+    'finish.gitIdentity': 'Bot 身份',
     'finish.save': '保存并启用',
     'finish.saving': '正在保存…',
     'finish.restarting': '插件重启中，正在等待就绪…',
@@ -254,6 +290,8 @@ function build(require) {
     'permission.restart.detail': '保存配置会重启插件（DSH 配置不是 volatile 的）；向导会轮询 setup/state 直到插件重新就绪。',
     'permissions.title': '权限与安全边界',
     'permissions.subtitle': 'SuperAgent 只做你明确允许的事；以下是它需要和不需要的系统权限。',
+    'permissions.githubIdentity': 'GitHub 身份',
+    'permissions.githubIdentityDetail': '使用专用 bot 账号时，commits/PRs 由 bot 账号发起，你的个人账号只需作为 collaborator（接受仓库邀请，并出现在 allowedLogins 中）。向导会为 bot 生成 SSH 密钥并复制公钥到 bot 账号；私钥留在本机。',
     'permissions.screen': '屏幕录制',
     'permissions.screenDetail': '不需要。面板和 Worker 都不会截屏；只有你另外安装 Computer Use 插件时才与 DSH 相关。',
     'permissions.accessibility': '辅助功能',
@@ -404,6 +442,40 @@ function build(require) {
     'github.selected': '{count} selected',
     'github.allowSelf': 'I use my own GitHub account (let my own events trigger work)',
     'github.allowSelfHint': 'Off by default so the agent’s own comments and pull requests cannot trigger more work. Most people running the agent as themselves should turn it on; keep it off with a dedicated machine account that should only react to other people.',
+    'github.advanced': 'Advanced (SSH key / existing key)',
+    'github.advancedHint': 'The plugin generates a dedicated SSH key for the bot, so you normally do not need this section; only open it to reuse an existing private key.',
+    'github.generateKey': 'Generate SSH key',
+    'github.generatingKey': 'Generating…',
+    'github.keyGenerated': 'Key generated',
+    'github.keyMissing': 'No key yet',
+    'github.keyExisting': 'Key already exists',
+    'github.keyRestarting': 'Restarting the plugin; waiting for it to be ready…',
+    'github.keyRestartTimeout': 'The key path was saved, but the plugin did not become ready within 60 seconds; refresh later or restart DSH.',
+    'github.publicKey': 'Public key (paste into the bot account SSH keys)',
+    'github.openGithubKeys': 'Open GitHub SSH keys',
+    'github.keyHint': 'Open the link as the bot account, paste the public key above and save. The private key stays on this machine; never commit it or paste it into chat.',
+    'github.sshKeyFile': 'Use an existing key path (optional)',
+    'github.sshKeyFileHint': 'Absolute path to an existing ed25519 private key. Leave empty to use the plugin-generated/default key.',
+    'github.operator': 'Your personal GitHub login',
+    'github.operatorHint': 'Triggers work and reviews it; the plugin writes it into allowedLogins and collaborators.',
+    'github.operatorRequired': 'Enter your personal GitHub login to continue.',
+    'github.personalToken': 'Your personal PAT (optional)',
+    'github.personalTokenHint': 'Optional: used to invite/accept repository invites automatically; stays on this machine, never written to config or shown again.',
+    'github.personalTokenPlaceholder': 'github_pat_… (optional)',
+    'github.botTokenSection': 'Bot fine-grained PAT',
+    'github.automationTitle': 'The plugin does this for you',
+    'github.auto1': 'Writes the bot token as a 0600 file and sets up git credentials (HTTPS/PAT or the generated SSH key)',
+    'github.auto2': 'Sets the clone/push commit identity to the bot account',
+    'github.auto3': 'Adds the bot to the watched repositories (accepts invites automatically when a personal PAT is provided)',
+    'github.auto4': 'Invites you (personal account) as a collaborator and adds you to allowedLogins',
+    'github.auto5': 'Validates the Telegram/GitHub sources and waits for the plugin to be ready',
+    'github.manualTitle': 'You still need to',
+    'github.manual1': 'Create the bot GitHub account and enable 2FA',
+    'github.manual2': 'Create a fine-grained PAT as the bot (Contents/Issues/PRs read-write; optional Checks/Actions read for CI)',
+    'github.manual3': 'Complete GitHub human/email verification for the bot account',
+    'github.manual4': 'Without a personal PAT: accept the bot’s repository invite manually on GitHub',
+    'github.manualAcceptHint': 'Without a personal PAT, invitations must be accepted by you on GitHub; with one they can be automated.',
+    'github.identityNote': 'Commits and pull requests appear as the bot account above; your personal account only acts as the collaborator and trigger.',
     'github.private': 'Private',
     'github.pushed': 'Last push',
     'github.emptyRepos': 'This token cannot see any repository; check its access scope.',
@@ -439,6 +511,7 @@ function build(require) {
     'finish.github': 'GitHub',
     'finish.mode': 'Accept mode',
     'finish.workers': 'Workers',
+    'finish.gitIdentity': 'Bot identity',
     'finish.save': 'Save and enable',
     'finish.saving': 'Saving…',
     'finish.restarting': 'Restarting the plugin; waiting for it to be ready…',
@@ -473,6 +546,8 @@ function build(require) {
     'permission.restart.detail': 'Saving configuration restarts the plugin (non-volatile DSH config). The wizard polls setup/state until the plugin is ready again.',
     'permissions.title': 'Permissions and boundaries',
     'permissions.subtitle': 'SuperAgent does only what you allow. Here is what it needs — and what it does not.',
+    'permissions.githubIdentity': 'GitHub identity',
+    'permissions.githubIdentityDetail': 'With a dedicated bot account, commits and pull requests are authored by the bot; your personal account only needs to be a collaborator (accept the repository invite and appear in allowedLogins). The wizard generates the bot SSH key and you paste its public key into the bot account; the private key stays local.',
     'permissions.screen': 'Screen recording',
     'permissions.screenDetail': 'Not needed. Neither the panel nor a worker captures the screen; only a separately installed Computer Use plugin involves DSH.',
     'permissions.accessibility': 'Accessibility',
@@ -539,20 +614,24 @@ function build(require) {
     return Number.isFinite(parsed) ? parsed : fallback
   }
 
-  function parseUserIds(value) {
+  function parseList(value) {
     const parts = String(value || '')
       .split(/[\s,，;；]+/)
       .map(part => part.trim())
       .filter(Boolean)
     const seen = new Set()
-    const ids = []
+    const items = []
     for (const part of parts) {
       if (!seen.has(part)) {
         seen.add(part)
-        ids.push(part)
+        items.push(part)
       }
     }
-    return ids
+    return items
+  }
+
+  function parseUserIds(value) {
+    return parseList(value)
   }
 
   function isLanguage(value) {
@@ -652,7 +731,7 @@ function build(require) {
       open: false,
       step: 0,
       telegram: { status: 'idle', token: '', botUsername: '', tokenFile: '', error: '', skipped: false },
-      github: { status: 'idle', token: '', login: '', tokenFile: '', repositories: [], selected: [], allowSelf: false, error: '', skipped: false },
+      github: { status: 'idle', token: '', login: '', tokenFile: '', repositories: [], selected: [], allowSelf: false, operator: '', personalToken: '', sshKeyFile: '', sshKeyPublic: '', sshKeyGenerated: false, sshKeyExisting: false, sshKeyGenerating: false, sshKeyRestarting: false, sshKeyError: '', error: '', skipped: false },
       behavior: { allowedUserIds: '', mode: 'observe', maxWorkers: 2, language: 'zh' },
       finish: { status: 'idle', error: '', elapsed: 0 },
     }
@@ -661,6 +740,7 @@ function build(require) {
   function wizardFromSetup(setup) {
     const base = defaultWizard()
     const { telegram, github, repositories } = normalizeSetupAccounts(setup)
+    const git = setup && typeof setup === 'object' && setup.git && typeof setup.git === 'object' ? setup.git : {}
     const existing = repositories.map(repo => repo.fullName).filter(Boolean)
     return {
       ...base,
@@ -676,7 +756,16 @@ function build(require) {
         login: typeof github.login === 'string' ? github.login : '',
         repositories,
         selected: [...existing],
-        allowSelf: github.allowSelf === true,
+        allowSelf: false,
+        operator: listOf(github.allowedLogins)[0] || listOf(github.collaborators)[0] || '',
+        personalToken: '',
+        sshKeyFile: git && typeof git.sshKeyFile === 'string' ? git.sshKeyFile : '',
+        sshKeyPublic: git && typeof git.publicKey === 'string' ? git.publicKey : '',
+        sshKeyGenerated: git && git.sshKeyConfigured === true,
+        sshKeyExisting: git && git.sshKeyConfigured === true,
+        sshKeyGenerating: false,
+        sshKeyRestarting: false,
+        sshKeyError: '',
       },
       behavior: {
         ...base.behavior,
@@ -712,7 +801,11 @@ function build(require) {
     if (step === 0) return wizard.telegram.status === 'validated' || wizard.telegram.skipped === true
     if (step === 1) {
       if (wizard.github.skipped === true) return true
-      return wizard.github.status === 'validated' && listOf(wizard.github.selected).length > 0
+      return (
+        wizard.github.status === 'validated' &&
+        listOf(wizard.github.selected).length > 0 &&
+        asText(wizard.github.operator).trim().length > 0
+      )
     }
     if (step === 2) {
       if (!isLanguage(wizard.behavior.language)) return false
@@ -747,15 +840,25 @@ function build(require) {
     const github = { enabled: githubEnabled }
     if (githubEnabled) {
       github.repositories = listOf(wizard.github.selected)
-      github.allowSelf = wizard.github.allowSelf === true
+      github.allowSelf = false
       if (wizard.github.login) github.login = wizard.github.login
       if (wizard.github.tokenFile) github.tokenFile = wizard.github.tokenFile
+      // The dedicated-bot flow derives both lists from the operator login; the
+      // plugin writes the bot identity (login/git name/email) on the Host side.
+      const operator = asText(wizard.github.operator).trim()
+      if (operator) {
+        github.allowedLogins = [operator]
+        github.collaborators = [operator]
+      }
     }
+    const executor = { maxWorkers: asNumber(wizard.behavior.maxWorkers, 2) }
+    const gitSshKeyFile = asText(wizard.github.sshKeyFile).trim()
+    if (gitSshKeyFile) executor.gitSshKeyFile = gitSshKeyFile
     return {
       language: isLanguage(wizard.behavior.language) ? wizard.behavior.language : 'zh',
       sources: { telegram, github },
       policy: { mode: wizard.behavior.mode },
-      executor: { maxWorkers: asNumber(wizard.behavior.maxWorkers, 2) },
+      executor,
     }
   }
 
@@ -1092,6 +1195,23 @@ function build(require) {
   border-radius: 6px; border: .5px solid var(--dsw-alias-border-l2);
   color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-layer-2);
 }
+.sa-advancedtoggle {
+  display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box;
+  padding: 8px; border: 0; border-radius: 6px; background: transparent;
+  color: var(--dsw-alias-label-secondary); font: inherit; font-size: 13px; line-height: 20px;
+  cursor: pointer; text-align: left;
+}
+.sa-advancedtoggle:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+.sa-advancedtoggle:focus-visible { outline: 2px solid var(--dsw-focus-ring-color); outline-offset: 1px; }
+.sa-advancedchevron { margin-left: auto; display: flex; transition: transform .15s ease; }
+.sa-advancedchevron--open { transform: rotate(90deg); }
+.sa-advancedbody { display: flex; flex-direction: column; gap: 12px; margin-top: 10px; }
+.sa-checklist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.sa-checklist li { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
+.sa-checklist li svg { margin-top: 2px; color: var(--dsw-alias-state-success-primary); }
+.sa-checklist--manual li svg { color: var(--dsw-alias-label-tertiary); }
+.sa-textarea[readonly] { background: var(--dsw-alias-bg-layer-2); }
+
 .sa-detailwrap { min-width: 0; max-width: 100%; }
 .sa-detail {
   font-size: 13px; color: var(--dsw-alias-label-secondary); line-height: 20px;
@@ -1412,9 +1532,11 @@ function build(require) {
       placeholder: props.placeholder,
       spellCheck: false,
       rows: props.rows || 2,
+      readOnly: props.readOnly === true,
       disabled: props.disabled === true,
+      style: props.style,
       onChange: event => {
-        if (props.onChange) props.onChange(event.target.value)
+        if (props.onChange && props.readOnly !== true) props.onChange(event.target.value)
       },
     })
   }
@@ -2024,9 +2146,10 @@ function build(require) {
   // -- setup wizard -----------------------------------------------------------
 
   function SetupView(props) {
-    const { t, wizard, setup, busy, saving, onSetWizard, onValidateTelegram, onValidateGithub, onSave, onSkipTelegram, onSkipGithub } = props
+    const { t, wizard, setup, busy, saving, onSetWizard, onValidateTelegram, onValidateGithub, onSave, onSkipTelegram, onSkipGithub, onGenerateSshKey } = props
     const [revealed, setRevealed] = React.useState(false)
     const [repoQuery, setRepoQuery] = React.useState('')
+    const [advancedOpen, setAdvancedOpen] = React.useState(false)
     const step = wizard.step
     const labels = stepLabels(t)
     const states = stepStates(wizard)
@@ -2189,6 +2312,253 @@ function build(require) {
         t('github.permChecks'),
         t('github.permActions'),
       ]
+      const operatorMissing = validated && asText(github.operator).trim().length === 0
+      const manualKeys = ['github.manual1', 'github.manual2', 'github.manual3']
+      if (asText(github.personalToken).trim().length === 0) manualKeys.push('github.manual4')
+
+      const identityFields = h(
+        'div',
+        null,
+        h('div', { className: 'sa-section-title' }, t('github.identitySection')),
+        h(
+          'div',
+          { className: 'sa-grid sa-grid--two', style: { gap: 12 } },
+          h(
+            Field,
+            {
+              id: 'sa-github-operator',
+              label: t('github.operator'),
+              hint: t('github.operatorHint'),
+              error: operatorMissing ? t('github.operatorRequired') : '',
+            },
+            h(TextInput, {
+              id: 'sa-github-operator',
+              value: github.operator,
+              placeholder: 'alice',
+              onChange: value => patchGithub({ operator: value }),
+            }),
+          ),
+          h(
+            Field,
+            {
+              id: 'sa-github-personal-token',
+              label: t('github.personalToken'),
+              hint: t('github.personalTokenHint'),
+            },
+            h(TextInput, {
+              id: 'sa-github-personal-token',
+              type: 'password',
+              value: github.personalToken,
+              placeholder: t('github.personalTokenPlaceholder'),
+              onChange: value => patchGithub({ personalToken: value }),
+            }),
+          ),
+        ),
+        h('div', { className: 'sa-hint', style: { marginTop: 8 } }, t('github.identityNote')),
+      )
+
+      const botTokenForm = h(
+        'div',
+        null,
+        h(
+          Field,
+          {
+            id: 'sa-github-token',
+            label: t('github.tokenLabel'),
+            hint: t('github.tokenHint'),
+          },
+          h(
+            'div',
+            { className: 'sa-inputrow' },
+            h(TextInput, {
+              id: 'sa-github-token',
+              type: revealed ? 'text' : 'password',
+              value: github.token,
+              placeholder: t('github.tokenPlaceholder'),
+              disabled: validating,
+              onChange: value => patchGithub({ token: value, error: '' }),
+              onEnter: () => {
+                if (github.token.trim().length > 0 && !validating) onValidateGithub(github.token.trim(), github.personalToken)
+              },
+            }),
+            h(Button, {
+              size: 'sm',
+              variant: 'ghost',
+              title: revealed ? t('common.hide') : t('common.show'),
+              disabled: validating,
+              onClick: () => setRevealed(value => !value),
+            }, revealed ? t('common.hide') : t('common.show')),
+          ),
+        ),
+        github.error ? h(Alert, { tone: 'error', title: t('github.error') }, github.error) : null,
+        h(
+          'div',
+          { className: 'sa-inline', style: { marginTop: 12 } },
+          h(Button, {
+            variant: 'primary',
+            icon: validating ? undefined : 'key',
+            disabled: validating || github.token.trim().length === 0,
+            onClick: () => onValidateGithub(github.token.trim(), github.personalToken),
+          }, validating ? h(Spinner, null) : null, validating ? t('github.validating') : t('github.validate')),
+        ),
+      )
+
+      const repositoriesBlock = h(
+        'div',
+        null,
+        repositories.length === 0
+          ? h('div', { className: 'sa-note', style: { marginTop: 8 } }, t('github.emptyRepos'))
+          : h(
+              'div',
+              null,
+              h('div', { className: 'sa-section-title', style: { marginTop: 12 } }, t('github.repos')),
+              h(
+                'div',
+                { className: 'sa-inline' },
+                h(
+                  'div',
+                  { style: { flex: '1 1 220px' } },
+                  h(TextInput, {
+                    value: repoQuery,
+                    placeholder: t('github.searchRepos'),
+                    onChange: value => setRepoQuery(value),
+                  }),
+                ),
+                h(Button, {
+                  size: 'sm',
+                  onClick: () => patchGithub({ selected: filtered.map(repo => repo.fullName) }),
+                }, t('github.selectAll')),
+                h(Button, {
+                  size: 'sm',
+                  variant: 'ghost',
+                  onClick: () => patchGithub({ selected: [] }),
+                }, t('github.selectNone')),
+              ),
+              h(
+                'div',
+                { className: 'sa-repolist' },
+                filtered.length === 0
+                  ? h('div', { className: 'sa-note', style: { padding: 10 } }, t('github.emptyRepos'))
+                  : filtered.map(repo =>
+                      h(CheckboxRow, {
+                        key: repo.fullName,
+                        title: repo.fullName,
+                        checked: selectedSet.has(repo.fullName),
+                        badge: repo.private ? t('github.private') : undefined,
+                        meta: repo.pushedAt ? `${t('github.pushed')} ${formatTime(repo.pushedAt)}` : undefined,
+                        onChange: on => toggle(repo.fullName, on),
+                      }),
+                    ),
+              ),
+              selected.length === 0
+                ? h('div', { className: 'sa-hint', style: { marginTop: 6, color: 'var(--dsw-alias-state-warn-label)' } }, t('github.selectAtLeastOne'))
+                : null,
+            ),
+      )
+
+      const automationBlock = validated
+        ? h(
+            'div',
+            null,
+            h('div', { className: 'sa-divider' }),
+            h('div', { className: 'sa-section-title' }, t('github.automationTitle')),
+            h(
+              'ul',
+              { className: 'sa-checklist' },
+              ['github.auto1', 'github.auto2', 'github.auto3', 'github.auto4', 'github.auto5'].map(key =>
+                h('li', { key }, h(Icon, { name: 'checkCircle', size: 14 }), h('span', null, t(key))),
+              ),
+            ),
+            h('div', { className: 'sa-section-title', style: { marginTop: 12 } }, t('github.manualTitle')),
+            h(
+              'ul',
+              { className: 'sa-checklist sa-checklist--manual' },
+              manualKeys.map(key => h('li', { key }, h(Icon, { name: 'info', size: 14 }), h('span', null, t(key)))),
+            ),
+            h('div', { className: 'sa-hint', style: { marginTop: 8 } }, t('github.manualAcceptHint')),
+          )
+        : null
+
+      const publicKey = github.sshKeyPublic
+      const advancedBlock = h(
+        'div',
+        null,
+        h('div', { className: 'sa-divider' }),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'sa-advancedtoggle',
+            'aria-expanded': advancedOpen ? 'true' : 'false',
+            onClick: () => setAdvancedOpen(value => !value),
+          },
+          h(Icon, { name: 'settings', size: 14 }),
+          h('span', null, t('github.advanced')),
+          h(
+            'span',
+            { className: `sa-advancedchevron${advancedOpen ? ' sa-advancedchevron--open' : ''}`, 'aria-hidden': true },
+            h(Icon, { name: 'arrowRight', size: 14 }),
+          ),
+        ),
+        advancedOpen
+          ? h(
+              'div',
+              { className: 'sa-advancedbody' },
+              h('div', { className: 'sa-hint' }, t('github.advancedHint')),
+              h(
+                'div',
+                { className: 'sa-inline' },
+                github.sshKeyGenerated
+                  ? h(Pill, { tone: 'ok' }, github.sshKeyExisting ? t('github.keyExisting') : t('github.keyGenerated'))
+                  : null,
+                github.sshKeyRestarting ? h('span', { className: 'sa-inline' }, h(Spinner, null), h('span', { className: 'sa-hint' }, t('github.keyRestarting'))) : null,
+                h(
+                  Button,
+                  {
+                    size: 'sm',
+                    variant: 'primary',
+                    icon: github.sshKeyGenerating ? undefined : 'key',
+                    disabled: github.sshKeyGenerating === true,
+                    onClick: onGenerateSshKey,
+                  },
+                  github.sshKeyGenerating ? h(Spinner, null) : null,
+                  github.sshKeyGenerating ? t('github.generatingKey') : t('github.generateKey'),
+                ),
+              ),
+              github.sshKeyError ? h(Alert, { tone: 'error', title: t('github.error') }, github.sshKeyError) : null,
+              publicKey
+                ? h(
+                    'div',
+                    { style: { marginTop: 10 } },
+                    h('div', { className: 'sa-label', style: { marginBottom: 6 } }, t('github.publicKey')),
+                    h(TextArea, { value: publicKey, readOnly: true, rows: 4, style: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' } }),
+                    h(
+                      'div',
+                      { className: 'sa-inline', style: { marginTop: 8 } },
+                      h(CopyButton, { text: publicKey, label: t('common.copy') }),
+                      h('a', {
+                        className: 'sa-btn sa-btn--sm',
+                        href: 'https://github.com/settings/keys',
+                        target: '_blank',
+                        rel: 'noreferrer noopener',
+                      }, h(Icon, { name: 'external', size: 13 }), t('github.openGithubKeys')),
+                    ),
+                    h('div', { className: 'sa-hint', style: { marginTop: 8 } }, t('github.keyHint')),
+                  )
+                : null,
+              h(
+                Field,
+                { label: t('github.sshKeyFile'), hint: t('github.sshKeyFileHint') },
+                h(TextInput, {
+                  value: github.sshKeyFile,
+                  placeholder: '~/.ssh/superagent_bot',
+                  onChange: value => patchGithub({ sshKeyFile: value }),
+                }),
+              ),
+            )
+          : null,
+      )
+
       return h(
         'div',
         { className: 'sa-fade' },
@@ -2201,9 +2571,13 @@ function build(require) {
             subtitle: t('github.desc'),
             action: h(Pill, { tone: validated ? 'ok' : 'plain' }, validated ? t('common.configured') : t('common.required')),
           }),
+          identityFields,
+          h('div', { className: 'sa-divider' }),
           h('div', { className: 'sa-section-title' }, t('github.permsTitle')),
           h('div', { className: 'sa-chips', style: { marginBottom: 14 } },
             permissions.map((text, index) => h('span', { className: 'sa-chip', key: index }, h(Icon, { name: 'check', size: 11 }), text))),
+          h('div', { className: 'sa-divider' }),
+          h('div', { className: 'sa-section-title' }, t('github.botTokenSection')),
           validated
             ? h(
                 'div',
@@ -2211,122 +2585,19 @@ function build(require) {
                 h(
                   Alert,
                   { tone: 'ok', title: t('github.success') },
-                  h('div', { className: 'sa-inline' },
+                  h(
+                    'div',
+                    { className: 'sa-inline' },
                     h(Icon, { name: 'github', size: 14 }),
                     h('span', { className: 'sa-mono' }, github.login || t('github.fineGrained')),
                     h(Pill, { tone: 'plain' }, t('github.selected', { count: selected.length })),
-                    github.allowSelf === true ? h(Pill, { tone: 'ok' }, 'allowSelf') : null),
-                ),
-                repositories.length === 0
-                  ? h('div', { className: 'sa-note', style: { marginTop: 8 } }, t('github.emptyRepos'))
-                  : h(
-                      'div',
-                      null,
-                      h('div', { className: 'sa-section-title', style: { marginTop: 12 } }, t('github.repos')),
-                      h(
-                        'div',
-                        { className: 'sa-inline' },
-                        h(
-                          'div',
-                          { style: { flex: '1 1 220px' } },
-                          h(TextInput, {
-                            value: repoQuery,
-                            placeholder: t('github.searchRepos'),
-                            onChange: value => setRepoQuery(value),
-                          }),
-                        ),
-                        h(Button, {
-                          size: 'sm',
-                          onClick: () => patchGithub({ selected: filtered.map(repo => repo.fullName) }),
-                        }, t('github.selectAll')),
-                        h(Button, {
-                          size: 'sm',
-                          variant: 'ghost',
-                          onClick: () => patchGithub({ selected: [] }),
-                        }, t('github.selectNone')),
-                      ),
-                      h(
-                        'div',
-                        { className: 'sa-repolist' },
-                        filtered.length === 0
-                          ? h('div', { className: 'sa-note', style: { padding: 10 } }, t('github.emptyRepos'))
-                          : filtered.map(repo =>
-                              h(CheckboxRow, {
-                                key: repo.fullName,
-                                title: repo.fullName,
-                                checked: selectedSet.has(repo.fullName),
-                                badge: repo.private ? t('github.private') : undefined,
-                                meta: repo.pushedAt ? `${t('github.pushed')} ${formatTime(repo.pushedAt)}` : undefined,
-                                onChange: on => toggle(repo.fullName, on),
-                              }),
-                            ),
-                      ),
-                      selected.length === 0
-                        ? h('div', { className: 'sa-hint', style: { marginTop: 6, color: 'var(--dsw-alias-state-warn-label)' } }, t('github.selectAtLeastOne'))
-                        : null,
-                    ),
-                h('div', { className: 'sa-divider' }),
-                h(
-                  'label',
-                  { className: 'sa-checkrow', style: { alignItems: 'flex-start', padding: '9px 8px' } },
-                  h('input', {
-                    type: 'checkbox',
-                    checked: github.allowSelf === true,
-                    onChange: event => patchGithub({ allowSelf: event.target.checked }),
-                  }),
-                  h(
-                    'span',
-                    { style: { minWidth: 0 } },
-                    h('span', { className: 'sa-checkrow-name', style: { whiteSpace: 'normal', lineHeight: 1.4 } }, t('github.allowSelf')),
-                    h('span', { className: 'sa-hint', style: { display: 'block', marginTop: 2 } }, t('github.allowSelfHint')),
                   ),
                 ),
+                repositoriesBlock,
               )
-            : h(
-                'div',
-                null,
-                h(
-                  Field,
-                  {
-                    id: 'sa-github-token',
-                    label: t('github.tokenLabel'),
-                    hint: t('github.tokenHint'),
-                  },
-                  h(
-                    'div',
-                    { className: 'sa-inputrow' },
-                    h(TextInput, {
-                      id: 'sa-github-token',
-                      type: revealed ? 'text' : 'password',
-                      value: github.token,
-                      placeholder: t('github.tokenPlaceholder'),
-                      disabled: validating,
-                      onChange: value => patchGithub({ token: value, error: '' }),
-                      onEnter: () => {
-                        if (github.token.trim().length > 0 && !validating) onValidateGithub(github.token.trim())
-                      },
-                    }),
-                    h(Button, {
-                      size: 'sm',
-                      variant: 'ghost',
-                      title: revealed ? t('common.hide') : t('common.show'),
-                      disabled: validating,
-                      onClick: () => setRevealed(value => !value),
-                    }, revealed ? t('common.hide') : t('common.show')),
-                  ),
-                ),
-                github.error ? h(Alert, { tone: 'error', title: t('github.error') }, github.error) : null,
-                h(
-                  'div',
-                  { className: 'sa-inline', style: { marginTop: 12 } },
-                  h(Button, {
-                    variant: 'primary',
-                    icon: validating ? undefined : 'key',
-                    disabled: validating || github.token.trim().length === 0,
-                    onClick: () => onValidateGithub(github.token.trim()),
-                  }, validating ? h(Spinner, null) : null, validating ? t('github.validating') : t('github.validate')),
-                ),
-              ),
+            : botTokenForm,
+          automationBlock,
+          advancedBlock,
         ),
       )
     }
@@ -2435,9 +2706,23 @@ function build(require) {
           github.status === 'validated'
             ? h('span', { className: 'sa-inline' }, h(Icon, { name: 'github', size: 13 }), github.login || t('github.fineGrained'),
                 h(Pill, { tone: 'plain' }, t('github.selected', { count: listOf(github.selected).length })),
-                github.allowSelf === true ? h(Pill, { tone: 'ok' }, 'allowSelf') : null)
+                github.operator ? h(Pill, { tone: 'plain' }, `@${github.operator}`) : null)
             : t('finish.noGithub')),
         h(SummaryRow, { label: t('behavior.language') }, t(`language.${behavior.language === 'en' ? 'en' : 'zh'}`)),
+        github.status === 'validated'
+          ? h(
+              SummaryRow,
+              { label: t('finish.gitIdentity') },
+              h(
+                'span',
+                { className: 'sa-inline' },
+                h(Icon, { name: 'github', size: 13 }),
+                github.login || t('github.fineGrained'),
+                h(Pill, { tone: github.sshKeyGenerated || github.sshKeyFile ? 'ok' : 'plain' },
+                  github.sshKeyGenerated || github.sshKeyFile ? t('github.keyGenerated') : t('github.keyMissing')),
+              ),
+            )
+          : null,
         h(SummaryRow, { label: t('finish.mode') }, behavior.mode),
         h(SummaryRow, { label: t('finish.workers') }, String(asNumber(behavior.maxWorkers, 2))),
       )
@@ -2634,6 +2919,12 @@ function build(require) {
       h(
         Card,
         { variant: 'flat' },
+        h(CardHead, { icon: 'github', title: t('permissions.githubIdentity') }),
+        h('div', { className: 'sa-note' }, t('permissions.githubIdentityDetail')),
+      ),
+      h(
+        Card,
+        { variant: 'flat' },
         h(CardHead, {
           icon: 'clock',
           title: t('permissions.watchdog'),
@@ -2790,9 +3081,11 @@ function build(require) {
       void setup.refresh()
     }
 
-    async function validateGithub(token) {
+    async function validateGithub(token, personalToken) {
       setWizard(current => ({ ...current, github: { ...current.github, status: 'validating', error: '' } }))
-      const result = await api.post(API_PATHS.setupGithub, { token })
+      const body = { token }
+      if (asText(personalToken).trim().length > 0) body.personalToken = asText(personalToken).trim()
+      const result = await api.post(API_PATHS.setupGithub, body)
       if (!aliveRef.current) return
       if (!result.ok) {
         setWizard(current => ({ ...current, github: { ...current.github, status: 'error', error: result.error } }))
@@ -2818,6 +3111,90 @@ function build(require) {
           },
         }
       })
+      void setup.refresh()
+    }
+
+    async function waitForSetupReady() {
+      const startedAt = Date.now()
+      while (Date.now() - startedAt < RESTART_WAIT_MS) {
+        await delay(RESTART_POLL_MS)
+        if (!aliveRef.current) return false
+        const poll = await api.get(API_PATHS.setupState)
+        if (!aliveRef.current) return false
+        if (poll.ok && poll.data && poll.data.plugin && poll.data.plugin.status === 'ready') return true
+      }
+      return false
+    }
+
+    async function generateSshKey() {
+      setWizard(current => ({
+        ...current,
+        github: { ...current.github, sshKeyGenerating: true, sshKeyRestarting: false, sshKeyError: '' },
+      }))
+      const result = await api.post(API_PATHS.setupGithubSshKey, {})
+      if (!aliveRef.current) return
+      if (!result.ok) {
+        const description = result.data && typeof result.data.description === 'string' ? result.data.description : ''
+        setWizard(current => ({
+          ...current,
+          github: {
+            ...current.github,
+            sshKeyGenerating: false,
+            sshKeyRestarting: false,
+            sshKeyError: description || result.error || t('common.error'),
+          },
+        }))
+        return
+      }
+      const data = result.data && typeof result.data === 'object' ? result.data : {}
+      const publicKey =
+        asText(data.publicKey) || asText(data.publicKeyOpenSsh) || asText(data.publicKeyOpenSSH) || ''
+      const keyFile = asText(data.keyFile) || asText(data.privateKeyFile) || asText(data.path)
+      const created = data.created !== false
+      const restarting = data.restarting === true
+      if (aliveRef.current) {
+        setWizard(current => ({
+          ...current,
+          github: {
+            ...current.github,
+            sshKeyGenerating: true,
+            sshKeyRestarting: restarting,
+            sshKeyError: '',
+            sshKeyGenerated: true,
+            sshKeyExisting: !created,
+            sshKeyPublic: publicKey || current.github.sshKeyPublic,
+            sshKeyFile: keyFile || current.github.sshKeyFile,
+          },
+        }))
+      }
+      let restarted = false
+      if (restarting) {
+        restarted = await waitForSetupReady()
+      } else if (keyFile.length > 0) {
+        // The endpoint did not persist/restart; write the key path through the
+        // normal config path so it survives the next plugin start.
+        const saved = await api.put(API_PATHS.setupConfig, { config: { executor: { gitSshKeyFile: keyFile } } })
+        if (aliveRef.current && !saved.ok) {
+          setWizard(current => ({
+            ...current,
+            github: { ...current.github, sshKeyError: saved.error || t('common.error') },
+          }))
+        }
+        if (saved.ok && saved.data && saved.data.restarting === true) {
+          restarted = await waitForSetupReady()
+        }
+      }
+      if (!aliveRef.current) return
+      setWizard(current => ({
+        ...current,
+        github: {
+          ...current.github,
+          sshKeyGenerating: false,
+          sshKeyRestarting: false,
+          sshKeyError:
+            restarted || !restarting ? current.github.sshKeyError : t('github.keyRestartTimeout'),
+        },
+      }))
       void setup.refresh()
     }
 
@@ -2897,10 +3274,11 @@ function build(require) {
         saving,
         onSetWizard: setWizard,
         onValidateTelegram: token => void validateTelegram(token),
-        onValidateGithub: token => void validateGithub(token),
+        onValidateGithub: (token, personalToken) => void validateGithub(token, personalToken),
         onSave: () => void saveAndWait(),
         onSkipTelegram: skipTelegram,
         onSkipGithub: skipGithub,
+        onGenerateSshKey: () => void generateSshKey(),
         onOpenDashboard: openDashboard,
         onReconfigure: reconfigure,
       })
@@ -3058,6 +3436,7 @@ function build(require) {
       canAdvance,
       behaviorError,
       buildConfig,
+      parseList,
       parseUserIds,
       setupLanguage,
       PERMISSION_KEYS,
