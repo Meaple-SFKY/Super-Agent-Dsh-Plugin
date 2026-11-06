@@ -11,3 +11,4 @@ state/
 .DS_Store
 research/
 coverage/
+dist/

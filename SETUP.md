@@ -129,6 +129,31 @@ dsh plugin --profile "$PROFILE" add "link:$PWD"
 2. 选择 **Install bundle**（对应 `plugin_manager` 的 `install_bundle` 动作），目标填本仓库的**绝对路径**（`link:` 方式安装的是当前 checkout，改代码后重启 DSH 即生效）。
 3. 装完确认插件列表里出现 `dsh-superagent-personal`，且 bundle 的 patch 行未被禁用。
 
+### 2.4 在线安装（tarball URL）
+
+打包产物可以放在任意 HTTPS 直链（推荐 GitHub Release 的 `.tgz` 资产），然后：
+
+```sh
+./scripts/pnpmw check
+mkdir -p dist
+./scripts/pnpmw pack --pack-destination dist
+# 把 dist/dsh-superagent-personal-<version>.tgz 上传到 GitHub Release / 静态托管
+```
+
+在 **Settings → Plugins → Install bundle** 里填 **tarball 的直链**，例如：
+
+```
+https://github.com/<owner>/<repo>/releases/download/v0.1.1/dsh-superagent-personal-0.1.1.tgz
+```
+
+注意：
+
+- 必须是 **tarball 直链**（`.tgz`），不是仓库网页；
+- 包的运行依赖（`@deepseek-ai/dsh-tools`、`dsh-llm`、`dsh-session`、`proper-lockfile`）已声明为 `dependencies`，安装时会由 pnpm 拉取，不再依赖本机 checkout 的 `node_modules`；
+- **安装后需要完整退出并重新打开 DSH**：运行中的进程会缓存 bundle 路径，热切换（link ↔ tarball）后仅重启插件 fiber 不够；
+- 同一 profile 混用 link 与 tarball 时，先 `remove_bundle` 再安装目标版本；
+- 若发布到 npm，需要把 `private` 改成 `false` 并 `npm publish`，然后 Install bundle 直接填包名即可。
+
 ### 2.4 配置（面板向导，推荐）
 
 装好 bundle 并重启 DSH 后，打开左侧栏 **Superagent → 设置**，按向导三步完成，**不需要手改 YAML**：
