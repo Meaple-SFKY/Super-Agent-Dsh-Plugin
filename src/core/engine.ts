@@ -33,6 +33,7 @@ import type {
   Candidate,
   ChannelAddress,
   EvalRun,
+  FollowRef,
   Input,
   IsoTime,
   Mandate,
@@ -891,22 +892,16 @@ export class Engine implements EnginePort {
         case 'ready':
           this.queueAttention(ticket, 'result', this.readyText(reportInput), now)
           this.enqueueRelay(ticket, assignment, reportInput, now)
-          {
-            const done = this.followsDone(ticket)
-            if (done.done) {
-              if (done.outcome !== undefined) {
-                this.endTicket(
-                  ticket,
-                  { at: now, by: 'executor', reason: 'ready', outcome: done.outcome },
-                  now,
-                )
-                break
-              }
-            } else if (ticket.follows.length === 0) {
-              this.endTicket(ticket, { at: now, by: 'executor', reason: 'ready', outcome: 'completed' }, now)
-              break
-            }
-          }
+          // A `ready` Report is terminal for the Ticket: the work is done.
+          // Waiting for `followsDone` left Tickets "awaiting review" forever
+          // when no Thread close is ever observed (a Telegram DM, a GitHub
+          // issue whose close the Source does not watch). Subscriptions stay,
+          // so a later person message resumes the Ticket under its Mandate.
+          this.endTicket(
+            ticket,
+            { at: now, by: 'executor', reason: 'ready', outcome: this.readyOutcome(ticket) },
+            now,
+          )
           break
         case 'blocked':
           this.queueAttention(ticket, 'attention', this.blockedText(reportInput), now)
@@ -1518,6 +1513,20 @@ export class Engine implements EnginePort {
       (follow.closed?.at ?? '') >= (best.closed?.at ?? '') ? follow : best,
     )
     return { done: true, outcome: latest.closed?.outcome }
+  }
+
+  /**
+   * Outcome of a Ticket ended by a `ready` Report: the latest Thread close it
+   * already knows about, otherwise `completed`.
+   */
+  private readyOutcome(ticket: Ticket): ThreadOutcome {
+    const latest = ticket.follows
+      .filter(follow => follow.closed !== undefined)
+      .reduce<FollowRef | undefined>(
+        (best, follow) => (best === undefined || (follow.closed?.at ?? '') >= (best.closed?.at ?? '') ? follow : best),
+        undefined,
+      )
+    return latest?.closed?.outcome ?? 'completed'
   }
 
   private queueAttention(ticket: Ticket, purpose: 'result' | 'attention', text: string, now: IsoTime): void {

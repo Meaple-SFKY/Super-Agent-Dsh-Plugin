@@ -7,6 +7,7 @@ import {
   RecordingExecutor,
   RecordingOutbox,
   effectPayload,
+  makeGithubTrigger,
   makeHarness,
   makePolicy,
   makeTrigger,
@@ -139,7 +140,7 @@ describe('reports', () => {
     expect(harness.store.tickets.get(ticket.id)?.waitingForPerson).toBe(false)
   })
 
-  it('sends a result for a ready report and keeps the Ticket open while its Threads are open', () => {
+  it('sends a result for a ready report and ends the Ticket as completed, keeping its Subscriptions', () => {
     const harness = makeHarness()
     const ticket = acceptTrigger(harness, 'tr_1')
     harness.engine.sources.bindThread(ticket.id, { key: 'owner/repo#7', source: 'github' }, true)
@@ -157,21 +158,23 @@ describe('reports', () => {
     })
 
     const stored = harness.store.tickets.get(ticket.id)!
-    expect(stored.ends).toBeUndefined()
+    expect(stored.ends?.by).toBe('executor')
+    expect(stored.ends?.outcome).toBe('completed')
+    expect(stored.state).toBe('ended')
+    // Ended Tickets keep their Subscriptions so a person message can resume them.
+    expect(stored.subscriptions.some(thread => thread.key === 'chat-1')).toBe(true)
+    expect(stored.subscriptions.some(thread => thread.key === 'owner/repo#7')).toBe(true)
     expect(harness.outbox.messages[0]?.purpose).toBe('result')
     expect(harness.outbox.messages[0]?.text).toContain('https://example.test/pull/7')
+    // The attention/active views are built from open Tickets only.
+    expect(harness.store.tickets.open().some(candidate => candidate.id === ticket.id)).toBe(false)
+    expect(harness.store.tickets.active().some(candidate => candidate.id === ticket.id)).toBe(false)
   })
 
-  it('ends a Ticket once every Thread it follows closed, with the latest outcome', () => {
+  it('ends an open Ticket once every Thread it follows closed, with the latest outcome', () => {
     const harness = makeHarness()
     const ticket = acceptTrigger(harness, 'tr_1')
     harness.engine.sources.bindThread(ticket.id, { key: 'owner/repo#7', source: 'github' }, true)
-    const assignment = startAssignment(harness, ticket)
-    harness.engine.executor.report({
-      ticketId: ticket.id,
-      assignmentId: assignment.id,
-      report: { kind: 'ready', summary: 'ready for review', at: harness.clock.now() },
-    })
 
     harness.engine.sources.threadClosed('chat-1', 'merged', harness.clock.now())
     expect(harness.store.tickets.get(ticket.id)?.ends).toBeUndefined()
@@ -182,6 +185,80 @@ describe('reports', () => {
     expect(closed.ends?.outcome).toBe('closed')
     expect(closed.ends?.by).toBe('system')
     expect(closed.follows.every(follow => follow.closed !== undefined)).toBe(true)
+  })
+
+  it('does not double-end or change the outcome of a Ticket already ended by ready', () => {
+    const harness = makeHarness()
+    const ticket = acceptTrigger(harness, 'tr_1')
+    harness.engine.sources.bindThread(ticket.id, { key: 'owner/repo#7', source: 'github' }, true)
+    const assignment = startAssignment(harness, ticket)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: { kind: 'ready', summary: 'works', at: harness.clock.now() },
+    })
+    const endedAt = harness.store.tickets.get(ticket.id)!.ends!.at
+
+    harness.clock.advance(5_000)
+    harness.engine.sources.threadClosed('chat-1', 'merged', harness.clock.now())
+    harness.engine.sources.threadClosed('owner/repo#7', 'merged', harness.clock.now())
+
+    const closed = harness.store.tickets.get(ticket.id)!
+    expect(closed.ends?.outcome).toBe('completed')
+    expect(closed.ends?.at).toBe(endedAt)
+    expect(closed.follows.some(follow => follow.closed !== undefined)).toBe(false)
+  })
+
+  it('ends a Telegram-origin ready Ticket and resumes it from a follow-up', () => {
+    const harness = makeHarness()
+    const ticket = acceptTrigger(harness, 'tr_1')
+    const assignment = startAssignment(harness, ticket)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: { kind: 'ready', summary: 'done', at: harness.clock.now() },
+    })
+    expect(harness.store.tickets.get(ticket.id)?.ends?.outcome).toBe('completed')
+    harness.effects.clear()
+
+    harness.engine.sources.receive(makeTrigger({ id: 'tr_2', text: 'one more thing' }))
+    harness.engine.evaluateDue()
+
+    const resumed = harness.store.tickets.get(ticket.id)!
+    expect(resumed.ends).toBeUndefined()
+    expect(resumed.state).toBe('open')
+    expect(resumed.assignments).toHaveLength(2)
+    expect(resumed.assignments[1]?.state).toBe('pending')
+    expect(harness.effects.list('assessment')).toEqual([])
+    expect(effectPayload<LaunchPayload>(harness, 'launch')?.assignmentId).toBe(resumed.assignments[1]?.id)
+  })
+
+  it('ends a GitHub-issue ready Ticket even though the issue never closes', () => {
+    const harness = makeHarness()
+    harness.engine.sources.receive(makeGithubTrigger({ id: 'tr_gh', addressed: 'mention' }))
+    harness.engine.evaluateDue()
+    const result = harness.engine.mainSession.decide({
+      triggerId: 'tr_gh',
+      outcome: 'accept',
+      reason: [{ code: 'asked', triggerId: 'tr_gh' }],
+    })
+    const ticket = result.ticket!
+    const assignment = startAssignment(harness, ticket)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: {
+        kind: 'ready',
+        summary: 'fixed',
+        pullRequest: { repo: 'owner/repo', number: 9, url: 'https://example.test/pull/9' },
+        at: harness.clock.now(),
+      },
+    })
+
+    const stored = harness.store.tickets.get(ticket.id)!
+    expect(stored.ends?.outcome).toBe('completed')
+    expect(stored.subscriptions.some(thread => thread.key === 'owner/repo#1')).toBe(true)
+    expect(harness.outbox.messages[0]?.purpose).toBe('result')
   })
 
   it('ends a dropped Ticket without an attention message', () => {
@@ -416,17 +493,6 @@ describe('language', () => {
     harness.engine.executor.report({
       ticketId: ticket.id,
       assignmentId: assignment.id,
-      report: {
-        kind: 'ready',
-        summary: 'opened a pull request',
-        pullRequest: { repo: 'owner/repo', number: 7, url: 'https://example.test/pull/7' },
-        at: harness.clock.now(),
-      },
-    })
-    harness.clock.advance(1_000)
-    harness.engine.executor.report({
-      ticketId: ticket.id,
-      assignmentId: assignment.id,
       report: { kind: 'blocked', summary: 'cannot choose a database', question: '用哪个数据库？', at: harness.clock.now() },
     })
     harness.clock.advance(1_000)
@@ -435,18 +501,8 @@ describe('language', () => {
       assignmentId: assignment.id,
       report: { kind: 'failed', summary: '编译失败', at: harness.clock.now() },
     })
-
-    expect(harness.outbox.messages.map(message => message.purpose)).toEqual(['result', 'attention', 'attention'])
-    expect(harness.outbox.messages[0]?.text).toBe('已完成，请验收：opened a pull request https://example.test/pull/7')
-    expect(harness.outbox.messages[1]?.text).toBe('需要你决定：用哪个数据库？')
-    expect(harness.outbox.messages[2]?.text).toBe('出了点问题：编译失败')
-  })
-
-  it('writes English user-facing messages when configured', () => {
-    const harness = localizedHarness('en')
-    const ticket = acceptTrigger(harness, 'tr_1')
-    const assignment = startAssignment(harness, ticket)
-
+    harness.clock.advance(1_000)
+    // A ready Report is terminal for the Ticket, so it comes last.
     harness.engine.executor.report({
       ticketId: ticket.id,
       assignmentId: assignment.id,
@@ -457,7 +513,18 @@ describe('language', () => {
         at: harness.clock.now(),
       },
     })
-    harness.clock.advance(1_000)
+
+    expect(harness.outbox.messages.map(message => message.purpose)).toEqual(['attention', 'attention', 'result'])
+    expect(harness.outbox.messages[0]?.text).toBe('需要你决定：用哪个数据库？')
+    expect(harness.outbox.messages[1]?.text).toBe('出了点问题：编译失败')
+    expect(harness.outbox.messages[2]?.text).toBe('已完成，请验收：opened a pull request https://example.test/pull/7')
+  })
+
+  it('writes English user-facing messages when configured', () => {
+    const harness = localizedHarness('en')
+    const ticket = acceptTrigger(harness, 'tr_1')
+    const assignment = startAssignment(harness, ticket)
+
     harness.engine.executor.report({
       ticketId: ticket.id,
       assignmentId: assignment.id,
@@ -469,12 +536,23 @@ describe('language', () => {
       assignmentId: assignment.id,
       report: { kind: 'failed', summary: 'the build is red', at: harness.clock.now() },
     })
+    harness.clock.advance(1_000)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: {
+        kind: 'ready',
+        summary: 'opened a pull request',
+        pullRequest: { repo: 'owner/repo', number: 7, url: 'https://example.test/pull/7' },
+        at: harness.clock.now(),
+      },
+    })
 
-    expect(harness.outbox.messages[0]?.text).toBe(
+    expect(harness.outbox.messages[0]?.text).toBe('Need your decision: Which database?')
+    expect(harness.outbox.messages[1]?.text).toBe('Something went wrong: the build is red')
+    expect(harness.outbox.messages[2]?.text).toBe(
       'Ready for review: opened a pull request https://example.test/pull/7',
     )
-    expect(harness.outbox.messages[1]?.text).toBe('Need your decision: Which database?')
-    expect(harness.outbox.messages[2]?.text).toBe('Something went wrong: the build is red')
   })
 
   it('localizes the acknowledgement when it is enabled', () => {
