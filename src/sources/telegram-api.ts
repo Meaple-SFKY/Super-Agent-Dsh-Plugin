@@ -538,3 +538,70 @@ export interface SendMessageOptions {
   signal?: AbortSignal
   attempts?: number
 }
+
+// ---------------------------------------------------------------------------
+// Stateless token validation (setup wizard; no ctx, no logging)
+// ---------------------------------------------------------------------------
+
+/** A token check failed. The message never contains the token. */
+export class TelegramTokenValidationError extends Error {
+  /** Telegram `error_code` when the Bot API answered; `0` for transport errors. */
+  readonly code?: number
+
+  constructor(message: string, code?: number) {
+    super(message)
+    this.name = 'TelegramTokenValidationError'
+    if (code !== undefined) this.code = code
+  }
+}
+
+export interface ValidateTelegramTokenOptions {
+  /** Bot API base URL; only changed in tests. */
+  apiBaseUrl?: string
+  /** Per-request timeout in milliseconds (default 10s). */
+  timeoutMs?: number
+}
+
+/**
+ * Call `getMe` once to prove a bot token works, without touching any Source
+ * instance, configuration or state. Stateless and safe to call from the setup
+ * API via a dynamic `import()`.
+ *
+ * Throws {@link TelegramTokenValidationError} with a readable description on
+ * any failure (the token is never included in the message).
+ */
+export async function validateTelegramToken(
+  token: string,
+  options: ValidateTelegramTokenOptions = {},
+): Promise<{ ok: true; id: number; username: string }> {
+  const trimmed = token.trim()
+  if (!trimmed) throw new TelegramTokenValidationError('Telegram token is empty')
+  const api = new TelegramApi({
+    token: trimmed,
+    ...(options.apiBaseUrl ? { baseUrl: options.apiBaseUrl } : {}),
+    maxAttempts: 2,
+    baseDelayMs: 250,
+    // A setup check must stay fast: never wait minutes for a 429 retry_after.
+    maxDelayMs: 2_000,
+    timeoutMs: 10_000,
+  })
+  try {
+    const user = await api.call<TelegramUser>('getMe', {}, {
+      attempts: 2,
+      timeoutMs: Math.max(100, options.timeoutMs ?? 10_000),
+    })
+    if (!user || typeof user.id !== 'number') {
+      throw new TelegramTokenValidationError('Telegram returned an unexpected getMe answer')
+    }
+    return { ok: true, id: user.id, username: user.username ?? '' }
+  } catch (error) {
+    if (error instanceof TelegramTokenValidationError) throw error
+    if (error instanceof TelegramApiError) {
+      throw new TelegramTokenValidationError(
+        `Telegram token check failed: ${error.description} (Telegram error ${error.code})`,
+        error.code,
+      )
+    }
+    throw new TelegramTokenValidationError(`Telegram token check failed: ${describeError(error)}`)
+  }
+}

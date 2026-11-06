@@ -284,6 +284,33 @@ function summarizeCi(checks: GithubCheckRun[], runs: GithubWorkflowRun[]): CiSna
   }
 }
 
+/**
+ * Both CI read APIs were denied. This is an actionable configuration problem,
+ * so the Source reports one short message instead of one 403 per repository
+ * poll: either grant Actions: Read (sufficient) or Checks: Read.
+ */
+export class CiPermissionError extends Error {
+  readonly repo: string
+
+  constructor(repo: string, detail?: string) {
+    super(`CI needs Actions: Read (or Checks: Read) permission for ${repo}${detail ? ` (${detail})` : ''}`)
+    this.name = 'CiPermissionError'
+    this.repo = repo
+  }
+}
+
+/** 403/404 mean "this token may not or cannot read this API"; either side may degrade. */
+function isCiPermissionDenied(error: unknown): boolean {
+  return error instanceof GithubApiError && (error.status === 403 || error.status === 404)
+}
+
+function describeCiReadError(error: unknown): string {
+  if (error instanceof GithubApiError) {
+    return error.status === 0 ? 'network error' : `HTTP ${error.status}${error.details ? `: ${error.details}` : ''}`
+  }
+  return error instanceof Error ? error.message : String(error)
+}
+
 function sameName(left: string | undefined, right: string | undefined): boolean {
   return Boolean(left) && Boolean(right) && left!.toLowerCase() === right!.toLowerCase()
 }
@@ -641,9 +668,33 @@ export class GithubSource implements Source {
       branch = await api.getDefaultBranch(repo, { signal })
       this.branchCache.set(repo, branch)
     }
-    const checks = await api.getCheckRunsForRef(repo, branch, { signal })
-    const runs = await api.listWorkflowRunsForRef(repo, branch, { by: 'branch', signal })
-    const snapshot = summarizeCi(checks.check_runs, runs.workflow_runs)
+    // Check runs and Actions runs are independent capabilities: a fine-grained
+    // PAT often has Actions but no Checks permission. Read both, keep whichever
+    // succeeded, and report one actionable message when both are denied.
+    const [checksResult, runsResult] = await Promise.allSettled([
+      api.getCheckRunsForRef(repo, branch, { signal }),
+      api.listWorkflowRunsForRef(repo, branch, { by: 'branch', signal }),
+    ])
+    const checksError = checksResult.status === 'rejected' ? checksResult.reason : undefined
+    const runsError = runsResult.status === 'rejected' ? runsResult.reason : undefined
+    const checksDenied = isCiPermissionDenied(checksError)
+    const runsDenied = isCiPermissionDenied(runsError)
+    // A non-permission failure (5xx, network) is transient: surface it so the
+    // loop retries instead of silently observing half of the CI picture.
+    if (checksError && !checksDenied) throw checksError
+    if (runsError && !runsDenied) throw runsError
+    if (checksDenied && runsDenied) {
+      throw new CiPermissionError(
+        repo,
+        `check runs ${describeCiReadError(checksError)}; workflow runs ${describeCiReadError(runsError)}`,
+      )
+    }
+    if (checksDenied) this.ctx.logger.debug('github: check-runs denied; using Actions workflow runs', { repo })
+    if (runsDenied) this.ctx.logger.debug('github: workflow runs denied; using check-runs', { repo })
+    const snapshot = summarizeCi(
+      checksResult.status === 'fulfilled' ? checksResult.value.check_runs : [],
+      runsResult.status === 'fulfilled' ? runsResult.value.workflow_runs : [],
+    )
     const fingerprint = JSON.stringify([branch, snapshot.failing])
     const previous = this.loadCi(repo)
     if (!previous || previous.branch !== branch) {

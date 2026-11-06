@@ -46,7 +46,7 @@ chmod 600 ~/.config/superagent/telegram-token
    - **Issues: Read and write**（读 Issue、回评论）
    - **Pull requests: Read and write**（读 PR、发 review 评论）
    - **Metadata: Read**（必选，自动带上）
-   - 需要看 CI 时再加 **Actions: Read**；需要读 check 结果时加 **Checks: Read**。
+   - 需要看 CI 时加 **Actions: Read**（推荐，必需）；**Checks: Read** 可选——没有 Checks 权限时会自动只用 Actions runs，两者都没有才会报错。
 4. 生成后同样只显示一次，保存：
 
 ```sh

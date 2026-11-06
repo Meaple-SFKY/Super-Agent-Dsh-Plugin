@@ -187,6 +187,9 @@ export interface GithubRepo {
   default_branch: string
   private?: boolean
   html_url?: string
+  archived?: boolean
+  fork?: boolean
+  pushed_at?: string | null
 }
 
 export interface GithubIssue {
@@ -664,6 +667,19 @@ export class GithubApi {
     return this.must<GithubPullRequest>(`/repos/${repoPath(repo)}/pulls/${number}`, { signal: options.signal })
   }
 
+  /**
+   * Repositories the authenticated user can access (owner, collaborator or
+   * organization member), newest push first. Paginated; callers cap the pages.
+   */
+  async listUserRepositories(
+    options: { signal?: AbortSignal; maxPages?: number; perPage?: number } = {},
+  ): Promise<GithubPage<GithubRepo>> {
+    return this.paginate<GithubRepo>(
+      '/user/repos?sort=pushed&direction=desc&affiliation=owner,collaborator,organization_member',
+      { ...options, maxPages: options.maxPages ?? 2 },
+    )
+  }
+
   /** Issues (including pull requests) updated since an ISO timestamp, oldest first. */
   async listIssuesUpdatedSince(
     repo: string,
@@ -867,4 +883,105 @@ function describeResponseBody(text: string): string {
     // Not JSON; fall back to a short slice of the raw body.
   }
   return text.replace(/\s+/g, ' ').slice(0, 200)
+}
+
+// ---------------------------------------------------------------------------
+// Stateless setup helpers (no ctx, no logging; safe for dynamic import)
+// ---------------------------------------------------------------------------
+
+/** A token check failed. The message never contains the token. */
+export class GithubTokenValidationError extends Error {
+  /** HTTP status when GitHub answered; `0` for transport errors. */
+  readonly status?: number
+
+  constructor(message: string, status?: number) {
+    super(message)
+    this.name = 'GithubTokenValidationError'
+    if (status !== undefined) this.status = status
+  }
+}
+
+export interface SetupHelperOptions {
+  /** GitHub API base URL; only changed in tests. */
+  apiBaseUrl?: string
+  /** Per-request timeout in milliseconds (default 10s). */
+  timeoutMs?: number
+}
+
+/** One repository as the setup wizard shows it. */
+export interface GithubRepositorySummary {
+  fullName: string
+  private: boolean
+  pushedAt: string | null
+  archived: boolean
+  fork: boolean
+}
+
+function setupApi(token: string, options: SetupHelperOptions): GithubApi {
+  const trimmed = token.trim()
+  if (!trimmed) throw new GithubTokenValidationError('GitHub token is empty')
+  return new GithubApi({
+    token: trimmed,
+    ...(options.apiBaseUrl ? { baseUrl: options.apiBaseUrl } : {}),
+    maxAttempts: 2,
+    baseDelayMs: 250,
+    // A setup check must stay fast: never wait minutes for a 429 retry_after.
+    maxDelayMs: 2_000,
+    timeoutMs: Math.max(1_000, options.timeoutMs ?? 10_000),
+  })
+}
+
+/**
+ * Call `/user` once to prove a GitHub token works. Stateless: no Source
+ * instance, configuration or state is touched, so the setup API can call it
+ * through a dynamic `import()`.
+ *
+ * Throws {@link GithubTokenValidationError} with a readable description (the
+ * token is never included). A 403 rate-limit answer surfaces as HTTP 403 with
+ * GitHub's message.
+ */
+export async function validateGithubToken(
+  token: string,
+  options: SetupHelperOptions = {},
+): Promise<{ ok: true; login: string; id: number }> {
+  const api = setupApi(token, options)
+  try {
+    const user = await api.getAuthenticatedUser()
+    if (!user || typeof user.login !== 'string' || !user.login) {
+      throw new GithubTokenValidationError('GitHub returned an unexpected /user answer')
+    }
+    return { ok: true, login: user.login, id: typeof user.id === 'number' ? user.id : 0 }
+  } catch (error) {
+    if (error instanceof GithubTokenValidationError) throw error
+    if (error instanceof GithubApiError) {
+      const description = error.status === 0 ? (error.details ?? 'network error') : error.details
+      throw new GithubTokenValidationError(
+        `GitHub token check failed: HTTP ${error.status}${description ? `: ${description}` : ''}`,
+        error.status,
+      )
+    }
+    throw new GithubTokenValidationError(`GitHub token check failed: ${describeError(error)}`)
+  }
+}
+
+/**
+ * List the repositories the token can access, at most 200, newest push first.
+ * Pages through `Link: rel="next"` (100 per page) and stops at the cap.
+ *
+ * Throws {@link GithubApiError} with a readable status/message for 401, 403
+ * (including rate limits), 404 and transport errors; the token never appears.
+ */
+export async function listGithubRepositories(
+  token: string,
+  options: SetupHelperOptions = {},
+): Promise<GithubRepositorySummary[]> {
+  const api = setupApi(token, options)
+  const page = await api.listUserRepositories({ maxPages: 2, perPage: 100 })
+  return page.items.slice(0, 200).map(repo => ({
+    fullName: repo.full_name,
+    private: repo.private === true,
+    pushedAt: typeof repo.pushed_at === 'string' ? repo.pushed_at : null,
+    archived: repo.archived === true,
+    fork: repo.fork === true,
+  }))
 }

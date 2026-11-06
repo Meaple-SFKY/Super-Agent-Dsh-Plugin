@@ -17,7 +17,11 @@ import {
   type TelegramConfig,
   type TelegramSource,
 } from '../src/sources/telegram.js'
-import { chunkText } from '../src/sources/telegram-api.js'
+import {
+  TelegramTokenValidationError,
+  chunkText,
+  validateTelegramToken,
+} from '../src/sources/telegram-api.js'
 import type { TelegramUpdate } from '../src/sources/telegram-api.js'
 
 // The token is fake; the fake server never checks it, and real credentials must
@@ -690,5 +694,61 @@ describe('telegram source: loop resilience', () => {
     expect(config.allowedUserIds).toEqual(['42', '43'])
     expect(config.pollSeconds).toBeGreaterThan(0)
     expect(config.pollTimeoutSeconds).toBeLessThanOrEqual(300)
+  })
+})
+
+describe('telegram token validation (stateless setup helper)', () => {
+  const TOKEN = '123456789:fake-setup-token-not-a-secret'
+
+  it('reports the bot id and username for a working token', async () => {
+    const fake = await startTelegram()
+    await expect(validateTelegramToken(TOKEN, { apiBaseUrl: fake.url, timeoutMs: 500 })).resolves.toEqual({
+      ok: true,
+      id: 999,
+      username: 'testbot',
+    })
+  })
+
+  it('reports a 401 without leaking the token', async () => {
+    const fake = await startTelegram(method => {
+      if (method === 'getMe') {
+        return { status: 401, body: { ok: false, error_code: 401, description: 'Unauthorized' } }
+      }
+      return undefined
+    })
+    let error: unknown
+    try {
+      await validateTelegramToken(TOKEN, { apiBaseUrl: fake.url, timeoutMs: 500 })
+      expect.unreachable()
+    } catch (caught) {
+      error = caught
+    }
+    expect(error).toBeInstanceOf(TelegramTokenValidationError)
+    expect(String(error)).toContain('Telegram error 401')
+    expect(String(error)).toContain('Unauthorized')
+    expect(String(error)).not.toContain(TOKEN)
+  })
+
+  it('reports a timeout without leaking the token', async () => {
+    const fake = await startTelegram(method => {
+      if (method === 'getMe') return { pending: true }
+      return undefined
+    })
+    const started = Date.now()
+    let error: unknown
+    try {
+      await validateTelegramToken(TOKEN, { apiBaseUrl: fake.url, timeoutMs: 50 })
+      expect.unreachable()
+    } catch (caught) {
+      error = caught
+    }
+    expect(error).toBeInstanceOf(TelegramTokenValidationError)
+    expect(String(error)).toMatch(/timeout/i)
+    expect(String(error)).not.toContain(TOKEN)
+    expect(Date.now() - started).toBeLessThan(4_000)
+  })
+
+  it('rejects an empty token without calling the network', async () => {
+    await expect(validateTelegramToken('   ')).rejects.toThrow(/empty/)
   })
 })

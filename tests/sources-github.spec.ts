@@ -22,12 +22,17 @@ import {
 } from '../src/sources/github.js'
 import {
   GithubApi,
+  GithubApiError,
+  GithubTokenValidationError,
   createGithubTokenProvider,
+  listGithubRepositories,
+  validateGithubToken,
   type GithubCheckRun,
   type GithubComment,
   type GithubIssue,
   type GithubPullRequest,
   type GithubReview,
+  type GithubWorkflowRun,
 } from '../src/sources/github-api.js'
 
 // Fake token: the fake server never verifies it, and no real credential may
@@ -56,6 +61,8 @@ interface GithubAnswer {
   status?: number
   headers?: Record<string, string>
   body?: unknown
+  /** Do not answer at all (used to test request timeouts). */
+  pending?: boolean
 }
 
 type GithubHandler = (request: GithubRequest) => GithubAnswer | undefined
@@ -104,6 +111,7 @@ async function startGithub(handler: GithubHandler): Promise<FakeGithub> {
         res.end(JSON.stringify({ message: 'Not Found' }))
         return
       }
+      if (answer.pending) return
       res.writeHead(answer.status ?? 200, {
         'content-type': 'application/json',
         ...(answer.headers ?? {}),
@@ -259,8 +267,31 @@ function makeReview(id: number, overrides: Partial<GithubReview> = {}): GithubRe
   }
 }
 
+function repoFixture(index: number): Record<string, unknown> {
+  return {
+    id: index,
+    full_name: `owner/repo-${index}`,
+    name: `repo-${index}`,
+    owner: { login: 'owner' },
+    default_branch: 'main',
+    private: index % 2 === 0,
+    archived: index % 50 === 0,
+    fork: index % 3 === 0,
+    pushed_at: iso(-index * 1000),
+    html_url: `https://github.com/owner/repo-${index}`,
+  }
+}
+
+function repoRange(from: number, to: number): Array<Record<string, unknown>> {
+  return Array.from({ length: to - from + 1 }, (_, offset) => repoFixture(from + offset))
+}
+
 function checkRun(name: string, conclusion: string | null, status = 'completed'): GithubCheckRun {
   return { id: Math.floor(Math.random() * 1e6), name, status, conclusion, head_sha: 'deadbeef' }
+}
+
+function workflowRun(name: string, conclusion: string | null): GithubWorkflowRun {
+  return { id: Math.floor(Math.random() * 1e6), name, status: 'completed', conclusion, head_sha: 'deadbeef' }
 }
 
 /** Handler for every stream the Source polls, returning empty lists by default. */
@@ -625,6 +656,106 @@ describe('github source: pull request lifecycle', () => {
 // ---------------------------------------------------------------------------
 
 describe('github source: CI', () => {
+  it('falls back to Actions workflow runs when check-runs are denied (403)', async () => {
+    let workflowRuns: GithubWorkflowRun[] = [workflowRun('ci-build', 'failure')]
+    const fake = await startGithub(request => {
+      if (/\/commits\/main\/check-runs$/.test(request.path)) {
+        return { status: 403, body: { message: 'Resource not accessible by integration' } }
+      }
+      if (/\/actions\/runs$/.test(request.path)) {
+        return { body: { total_count: workflowRuns.length, workflow_runs: workflowRuns } }
+      }
+      return emptyStreams(request)
+    })
+    const { ctx, triggers, kv } = makeContext()
+    const source = createSource(baseConfig(fake.url, { observeCi: true }), ctx) as GithubSource
+
+    const first = await source.pollOnce(signal())
+    expect(first.errors).toEqual([])
+    // Actions runs populated the baseline even though check-runs was denied.
+    expect(kv.get('github:ci:o/r')).toMatchObject({ failing: ['ci-build'] })
+    expect(triggers).toHaveLength(0)
+
+    workflowRuns = [workflowRun('ci-build', 'failure'), workflowRun('ci-test', 'failure')]
+    const second = await source.pollOnce(signal())
+    expect(second.errors).toEqual([])
+    expect(second.emitted).toBe(1)
+    expect(triggers[0]!.kind).toBe('ci')
+    expect(triggers[0]!.text).toContain('ci-test')
+  })
+
+  it('falls back to Actions workflow runs when check-runs do not exist (404)', async () => {
+    const fake = await startGithub(request => {
+      if (/\/commits\/main\/check-runs$/.test(request.path)) {
+        return { status: 404, body: { message: 'Not Found' } }
+      }
+      if (/\/actions\/runs$/.test(request.path)) {
+        return { body: { total_count: 1, workflow_runs: [workflowRun('ci-deploy', 'failure')] } }
+      }
+      return emptyStreams(request)
+    })
+    const { ctx, triggers, kv } = makeContext()
+    const source = createSource(baseConfig(fake.url, { observeCi: true }), ctx) as GithubSource
+
+    const first = await source.pollOnce(signal())
+    expect(first.errors).toEqual([])
+    expect(kv.get('github:ci:o/r')).toMatchObject({ failing: ['ci-deploy'] })
+    expect(triggers).toHaveLength(0)
+  })
+
+  it('falls back to check-runs when Actions workflow runs are denied (403)', async () => {
+    let checks: GithubCheckRun[] = [checkRun('unit-tests', 'failure')]
+    const fake = await startGithub(request => {
+      if (/\/commits\/main\/check-runs$/.test(request.path)) {
+        return { body: { total_count: checks.length, check_runs: checks } }
+      }
+      if (/\/actions\/runs$/.test(request.path)) {
+        return { status: 403, body: { message: 'Resource not accessible by integration' } }
+      }
+      return emptyStreams(request)
+    })
+    const { ctx, triggers, kv } = makeContext()
+    const source = createSource(baseConfig(fake.url, { observeCi: true }), ctx) as GithubSource
+
+    const first = await source.pollOnce(signal())
+    expect(first.errors).toEqual([])
+    expect(kv.get('github:ci:o/r')).toMatchObject({ failing: ['unit-tests'] })
+    expect(triggers).toHaveLength(0)
+
+    checks = [checkRun('unit-tests', 'failure'), checkRun('lint', 'failure')]
+    const second = await source.pollOnce(signal())
+    expect(second.errors).toEqual([])
+    expect(second.emitted).toBe(1)
+    expect(triggers[0]!.text).toContain('lint')
+  })
+
+  it('reports one actionable permission error when both CI sources are denied', async () => {
+    const fake = await startGithub(request => {
+      if (/\/commits\/main\/check-runs$/.test(request.path)) {
+        return { status: 403, body: { message: 'Resource not accessible by integration' } }
+      }
+      if (/\/actions\/runs$/.test(request.path)) {
+        return { status: 403, body: { message: 'Resource not accessible by integration' } }
+      }
+      return emptyStreams(request)
+    })
+    const { ctx, triggers, kv } = makeContext()
+    const source = createSource(baseConfig(fake.url, { observeCi: true }), ctx) as GithubSource
+
+    const first = await source.pollOnce(signal())
+    expect(first.errors).toHaveLength(1)
+    expect(first.errors[0]).toMatch(/CI needs Actions: Read \(or Checks: Read\)/)
+    expect(first.errors[0]).toContain('o/r')
+    expect(first.errors[0]).not.toContain('test-token-not-a-secret')
+    expect(kv.get('github:ci:o/r')).toBeUndefined()
+    expect(triggers).toHaveLength(0)
+
+    // Repeated polls keep reporting exactly one concise error per repository.
+    const second = await source.pollOnce(signal())
+    expect(second.errors).toHaveLength(1)
+    expect(second.errors[0]).toMatch(/CI needs Actions: Read \(or Checks: Read\)/)
+  })
+
   it('emits a ci Trigger when the default-branch failure set changes, then on recovery', async () => {
     let checks: GithubCheckRun[] = [checkRun('build', 'failure')]
     const fake = await startGithub(request => {
@@ -839,5 +970,149 @@ describe('github source: loop resilience', () => {
     await waitFor(() => health.some(entry => entry.state === 'ready'))
     await source.stop()
     expect(source.healthState()).toBe('off')
+  })
+})
+
+describe('github setup helpers (stateless token validation and repository discovery)', () => {
+  const TOKEN = 'ghp_fake_setup_token_not_a_secret'
+
+  it('validates a working token and returns login/id', async () => {
+    const fake = await startGithub(request => {
+      if (request.path === '/user') return { body: { login: 'setup-agent', id: 9 } }
+      return undefined
+    })
+    await expect(validateGithubToken(TOKEN, { apiBaseUrl: fake.url, timeoutMs: 1_000 })).resolves.toEqual({
+      ok: true,
+      login: 'setup-agent',
+      id: 9,
+    })
+  })
+
+  it('reports a 401 without leaking the token', async () => {
+    const fake = await startGithub(request => {
+      if (request.path === '/user') return { status: 401, body: { message: 'Bad credentials' } }
+      return undefined
+    })
+    let error: unknown
+    try {
+      await validateGithubToken(TOKEN, { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+      expect.unreachable()
+    } catch (caught) {
+      error = caught
+    }
+    expect(error).toBeInstanceOf(GithubTokenValidationError)
+    expect(String(error)).toContain('HTTP 401')
+    expect(String(error)).toContain('Bad credentials')
+    expect(String(error)).not.toContain(TOKEN)
+  })
+
+  it('reports a rate-limited 403 readably without leaking the token', async () => {
+    const fake = await startGithub(request => {
+      if (request.path === '/user') {
+        return {
+          status: 403,
+          headers: {
+            'x-ratelimit-remaining': '0',
+            'x-ratelimit-reset': String(Math.floor(Date.now() / 1000)),
+          },
+          body: { message: 'API rate limit exceeded' },
+        }
+      }
+      return undefined
+    })
+    let error: unknown
+    try {
+      await validateGithubToken(TOKEN, { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+      expect.unreachable()
+    } catch (caught) {
+      error = caught
+    }
+    expect(error).toBeInstanceOf(GithubTokenValidationError)
+    expect(String(error)).toContain('HTTP 403')
+    expect(String(error)).toContain('rate limit')
+    expect(String(error)).not.toContain(TOKEN)
+  })
+
+  it('reports a timeout without leaking the token', async () => {
+    const fake = await startGithub(request => {
+      if (request.path === '/user') return { pending: true }
+      return undefined
+    })
+    const started = Date.now()
+    let error: unknown
+    try {
+      await validateGithubToken(TOKEN, { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+      expect.unreachable()
+    } catch (caught) {
+      error = caught
+    }
+    expect(error).toBeInstanceOf(GithubTokenValidationError)
+    expect(String(error)).toMatch(/timeout/i)
+    expect(String(error)).not.toContain(TOKEN)
+    expect(Date.now() - started).toBeLessThan(6_000)
+  })
+
+  it('pages through repositories, caps at 200 and maps the summary fields', async () => {
+    const fake = await startGithub(request => {
+      if (request.path !== '/user/repos') return undefined
+      const page = Number(request.query.get('page') ?? '1')
+      if (page === 1) {
+        return {
+          body: repoRange(1, 100),
+          headers: { link: `<${fake.url}/user/repos?per_page=100&page=2>; rel="next"` },
+        }
+      }
+      if (page === 2) {
+        return {
+          body: repoRange(101, 200),
+          headers: { link: `<${fake.url}/user/repos?per_page=100&page=3>; rel="next"` },
+        }
+      }
+      return { body: repoRange(201, 300) }
+    })
+
+    const repositories = await listGithubRepositories(TOKEN, { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+
+    expect(repositories).toHaveLength(200)
+    expect(repositories[0]).toEqual({
+      fullName: 'owner/repo-1',
+      private: false,
+      pushedAt: expect.any(String),
+      archived: false,
+      fork: false,
+    })
+    expect(repositories[199]).toMatchObject({ fullName: 'owner/repo-200', private: true, archived: true })
+    // The third page exists but must not be requested: the cap is 200.
+    const thirdPage = fake
+      .requestsTo('/user/repos')
+      .filter(request => request.query.get('page') === '3')
+    expect(thirdPage).toHaveLength(0)
+  })
+
+  it('reports a 403 while listing repositories readably without leaking the token', async () => {
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repos') {
+        return {
+          status: 403,
+          headers: {
+            'x-ratelimit-remaining': '0',
+            'x-ratelimit-reset': String(Math.floor(Date.now() / 1000)),
+          },
+          body: { message: 'API rate limit exceeded' },
+        }
+      }
+      return undefined
+    })
+    let error: unknown
+    try {
+      await listGithubRepositories(TOKEN, { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+      expect.unreachable()
+    } catch (caught) {
+      error = caught
+    }
+    expect(error).toBeInstanceOf(GithubApiError)
+    expect(String(error)).toContain('403')
+    expect(String(error)).toContain('rate limit')
+    expect(String(error)).not.toContain(TOKEN)
   })
 })
