@@ -89,6 +89,7 @@ function build(require) {
     'common.loading': '正在加载…',
     'common.notConfigured': '未配置',
     'common.configured': '已配置',
+    'common.edit': '修改',
     'common.optional': '可选',
     'common.recommended': '推荐',
     'common.required': '必需',
@@ -417,6 +418,7 @@ function build(require) {
     'common.loading': 'Loading…',
     'common.notConfigured': 'Not configured',
     'common.configured': 'Configured',
+    'common.edit': 'Edit',
     'common.optional': 'Optional',
     'common.recommended': 'Recommended',
     'common.required': 'Required',
@@ -2151,6 +2153,13 @@ function build(require) {
       { className: 'sa-summary-row' },
       h('span', { className: 'sa-summary-key' }, props.label),
       h('span', { className: 'sa-summary-val' }, props.children),
+      props.onEdit
+        ? h(
+            Button,
+            { size: 'sm', variant: 'ghost', onClick: props.onEdit },
+            props.editLabel || 'Edit',
+          )
+        : null,
     )
   }
 
@@ -2695,7 +2704,7 @@ function build(require) {
   // -- setup wizard -----------------------------------------------------------
 
   function SetupView(props) {
-    const { t, wizard, setup, busy, saving, models, onSetWizard, onValidateTelegram, onValidateGithub, onSave, onSkipTelegram, onSkipGithub, onGenerateSshKey, onRemoveOperatorToken } = props
+    const { t, wizard, setup, busy, saving, models, onSetWizard, onValidateTelegram, onValidateGithub, onSave, onSkipTelegram, onSkipGithub, onGenerateSshKey, onRemoveOperatorToken, onEditStep } = props
     const [revealed, setRevealed] = React.useState(false)
     const [repoQuery, setRepoQuery] = React.useState('')
     const [advancedOpen, setAdvancedOpen] = React.useState(false)
@@ -3352,33 +3361,33 @@ function build(require) {
       const summary = h(
         'div',
         { className: 'sa-summary' },
-        h(SummaryRow, { label: t('finish.telegram') },
+        h(SummaryRow, { label: t('finish.telegram'), onEdit: () => onEditStep(0), editLabel: t('common.edit') },
           telegram.status === 'validated'
             ? h('span', { className: 'sa-inline' }, h(Icon, { name: 'bot', size: 13 }), `@${telegram.botUsername || 'bot'}`)
             : t('finish.noTelegram')),
-        h(SummaryRow, { label: t('finish.github') },
+        h(SummaryRow, { label: t('finish.github'), onEdit: () => onEditStep(1), editLabel: t('common.edit') },
           github.status === 'validated'
             ? h('span', { className: 'sa-inline' }, h(Icon, { name: 'github', size: 13 }), github.login || t('github.fineGrained'),
                 h(Pill, { tone: 'plain' }, t('github.selected', { count: listOf(github.selected).length })),
                 github.operator ? h(Pill, { tone: 'plain' }, `@${github.operator}`) : null)
             : t('finish.noGithub')),
-        h(SummaryRow, { label: t('behavior.language') }, t(`language.${behavior.language === 'en' ? 'en' : 'zh'}`)),
+        h(SummaryRow, { label: t('behavior.language'), onEdit: () => onEditStep(2), editLabel: t('common.edit') }, t(`language.${behavior.language === 'en' ? 'en' : 'zh'}`)),
         h(
           SummaryRow,
-          { label: t('finish.routerModel') },
+          { label: t('finish.routerModel'), onEdit: () => onEditStep(2), editLabel: t('common.edit') },
           modelSelectionLabel(decodeModelSelection(behavior.routerModel), buildModelProviders(models && models.data)) ||
             t('behavior.modelDefault'),
         ),
         h(
           SummaryRow,
-          { label: t('finish.workerModel') },
+          { label: t('finish.workerModel'), onEdit: () => onEditStep(2), editLabel: t('common.edit') },
           modelSelectionLabel(decodeModelSelection(behavior.workerModel), buildModelProviders(models && models.data)) ||
             t('behavior.modelDefault'),
         ),
         github.status === 'validated'
           ? h(
               SummaryRow,
-              { label: t('finish.gitIdentity') },
+              { label: t('finish.gitIdentity'), onEdit: () => onEditStep(1), editLabel: t('common.edit') },
               h(
                 'span',
                 { className: 'sa-inline' },
@@ -3389,8 +3398,8 @@ function build(require) {
               ),
             )
           : null,
-        h(SummaryRow, { label: t('finish.mode') }, behavior.mode),
-        h(SummaryRow, { label: t('finish.workers') }, String(asNumber(behavior.maxWorkers, 2))),
+        h(SummaryRow, { label: t('finish.mode'), onEdit: () => onEditStep(2), editLabel: t('common.edit') }, behavior.mode),
+        h(SummaryRow, { label: t('finish.workers'), onEdit: () => onEditStep(2), editLabel: t('common.edit') }, String(asNumber(behavior.maxWorkers, 2))),
       )
 
       let stateBlock = null
