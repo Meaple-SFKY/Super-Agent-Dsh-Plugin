@@ -151,6 +151,21 @@ export function validateConfig(raw: unknown): { config?: RuntimeConfig; problem?
   return { config: { ...config, stateDir } }
 }
 
+/**
+ * Resolve the outbound message cap from `quiet`.
+ *
+ * `quiet.maxChars` is the optional hard cap (schema default `0` means "unset");
+ * `quiet.minChars` is the minimum length of an attention message and has
+ * historically doubled as the cap. Only a *positive* value may reach the
+ * Engine's `maxMessageChars`: passing `0` (or a negative/NaN value) truncates
+ * every user-facing message to a single `…`.
+ */
+export function resolveQuietMaxChars(quiet: { maxChars?: number; minChars?: number } | undefined): number | undefined {
+  const positive = (value: number | undefined): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined
+  return positive(quiet?.maxChars) ?? positive(quiet?.minChars)
+}
+
 // ---------------------------------------------------------------------------
 // Localized operational copy
 // ---------------------------------------------------------------------------
@@ -540,8 +555,8 @@ export class Runtime {
       executor: () => this.executor as unknown as ExecutorPort,
       acknowledgeOnAccept: config.acknowledgeOnAccept === true,
       language: this.language,
-      ...(config.quiet?.maxChars !== undefined || config.quiet?.minChars !== undefined
-        ? { maxMessageChars: config.quiet?.maxChars ?? config.quiet?.minChars }
+      ...(resolveQuietMaxChars(config.quiet) !== undefined
+        ? { maxMessageChars: resolveQuietMaxChars(config.quiet) }
         : {}),
     })
 

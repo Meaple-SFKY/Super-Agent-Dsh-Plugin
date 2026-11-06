@@ -22,7 +22,7 @@ import { FakeSource, RecordingLogger, createFakeHost, textOf, until } from './ru
 const dirs: string[] = []
 
 afterEach(() => {
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 })
 })
 
 function tempDir(): string {
@@ -436,10 +436,8 @@ describe('model fallback for new sessions (task-16)', () => {
   })
 
   it('prefers an explicit executor model over the host default, and uses the host default otherwise', async () => {
-    const stateDirs: string[] = []
     const boot = async (executor: NonNullable<RuntimeConfig['executor']>): Promise<{ runtime: Runtime; host: ReturnType<typeof createFakeHost> }> => {
       const stateDir = tempDir()
-      stateDirs.push(stateDir)
       const host = createFakeHost({ defaultModel: { provider: 'host', model: 'host-model' } })
       const runtime = new Runtime(host.ctx as unknown as Context, {
         stateDir,

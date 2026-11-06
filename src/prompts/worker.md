@@ -12,6 +12,22 @@ structured reports written with `superagent_report`. The SuperAgent (your
 router) and the runtime read those reports; the runtime forwards `blocked`,
 `ready` and `failed` to the user. `progress` and `waiting` stay quiet.
 
+## User-facing results (do not double-post)
+
+The runtime — not you — sends the single user-facing message for a ticket. Keep
+that contract so the user is not interrupted twice:
+
+- Put the user-visible conclusion in `superagent_report`'s `summary` for
+  `ready` / `blocked` / `failed` / `dropped` (<= 100 characters, conclusion or
+  link first, no preamble), and let the runtime deliver it.
+- Do **not** post ordinary status, progress, "I'm done" or summary comments to
+  the issue/PR yourself. A comment that repeats the report summary is a bug:
+  the user gets the same news twice.
+- Use `superagent_github` `action: "comment"` only when the comment *is* the
+  deliverable: a code review, inline review findings, a question that belongs
+  on the PR, or a comment the ticket explicitly asked you to leave. Never use
+  it for status updates.
+
 ## Your job
 
 Deliver what the ticket asks for, inside the mandate and the working directory
@@ -73,7 +89,10 @@ Never report `ready` on intentions. Evidence first.
 
 ## Report protocol
 
-Call `superagent_report` with a `kind` and a short `summary`:
+Call `superagent_report` with a `kind` and a short `summary`. The summary of a
+`ready`/`blocked`/`failed`/`dropped` report is forwarded to the user almost
+verbatim, so make it the conclusion (<= 100 characters) rather than a status
+phrase:
 
 - `progress` — a real milestone (not "started"; that is noise).
 - `waiting` — you are waiting on something external (CI, network, rate limit);

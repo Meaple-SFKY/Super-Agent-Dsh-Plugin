@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   Runtime,
   renderCommandReply,
+  resolveQuietMaxChars,
   validateConfig,
   type RuntimeConfig,
 } from '../src/app/runtime.js'
@@ -39,7 +40,10 @@ interface LanguageHarness {
   stateDir: string
 }
 
-async function startRuntime(language: 'zh' | 'en'): Promise<LanguageHarness> {
+async function startRuntime(
+  language: 'zh' | 'en',
+  quiet?: { maxChars?: number; minChars?: number },
+): Promise<LanguageHarness> {
   const stateDir = mkdtempSync(join(tmpdir(), 'superagent-lang-'))
   dirs.push(stateDir)
   const host = createFakeHost()
@@ -52,6 +56,7 @@ async function startRuntime(language: 'zh' | 'en'): Promise<LanguageHarness> {
     },
     policy: { mode: 'auto' },
     language,
+    ...(quiet ? { quiet } : {}),
     passIntervalMs: 60_000,
     heartbeatIntervalMs: 60_000,
     watchdog: { intervalMs: 60_000 },
@@ -171,5 +176,44 @@ describe('language configuration (task-18)', () => {
   it('keeps the role prompts language-aware', () => {
     expect(workerSystemPrompt('zh')).toContain('始终使用简体中文')
     expect(workerSystemPrompt('en')).toContain('in English')
+  })
+})
+
+describe('quiet message cap (task-21)', () => {
+  it('only uses a positive maxChars, then minChars, then the Engine default', () => {
+    expect(resolveQuietMaxChars({ maxChars: 0, minChars: 100 })).toBe(100)
+    expect(resolveQuietMaxChars({ maxChars: -10, minChars: 100 })).toBe(100)
+    expect(resolveQuietMaxChars({ maxChars: 0, minChars: 0 })).toBeUndefined()
+    expect(resolveQuietMaxChars({})).toBeUndefined()
+    expect(resolveQuietMaxChars(undefined)).toBeUndefined()
+    expect(resolveQuietMaxChars({ maxChars: 42, minChars: 100 })).toBe(42)
+    expect(resolveQuietMaxChars({ maxChars: Number.NaN, minChars: 80 })).toBe(80)
+    expect(resolveQuietMaxChars({ maxChars: Number.POSITIVE_INFINITY, minChars: 80 })).toBe(80)
+  })
+
+  it('never produces a "…"-only result message when maxChars is 0 or missing', async () => {
+    const longSummary = 'fixed the CineNest issue and opened the PR https://github.com/example/repo/pull/42 please review it when you can'
+    for (const quiet of [{ maxChars: 0, minChars: 100 }, { maxChars: 0, minChars: 0 }, {}, { maxChars: -1, minChars: 100 }]) {
+      const harness = await startRuntime('zh', quiet)
+      try {
+        const text = await readyMessage(harness, `tr_quiet_${JSON.stringify(quiet).length}_${Math.random().toString(36).slice(2, 6)}`, longSummary)
+        expect(text).not.toBe('…')
+        expect(text.length).toBeLessThanOrEqual(100)
+        expect(text).toContain('已完成')
+      } finally {
+        await harness.runtime.stop()
+      }
+    }
+  })
+
+  it('honours a positive maxChars as the cap', async () => {
+    const harness = await startRuntime('zh', { maxChars: 40, minChars: 100 })
+    try {
+      const text = await readyMessage(harness, 'tr_quiet_cap', 'x'.repeat(200))
+      expect(text.length).toBeLessThanOrEqual(40)
+      expect(text).toContain('已完成')
+    } finally {
+      await harness.runtime.stop()
+    }
   })
 })

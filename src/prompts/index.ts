@@ -327,7 +327,12 @@ export function renderAssignmentMessage(options: AssignmentRenderOptions): strin
     lines.push('2. continue from the last verified artefact;')
     lines.push('3. report progress only if the state was unclear, otherwise continue to the next real milestone.')
   }
-  lines.push('report with superagent_report. A turn must not end without a report; blocked/ready/failed wake the user.')
+  lines.push(
+    'report with superagent_report. A turn must not end without a report; blocked/ready/failed wake the user.',
+  )
+  lines.push(
+    'user-facing conclusion belongs in report.summary (<= 100 chars); do not post status/summary comments with superagent_github unless the comment is the deliverable (review/inline findings).',
+  )
   return lines.join('\n')
 }
 

@@ -64,6 +64,24 @@ describe('prompt files', () => {
     expect(normalizeLanguage(undefined)).toBe('zh')
   })
 
+  it('forbids standalone status/summary comments and routes the conclusion through the report', () => {
+    const worker = workerSystemPrompt('en')
+    expect(worker).toContain('Do **not** post ordinary status')
+    expect(worker).toContain('<= 100 characters')
+    expect(worker).toContain('runtime — not you — sends the single user-facing message')
+    expect(worker).toContain('Never use')
+    expect(worker).toContain('code review')
+    const ticket = makeTicket()
+    const assignment = renderAssignmentMessage({
+      ticket,
+      assignment: ticket.assignments[0]!,
+      directory: '/tmp/work/t_1',
+      triggers: [],
+    })
+    expect(assignment).toContain('user-facing conclusion belongs in report.summary')
+    expect(assignment).toContain('do not post status/summary comments')
+  })
+
   it('guides a worker to create a repository when the ticket has none', () => {
     expect(workerSystemPrompt('en')).toContain('create_repository')
     expect(workerSystemPrompt('en')).toContain('git init -b main')
