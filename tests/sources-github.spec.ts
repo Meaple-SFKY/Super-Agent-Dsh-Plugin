@@ -15,6 +15,7 @@ import type { SourceContext, SourceHealth, SourceLogger } from '../src/sources/k
 import {
   createSource,
   parseCommentTarget,
+  sanitizeHealthDetail,
   type GithubCallbacks,
   type GithubConfig,
   type GithubPullInfo,
@@ -146,6 +147,8 @@ interface TestContext {
   triggers: Trigger[]
   health: SourceHealth[]
   kv: Map<string, unknown>
+  /** Extras passed to `logger.warn`, for "warn once" assertions. */
+  loggerWarnings: Array<Record<string, unknown>>
 }
 
 interface TestContextOptions {
@@ -160,11 +163,14 @@ function makeContext(id = 'github', options: TestContextOptions = {}): TestConte
   const triggers: Trigger[] = []
   const health: SourceHealth[] = []
   const seen = new Set<string>()
+  const loggerWarnings: Array<Record<string, unknown>> = []
   let counter = 0
   const logger: SourceLogger = {
     debug: () => undefined,
     info: () => undefined,
-    warn: () => undefined,
+    warn: (_message: string, extra?: Record<string, unknown>) => {
+      loggerWarnings.push(extra ?? {})
+    },
     error: () => undefined,
   }
   const receive = (trigger: Trigger): Disposition => {
@@ -196,7 +202,7 @@ function makeContext(id = 'github', options: TestContextOptions = {}): TestConte
       keys: (prefix = '') => [...kv.keys()].filter(key => key.startsWith(prefix)),
     },
   } as SourceContext
-  return { ctx, triggers, health, kv }
+  return { ctx, triggers, health, kv, loggerWarnings }
 }
 
 const signal = (): AbortSignal => new AbortController().signal
@@ -1006,6 +1012,115 @@ describe('github source: automatic repository discovery', () => {
     expect(fake.requestsTo('/user/repos')).toHaveLength(0)
   })
 
+  it('drops a 404 repository from the wildcard set, refreshes discovery and stops requesting it', async () => {
+    const alive = 'agent/alive'
+    const gone = 'agent/gone'
+    let listed = [gone, alive]
+    let discoveryCalls = 0
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repos') {
+        discoveryCalls += 1
+        // The remote list no longer contains the deleted repository on refresh.
+        if (discoveryCalls > 1) listed = [alive]
+        return {
+          body: listed.map((fullName, index) => ({
+            id: index + 1,
+            full_name: fullName,
+            name: fullName.split('/')[1],
+            owner: { login: 'agent' },
+            default_branch: 'main',
+          })),
+        }
+      }
+      const match = /^\/repos\/([^/]+\/[^/]+)\//.exec(request.path)
+      if (!match) return undefined
+      const repo = match[1]!
+      if (repo === gone || !listed.includes(repo)) return { status: 404, body: { message: 'Not Found' } }
+      return emptyStreams(request, repo)
+    })
+    const { ctx, kv, loggerWarnings } = makeContext('github')
+    const source = createSource(baseConfig(fake.url, { repositories: ['*'] }), ctx) as GithubSource
+
+    const first = await source.pollOnce(signal())
+    expect(first.errors).toEqual([])
+    expect(first.removed).toEqual([gone])
+    expect(first.repos).toBe(1)
+    expect(discoveryCalls).toBeGreaterThanOrEqual(2)
+    expect(kv.get('github:cursors:agent/gone')).toBeUndefined()
+    // Dropping a discovered repository is not a user-facing warning.
+    expect(loggerWarnings).toEqual([])
+    const goneRequests = fake.requests.filter(request => request.path.startsWith('/repos/agent/gone/')).length
+    expect(goneRequests).toBeGreaterThan(0)
+
+    const second = await source.pollOnce(signal())
+    expect(second.errors).toEqual([])
+    expect(second.repos).toBe(1)
+    expect(fake.requests.filter(request => request.path.startsWith('/repos/agent/gone/')).length).toBe(goneRequests)
+  })
+
+  it('keeps an explicit repository but warns only once when it 404s', async () => {
+    const fake = await startGithub(request => {
+      if (/^\/repos\/o\/r\//.test(request.path)) return { status: 404, body: { message: 'Not Found' } }
+      return undefined
+    })
+    const { ctx, loggerWarnings } = makeContext('github')
+    const source = createSource(baseConfig(fake.url), ctx) as GithubSource
+
+    const first = await source.pollOnce(signal())
+    expect(first.errors).toEqual([])
+    expect(first.removed).toEqual([])
+    expect(first.repos).toBe(1)
+    expect(loggerWarnings).toHaveLength(1)
+    expect(String(loggerWarnings[0]!.repo)).toBe('o/r')
+
+    const second = await source.pollOnce(signal())
+    expect(second.errors).toEqual([])
+    expect(loggerWarnings).toHaveLength(1)
+  })
+
+  it('keeps health details on one short line without URLs or query strings', async () => {
+    const gone = 'agent/demo-1'
+    let discoveryCalls = 0
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repos') {
+        discoveryCalls += 1
+        const listed = discoveryCalls > 1 ? [] : [gone]
+        return {
+          body: listed.map((fullName, index) => ({
+            id: index + 1,
+            full_name: fullName,
+            name: fullName.split('/')[1],
+            owner: { login: 'agent' },
+            default_branch: 'main',
+          })),
+        }
+      }
+      if (/^\/repos\/agent\/demo-1\//.test(request.path)) {
+        return { status: 404, body: { message: 'Not Found' } }
+      }
+      return undefined
+    })
+    const { ctx, health } = makeContext('github')
+    const source = createSource(baseConfig(fake.url, { repositories: ['*'], pollSeconds: 10 }), ctx) as GithubSource
+
+    await source.start()
+    await waitFor(() => health.some(entry => (entry.detail ?? '').includes('repo removed')))
+    await source.stop()
+
+    for (const entry of health) {
+      const detail = entry.detail ?? ''
+      expect(detail).not.toContain('\n')
+      expect(detail).not.toContain('?')
+      expect(detail).not.toContain('http://')
+      expect(detail).not.toContain('test-token-not-a-secret')
+      expect(detail.length).toBeLessThanOrEqual(160)
+    }
+    const ready = health.find(entry => entry.state === 'ready')!
+    expect(ready.detail).toContain('agent/demo-1')
+    expect(ready.detail).toContain('(auto)')
+    expect(ready.detail).toContain('repo removed (deleted or no access)')
+  })
+
   it('reports the resolved count as "N repo(s) (auto)" in health', async () => {
     const fake = await startGithub(request => {
       if (request.path === '/user/repos') {
@@ -1033,6 +1148,23 @@ describe('github source: automatic repository discovery', () => {
       health.some(entry => entry.state === 'ready' && (entry.detail ?? '').includes('2 repo(s) (auto)')),
     )
     await source.stop()
+  })
+})
+
+describe('github health detail sanitizing', () => {
+  it('collapses newlines, URLs and query strings and caps the length', () => {
+    const raw =
+      '0 trigger(s); 1 repo failed: GitHub GET /repos/o/r/issues?state=open&since=2026-01-01 failed (HTTP 404)\nsecond line http://example.test/x'
+    const clean = sanitizeHealthDetail(raw)
+    expect(clean).not.toContain('\n')
+    expect(clean).not.toContain('?')
+    expect(clean).not.toContain('http')
+    expect(clean).toContain('1 repo failed')
+    expect(clean.length).toBeLessThanOrEqual(160)
+
+    const long = sanitizeHealthDetail('x'.repeat(400))
+    expect(long.length).toBeLessThanOrEqual(160)
+    expect(long.endsWith('…')).toBe(true)
   })
 })
 
@@ -1221,8 +1353,9 @@ describe('github source: loop resilience', () => {
       ctx,
     ) as GithubSource
     await source.start()
+    // The panel detail is short; the full cause (env var name) goes to the log.
     await waitFor(() =>
-      health.some(entry => (entry.detail ?? '').includes('SUPERAGENT_TEST_MISSING_GH_TOKEN_XYZ')),
+      health.some(entry => (entry.detail ?? '').toLowerCase().includes('token')),
     )
     await source.stop()
     expect(source.healthState()).toBe('off')

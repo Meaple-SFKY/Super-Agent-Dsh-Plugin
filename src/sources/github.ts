@@ -387,6 +387,69 @@ export class ReceiveFailedError extends Error {
   }
 }
 
+/**
+ * A repository answered 404/410 on a repository-level read: it was deleted,
+ * renamed, or the token lost access. `pollOnce` turns this into "remove it from
+ * the wildcard set" instead of repeating the same failure every minute.
+ */
+export class RepositoryGoneError extends Error {
+  readonly repo: string
+  readonly status: number
+
+  constructor(repo: string, status: number) {
+    super(`repository ${repo} is not accessible (HTTP ${status})`)
+    this.name = 'RepositoryGoneError'
+    this.repo = repo
+    this.status = status
+  }
+}
+
+function repositoryGoneStatus(error: unknown): number | undefined {
+  if (error instanceof GithubApiError && (error.status === 404 || error.status === 410)) {
+    return error.status
+  }
+  return undefined
+}
+
+/**
+ * Collapse a health detail to one short line for the panel: no newlines, no
+ * URLs, no query strings, at most `maxLength` characters.
+ */
+export function sanitizeHealthDetail(text: string, maxLength = 160): string {
+  const singleLine = text
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/git@\S+/gi, '')
+    .replace(/\/repos\/\S*/gi, '')
+    .replace(/\?\S*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (singleLine.length <= maxLength) return singleLine
+  return `${singleLine.slice(0, Math.max(0, maxLength - 1))}…`
+}
+
+const FAILED_REPO_STATUS = /HTTP (\d{3})/
+
+function firstFailedStatus(errors: string[]): string | undefined {
+  for (const error of errors) {
+    const match = FAILED_REPO_STATUS.exec(error)
+    if (match) return `HTTP ${match[1]}`
+  }
+  return undefined
+}
+
+/** A few-word category for a failure without an HTTP status (token, timeout...). */
+function failureTag(errors: string[]): string | undefined {
+  const status = firstFailedStatus(errors)
+  if (status) return status
+  const text = errors.join(' ')
+  if (/token/i.test(text)) return 'token'
+  if (/timeout/i.test(text)) return 'timeout'
+  if (/network|fetch failed|ECONN/i.test(text)) return 'network'
+  if (/discovery/i.test(text)) return 'discovery'
+  return undefined
+}
+
 export interface GithubPollResult {
   repos: number
   emitted: number
@@ -394,6 +457,8 @@ export interface GithubPollResult {
   errors: string[]
   /** Non-fatal problems (e.g. stale automatic repository discovery). */
   warnings: string[]
+  /** Repositories dropped from the wildcard set because they returned 404/410. */
+  removed: string[]
 }
 
 interface RepoPollResult {
@@ -420,6 +485,8 @@ export class GithubSource implements Source {
   private autoRepositoryFailures = 0
   private autoRepositoryLastAttempt = 0
   private autoRepositoryLastError: string | undefined
+  /** Explicit-list repositories already warned about a 404, so we warn once. */
+  private readonly warnedGoneRepositories = new Set<string>()
 
   constructor(config: GithubConfig, ctx: SourceContext) {
     this.ctx = ctx
@@ -461,13 +528,7 @@ export class GithubSource implements Source {
         const result = await this.pollOnce(signal)
         failures = result.errors.length > 0 ? failures + 1 : 0
         if (signal.aborted) break
-        const auto = this.wantsAutoRepositories() ? ' (auto)' : ''
-        const warning = result.warnings.length > 0 ? `; ${result.warnings[0]}` : ''
-        const detail =
-          result.errors.length > 0
-            ? `${result.emitted} trigger(s); ${result.errors.length} repo read(s) failed: ${result.errors[0]}; ${result.repos} repo(s)${auto}${warning}`
-            : `${result.emitted} trigger(s), ${result.filtered} filtered in ${result.repos} repo(s)${auto}${warning}`
-        this.report(failures >= 3 ? 'error' : 'ready', detail)
+        this.report(failures >= 3 ? 'error' : 'ready', this.healthDetail(result))
         await this.sleep(this.config.pollSeconds * 1000, signal)
       } catch (error) {
         if (signal.aborted) break
@@ -489,7 +550,8 @@ export class GithubSource implements Source {
   private report(state: HealthState, detail: string): void {
     this.lastHealth = state
     try {
-      this.ctx.health({ name: GITHUB_SOURCE, state, detail, at: this.ctx.now() })
+      // The panel shows this verbatim: keep it one short line, no URLs.
+      this.ctx.health({ name: GITHUB_SOURCE, state, detail: sanitizeHealthDetail(detail), at: this.ctx.now() })
     } catch {
       // Never let health reporting take the loop down.
     }
@@ -552,6 +614,7 @@ export class GithubSource implements Source {
       filtered: 0,
       errors,
       warnings,
+      removed: [],
     }
     for (const repo of repositories) {
       if (signal.aborted) throw abortError()
@@ -561,10 +624,51 @@ export class GithubSource implements Source {
         result.filtered += repoResult.filtered
       } catch (error) {
         if (signal.aborted || isAbortError(error)) throw error
+        if (error instanceof RepositoryGoneError) {
+          const outcome = this.handleRepositoryGone(repo)
+          if (outcome === 'auto') {
+            result.removed.push(repo)
+            this.ctx.logger.info('github: discovered repository disappeared; refreshing discovery', { repo })
+          }
+          continue
+        }
+        this.ctx.logger.warn('github: repository poll failed', { repo, error: describeError(error) })
         result.errors.push(`${repo}: ${describeError(error)}`)
       }
     }
+    if (result.removed.length > 0) {
+      // The deleted repository is already out of the cached set; refresh now so
+      // a rename/replacement is picked up without waiting for the 10-minute tick.
+      try {
+        await this.refreshAutoRepositories(api, signal)
+      } catch (error) {
+        if (signal.aborted || isAbortError(error)) throw error
+        result.warnings.push(`repository discovery: ${describeError(error)}`)
+      }
+    }
+    // Discovery may have changed the set (or removed repositories).
+    result.repos = this.effectiveRepositories().length
     return result
+  }
+
+  /** One short line for the panel; several repositories are summarised. */
+  private healthDetail(result: GithubPollResult): string {
+    const auto = this.wantsAutoRepositories() ? ' (auto)' : ''
+    const repositories = this.effectiveRepositories()
+    const parts = [
+      `${result.emitted} trigger(s), ${result.filtered} filtered`,
+      `${result.repos} repo(s)${auto}${repositories[0] ? `: ${repositories[0]}` : ''}`,
+    ]
+    if (result.removed.length > 0) {
+      parts.push(`${result.removed.length} repo removed (deleted or no access): ${result.removed[0]}`)
+    }
+    if (result.errors.length > 0) {
+      const tag = failureTag(result.errors)
+      const firstFailedRepo = result.errors[0]?.split(':')[0]
+      parts.push(`${result.errors.length} repo failed${tag ? ` (${tag})` : ''}${firstFailedRepo ? `: ${firstFailedRepo}` : ''}`)
+    }
+    if (result.warnings.length > 0) parts.push(`${result.warnings.length} warning(s)`)
+    return sanitizeHealthDetail(parts.join('; '))
   }
 
   // -------------------------------------------------------------------------
@@ -650,6 +754,44 @@ export class GithubSource implements Source {
     }
   }
 
+  /**
+   * A repository read answered 404/410. Wildcard-discovered repositories are
+   * dropped from the resolved set (the next refresh decides whether it was
+   * renamed); explicit entries stay configured and only warn once.
+   */
+  private handleRepositoryGone(repo: string): 'auto' | 'explicit' {
+    const auto = this.autoRepositories
+    if (auto && auto.repositories.some(candidate => sameName(candidate, repo))) {
+      this.autoRepositories = {
+        repositories: auto.repositories.filter(candidate => !sameName(candidate, repo)),
+        resolvedAt: 0, // force a discovery refresh on the next opportunity
+      }
+      this.forgetRepository(repo)
+      return 'auto'
+    }
+    const key = repo.toLowerCase()
+    if (!this.warnedGoneRepositories.has(key)) {
+      this.warnedGoneRepositories.add(key)
+      this.ctx.logger.warn(
+        'github: repository is not accessible (404); keeping the explicit entry in repositories',
+        { repo },
+      )
+    }
+    return 'explicit'
+  }
+
+  /** Drop per-repository poll state once a repository is gone for good. */
+  private forgetRepository(repo: string): void {
+    try {
+      this.branchCache.delete(repo)
+      this.ctx.kv.delete(KV.cursors(repo))
+      this.ctx.kv.delete(KV.pulls(repo))
+      this.ctx.kv.delete(KV.ci(repo))
+    } catch {
+      // State cleanup is best effort; polling must continue.
+    }
+  }
+
   private async pollRepo(api: GithubApi, repo: string, signal: AbortSignal): Promise<RepoPollResult> {
     const cursors = this.loadCursors(repo)
     const trackedPulls = this.loadTrackedPulls(repo)
@@ -679,6 +821,10 @@ export class GithubSource implements Source {
         await run()
       } catch (error) {
         if (signal.aborted || isAbortError(error)) throw error
+        // A 404/410 on a repository-level read means the repository itself is
+        // gone; `pollOnce` decides whether to drop it or warn once.
+        const gone = repositoryGoneStatus(error)
+        if (gone !== undefined) throw new RepositoryGoneError(repo, gone)
         errors.push(`${label}: ${describeError(error)}`)
       }
     }
@@ -747,7 +893,15 @@ export class GithubSource implements Source {
         if (this.config.allowSelf || !this.isSelf(pull.user.login)) reviewCandidates.push(pull)
       }
       for (const pull of reviewCandidates.slice(0, MAX_REVIEW_PULLS)) {
-        const reviews = await api.listPullReviews(repo, pull.number, { signal })
+        let reviews: GithubPage<GithubReview>
+        try {
+          reviews = await api.listPullReviews(repo, pull.number, { signal })
+        } catch (error) {
+          if (signal.aborted || isAbortError(error)) throw error
+          // A deleted PR 404s this endpoint; the repository itself is fine.
+          if (repositoryGoneStatus(error) !== undefined) continue
+          throw error
+        }
         if (reviews.notModified) continue
         let read = 0
         for (const review of reviews.items) {
