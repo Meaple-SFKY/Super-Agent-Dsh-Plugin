@@ -224,6 +224,48 @@ export function renderCommandReply(
 }
 
 // ---------------------------------------------------------------------------
+// User-facing safe-mode notice
+// ---------------------------------------------------------------------------
+
+/** Hard cap for any direct user notification pushed outside the Engine. */
+export const USER_NOTICE_LIMIT = 140
+
+/**
+ * The one short, localized sentence shown when safe mode pauses the plugin.
+ * It deliberately carries no error chain, command, path or duration: those
+ * stay in the log and in health/panel `detail`.
+ */
+export function renderSafeModeNotice(language: 'zh' | 'en'): string {
+  return language === 'en'
+    ? 'SuperAgent paused automatic work after repeated failures. See the panel or logs for details, then send /resume in Telegram.'
+    : 'SuperAgent 因连续失败已暂停自动处理。详情请查看面板或日志；修复后在 Telegram 发送 /resume 即可继续。'
+}
+
+/**
+ * Defense-in-depth for user notifications: strip code blocks, shell command
+ * lines, absolute paths and remote URLs, collapse whitespace and cap the
+ * length. Safe mode itself never passes raw errors here, but any future
+ * notice goes through the same gate.
+ */
+export function sanitizeUserNotice(text: string, limit = USER_NOTICE_LIMIT): string {
+  let out = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`[^`]*`/g, ' ')
+    .replace(/\bcommand failed[^\n]*/gi, ' ')
+    .replace(/\b(?:\/bin\/(?:sh|bash|zsh)|sh -lc|bash -lc|cmd\.exe[^\n]*)[^\n]*/gi, ' ')
+    .replace(/\b(?:git|npm|pnpm|yarn|node|python3?|brew|pip3?)\s[^\n]*/gi, ' ')
+    .replace(/[A-Za-z]:\\[^\s,;]+/g, ' ')
+    .replace(/(?:^|\s)\/(?:[\w.-]+\/)+[\w.-]*/g, ' ')
+    .replace(/\b[\w.-]+@[\w.-]+:[\w./-]+\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  // Keep the leading sentence readable when everything after it was stripped.
+  out = out.replace(/[\s:;,-]+$/, '')
+  if (out.length > limit) out = `${out.slice(0, Math.max(0, limit - 1))}…`
+  return out
+}
+
+// ---------------------------------------------------------------------------
 // Policy
 // ---------------------------------------------------------------------------
 
@@ -968,9 +1010,9 @@ export class Runtime {
         this.logger.warn('could not stop effects in safe mode', { error: errorMessage(error) })
       }
       this.writeHeartbeat()
-      await this.notifyUser(
-        this.language === 'en' ? `SuperAgent paused itself: ${reason}` : `SuperAgent 已自动暂停：${reason}`,
-      )
+      // Details stay in logger/health/statusDetail (panel); the user gets one
+      // short, localized sentence with the next step.
+      await this.notifyUser(renderSafeModeNotice(this.language))
     })().catch((error: unknown) => {
       this.logger.warn('safe mode transition failed', { error: errorMessage(error) })
     })
@@ -1007,7 +1049,7 @@ export class Runtime {
         id: `msg_${Date.now().toString(36)}safe`,
         purpose: 'notice',
         channel: { source: 'telegram', thread: `telegram:dm:${chat}`, to: chat },
-        text: text.length > 200 ? `${text.slice(0, 199)}…` : text,
+        text: sanitizeUserNotice(redactDetail(text)),
         markdown: 'plain',
         at: this.clock.now(),
       }

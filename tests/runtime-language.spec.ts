@@ -14,8 +14,11 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   Runtime,
+  USER_NOTICE_LIMIT,
   renderCommandReply,
+  renderSafeModeNotice,
   resolveQuietMaxChars,
+  sanitizeUserNotice,
   validateConfig,
   type RuntimeConfig,
 } from '../src/app/runtime.js'
@@ -212,6 +215,60 @@ describe('quiet message cap (task-21)', () => {
       const text = await readyMessage(harness, 'tr_quiet_cap', 'x'.repeat(200))
       expect(text.length).toBeLessThanOrEqual(40)
       expect(text).toContain('已完成')
+    } finally {
+      await harness.runtime.stop()
+    }
+  })
+})
+
+describe('safe-mode user notice (task-24)', () => {
+  const NASTY =
+    'SuperAgent paused itself: effect launch failed 5 times: command failed (Command failed: /bin/sh -lc git clone git@github.com:owner/repo.git /Users/me/.dsh/state/work/t_abc)'
+
+  it('is localized, short and free of commands/paths/error chains', () => {
+    for (const language of ['zh', 'en'] as const) {
+      const notice = renderSafeModeNotice(language)
+      expect(notice.length).toBeLessThanOrEqual(USER_NOTICE_LIMIT)
+      expect(notice).toContain('/resume')
+      expect(notice).not.toMatch(/git clone|\/bin\/sh|command failed|effect launch|\/Users\/|git@github/)
+      expect(notice).not.toContain('…')
+    }
+    expect(renderSafeModeNotice('zh')).toContain('已暂停自动处理')
+    expect(renderSafeModeNotice('zh')).not.toContain('paused itself')
+    expect(renderSafeModeNotice('en')).toContain('paused automatic work')
+    expect(renderSafeModeNotice('en')).not.toContain('已暂停')
+  })
+
+  it('sanitizes any future notice as defense in depth', () => {
+    const cleaned = sanitizeUserNotice(NASTY)
+    expect(cleaned.length).toBeLessThanOrEqual(USER_NOTICE_LIMIT)
+    expect(cleaned).not.toMatch(/\/bin\/sh|git clone|command failed|\/Users\/|git@github\.com/)
+    expect(sanitizeUserNotice('x'.repeat(500)).length).toBeLessThanOrEqual(USER_NOTICE_LIMIT)
+    expect(sanitizeUserNotice('`rm -rf /tmp/x` done')).not.toContain('rm -rf')
+    expect(sanitizeUserNotice('see /Users/me/state/superagent.sqlite please')).not.toContain('/Users/me')
+  })
+
+  it('sends only the short localized notice when entering safe mode; details stay in health', async () => {
+    const harness = await startRuntime('zh')
+    try {
+      const engine = harness.runtime.enginePort as unknown as { evaluateDue: () => void }
+      engine.evaluateDue = () => {
+        throw new Error('effect launch failed 5 times: command failed (Command failed: /bin/sh -lc git clone git@github.com:owner/repo.git /Users/me/state/work/t_1)')
+      }
+      for (let index = 0; index < 5; index++) await harness.runtime.pass('safe-mode-test')
+      await until(() => harness.source.sent.length > 0, 4_000, 'safe-mode notice')
+
+      const text = harness.source.sent[0]!.text
+      expect(text).toContain('已暂停自动处理')
+      expect(text.length).toBeLessThanOrEqual(USER_NOTICE_LIMIT)
+      expect(text).not.toMatch(/\/bin\/sh|git clone|command failed|\/Users\/|git@github|effect launch/)
+
+      // Details remain available to the panel/health (and the log).
+      const state = harness.runtime.buildState()
+      expect(state.plugin.status).toBe('degraded')
+      expect(state.plugin.detail ?? '').toContain('safe mode')
+      expect(state.plugin.detail ?? '').toContain('command failed')
+      expect(harness.host.logger.text()).toContain('entering SAFE MODE')
     } finally {
       await harness.runtime.stop()
     }
