@@ -359,7 +359,7 @@ export class NativeSource implements Source {
           this.json(response, 400, { ok: false, error: 'invalid_text', description: 'text must be 1..20000 characters' })
           return
         }
-        const attachments = validateTaskAttachments(body.attachments)
+        const { attachments, warnings } = validateTaskAttachments(body.attachments)
         const clientTaskId = typeof body.clientTaskId === 'string' ? body.clientTaskId.slice(0, 200) : undefined
         const result = await this.bridge.createTask({
           text,
@@ -369,6 +369,7 @@ export class NativeSource implements Source {
         this.json(response, result.ok ? 200 : 400, {
           ...result,
           status: result.ticketId ? 'accepted' : 'pending',
+          ...(warnings.length > 0 ? { warnings } : {}),
         })
         return
       }
@@ -671,24 +672,36 @@ const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.he
  * Validate `attachments` from a native task: absolute paths of existing regular
  * files, at most 10. Returns the normalized attachment list for Trigger.meta.
  */
-export function validateTaskAttachments(value: unknown): NativeTaskAttachment[] {
-  if (value === undefined) return []
-  if (!Array.isArray(value)) throw new NativeHttpError(400, 'invalid_attachments', 'attachments must be an array of absolute paths')
-  if (value.length > 10) throw new NativeHttpError(400, 'invalid_attachments', 'at most 10 attachments are allowed')
+export function validateTaskAttachments(value: unknown): { attachments: NativeTaskAttachment[]; warnings: string[] } {
+  if (value === undefined || value === null) return { attachments: [], warnings: [] }
+  const warnings: string[] = []
+  if (!Array.isArray(value)) {
+    return { attachments: [], warnings: ['attachments was ignored: expected an array of absolute paths'] }
+  }
+  const entries = value.slice(0, 10)
+  if (value.length > 10) warnings.push(`only the first 10 attachments were used (${value.length} given)`)
   const attachments: NativeTaskAttachment[] = []
-  for (const entry of value) {
+  for (const entry of entries) {
     if (typeof entry !== 'string' || entry.trim().length === 0) {
-      throw new NativeHttpError(400, 'invalid_attachments', 'each attachment must be a non-empty absolute path')
+      warnings.push('an attachment was ignored: expected a non-empty absolute path')
+      continue
     }
     const path = entry.trim()
-    if (!isAbsolute(path)) throw new NativeHttpError(400, 'invalid_attachments', `attachment is not an absolute path: ${path}`)
+    if (!isAbsolute(path)) {
+      warnings.push(`attachment ignored (not an absolute path): ${path}`)
+      continue
+    }
     let stat
     try {
       stat = statSync(path)
     } catch {
-      throw new NativeHttpError(400, 'invalid_attachments', `attachment does not exist: ${path}`)
+      warnings.push(`attachment ignored (does not exist): ${path}`)
+      continue
     }
-    if (!stat.isFile()) throw new NativeHttpError(400, 'invalid_attachments', `attachment is not a regular file: ${path}`)
+    if (!stat.isFile()) {
+      warnings.push(`attachment ignored (not a regular file): ${path}`)
+      continue
+    }
     const name = basename(path)
     const extension = name.includes('.') ? name.slice(name.lastIndexOf('.')).toLowerCase() : ''
     attachments.push({
@@ -698,10 +711,9 @@ export function validateTaskAttachments(value: unknown): NativeTaskAttachment[] 
       size: stat.size,
     })
   }
-  return attachments
+  return { attachments, warnings }
 }
 
-/** Source kind factory used by the runtime. */
 export function createSource(config: unknown, ctx: SourceContext): Source {
   const parsed = (config ?? {}) as NativeSourceConfig
   return new NativeSource(ctx, parsed)

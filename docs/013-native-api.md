@@ -92,7 +92,8 @@ curl -s -H "x-mmagent-token: $TOKEN" http://127.0.0.1:47821/superagent/native/v1
   - `snapshot`：连接初始状态。
   - `ticket`：Ticket 新增或 stage/lastReport 变化 `{ticket:{id,title,stage,lastReport,at}}`。
   - `attention`：Ticket 进入 attention（blocked/ready/failed）`{ticket}`。
-  - `message`：插件发给用户的出站消息 `{message:{...OutboundMessage}, inboxId}`（与 `/messages` 条目一致；App 应渲染文本/附件）。
+  - `message`：插件发给用户的出站消息：`{message:{...OutboundMessage}, inboxId, thread, ticketId, purpose}`
+    - 顶层 `thread` / `ticketId` / `purpose` 便于 App 不解析 `message` 内部结构就做路由/分组（`ticketId` 可能为 `null`）。
   - `result`：Ticket 结束 `{ticket}`。
 - 断线重连：带 `Last-Event-ID: <last id>`；未带时重新收到 snapshot。
 
@@ -107,10 +108,20 @@ const es = new EventSource(url + '/events') // 浏览器 EventSource 不能带�
 
 ```json
 // request
-{ "text": "修复构建并提交 PR", "clientTaskId": "mac-uuid-1" }
+{
+  "text": "修复构建并提交 PR",
+  "clientTaskId": "mac-uuid-1",
+  "attachments": ["/Users/me/Desktop/bug.png", "/Users/me/Desktop/log.txt"]
+}
 // response 200
 { "ok": true, "ticketId": "tk_1|null", "threadId": "native:task:<uuid>", "triggerId": "tr_native_...", "status": "accepted|pending" }
 ```
+
+`attachments`（可选）：本机**绝对路径**数组，最多 10 个。有效项会归一化为
+`{path, name, kind: 'photo'|'document', size}`（图片扩展名 → `photo`）写入 `Trigger.meta.attachments`，Worker 可用
+`read_image`/`read_file` 读取、也可在报告里用 `files` 回传。
+**宽容策略**：不存在/非普通文件/相对路径/非字符串/超过 10 个不会让任务失败——无效项被忽略，前 10 个有效项提交，
+响应带 `warnings: string[]` 说明原因（例如 `"attachment ignored (does not exist): /…"`）。App 可展示这些警告。
 
 - 每个任务创建一个**独立 Thread** `native:task:<uuid>`（不会 resume 其他 Ticket/Thread），actor=`local`，addressed=`direct`。
 - `ticketId` 由 Router 判定接受后产生：通常立即返回；若模型尚未决定则在最多 1.5 s 后返回 `ticketId: null, status: "pending"`，随后通过 SSE `ticket` 事件给出 ticketId（用 `threadId` 关联）。
@@ -161,6 +172,7 @@ const es = new EventSource(url + '/events') // 浏览器 EventSource 不能带�
 - 只读 `state/tickets/events/messages`；写操作仅 `tasks`、`reply`、`actions`。
 - 不暴露模型列表/模型切换（v1 只读，模型在 DSH/面板配置）。
 - 不支持删除 Ticket、取消排队中的任务（用 `actions.stop`）。
+- 任务附件只支持本机文件路径（v1 无二进制上传）；附件内容由 Worker 读取，SSE 的 `message` 事件里若插件回传文件会带绝对路径。
 - SSE backlog 只在内存（进程重启后靠 snapshot + `/messages` 重建视图）；`/messages` 窗口 500 条。
 - 端口/token 每次进程启动都会重新生成；App 不要缓存 token。
 

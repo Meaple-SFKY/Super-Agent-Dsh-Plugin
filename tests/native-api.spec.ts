@@ -3,7 +3,7 @@
  * These tests use a real HTTP server and real files, but no DSH host.
  */
 
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -17,6 +17,7 @@ import {
   type NativeBridge,
   type NativeState,
   type NativeTicketDetail,
+  validateTaskAttachments,
 } from '../src/sources/native.js'
 import type { ChannelAddress, OutboundMessage, Trigger } from '../src/core/model.js'
 import type { SourceContext } from '../src/sources/kind.js'
@@ -84,7 +85,11 @@ class FakeSourceContext implements SourceContext {
 }
 
 class FakeBridge implements NativeBridge {
-  readonly tasks: Array<{ text: string; clientTaskId?: string }> = []
+  readonly tasks: Array<{
+    text: string
+    clientTaskId?: string
+    attachments?: Array<{ path: string; name: string; kind: 'photo' | 'document'; size: number }>
+  }> = []
   readonly replies: Array<{ ticketId: string; text: string }> = []
   readonly actions: Array<{ ticketId: string; action: 'ack' | 'retry' | 'stop' }> = []
   stateValue: NativeState = {
@@ -103,7 +108,11 @@ class FakeBridge implements NativeBridge {
   ticket(): NativeTicketDetail | undefined {
     return this.detail
   }
-  async createTask(input: { text: string; clientTaskId?: string }) {
+  async createTask(input: {
+    text: string
+    clientTaskId?: string
+    attachments?: Array<{ path: string; name: string; kind: 'photo' | 'document'; size: number }>
+  }) {
     this.tasks.push(input)
     return {
       ok: true,
@@ -232,6 +241,65 @@ describe('native tasks, replies and actions', () => {
     expect(invalid.status).toBe(400)
   })
 
+  it('accepts up to 10 local attachments, normalizes them and rejects invalid paths', async () => {
+    const harness = await startSource()
+    const filesDir = mkdtempSync(join(tmpdir(), 'native-attach-'))
+    const photo = join(filesDir, 'screen.png')
+    const document = join(filesDir, 'notes.txt')
+    writeFileSync(photo, 'pixel')
+    writeFileSync(document, 'hello')
+
+    const created = await fetch(`${harness.base}/tasks`, {
+      method: 'POST',
+      headers: auth(harness.token),
+      body: JSON.stringify({ text: 'look at these', attachments: [photo, document] }),
+    })
+    expect(created.status).toBe(200)
+    expect(harness.bridge.tasks[0]!.attachments).toEqual([
+      { path: photo, name: 'screen.png', kind: 'photo', size: 5 },
+      { path: document, name: 'notes.txt', kind: 'document', size: 5 },
+    ])
+
+    const badPath = join(filesDir, 'missing.png')
+    const invalidCases: unknown[] = [
+      [badPath],
+      ['relative/file.txt'],
+      [filesDir],
+      Array.from({ length: 11 }, () => photo),
+      'not-an-array',
+    ]
+    for (const attachments of invalidCases) {
+      const response = await fetch(`${harness.base}/tasks`, {
+        method: 'POST',
+        headers: auth(harness.token),
+        body: JSON.stringify({ text: 'still runs', attachments }),
+      })
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as { ok: boolean; warnings?: string[] }
+      expect(body.ok).toBe(true)
+      expect(body.warnings?.length ?? 0).toBeGreaterThan(0)
+    }
+    // The task still ran; invalid attachments never reach the bridge.
+    expect(harness.bridge.tasks[harness.bridge.tasks.length - 1]!.attachments ?? []).toEqual([])
+  })
+
+  it('validates the attachment helper directly (warn/ignore semantics)', () => {
+    const filesDir = mkdtempSync(join(tmpdir(), 'native-attach-helper-'))
+    const photo = join(filesDir, 'shot.png')
+    writeFileSync(photo, 'x')
+    expect(validateTaskAttachments([photo]).attachments).toEqual([
+      { path: photo, name: 'shot.png', kind: 'photo', size: 1 },
+    ])
+    expect(validateTaskAttachments(undefined)).toEqual({ attachments: [], warnings: [] })
+    const eleven = Array.from({ length: 11 }, () => photo)
+    const many = validateTaskAttachments(eleven)
+    expect(many.attachments).toHaveLength(10)
+    expect(many.warnings.some(line => line.includes('first 10'))).toBe(true)
+    const invalid = validateTaskAttachments([join(filesDir, 'missing.png'), 'rel.txt', filesDir, 42])
+    expect(invalid.attachments).toEqual([])
+    expect(invalid.warnings.length).toBe(4)
+  })
+
   it('returns ticket detail and forwards replies with the ticket id', async () => {
     const harness = await startSource()
     const notFound = await fetch(`${harness.base}/tickets/tk_missing`, { headers: auth(harness.token) })
@@ -336,6 +404,10 @@ describe('native outbox, inbox and SSE', () => {
     await harness.source.send(outbound('msg_sse', 'streamed'))
     await readUntil('event: message')
     expect(text).toContain('streamed')
+    // The message event carries routing/labelling fields at the top level.
+    expect(text).toContain('"thread":"native:task:t1"')
+    expect(text).toContain('"ticketId":"tk_native_1"')
+    expect(text).toContain('"purpose":"result"')
     controller.abort()
     await reader.cancel().catch(() => undefined)
   })
@@ -376,18 +448,25 @@ describe('native runtime wiring', () => {
     const body = (await state.json()) as { sources: Array<{ id: string; health: string }> }
     expect(body.sources.some(source => source.id === 'native' && source.health === 'ready')).toBe(true)
 
+    const attachment = join(stateDir, 'mac-screenshot.png')
+    writeFileSync(attachment, 'png-bytes')
     const task = await fetch(`${base}/tasks`, {
       method: 'POST',
       headers: auth(discovery.token),
-      body: JSON.stringify({ text: 'native task from mac app', clientTaskId: 'mac-1' }),
+      body: JSON.stringify({ text: 'native task from mac app', clientTaskId: 'mac-1', attachments: [attachment] }),
     })
     expect(task.status).toBe(200)
     const taskBody = (await task.json()) as { ok: boolean; threadId: string; triggerId?: string }
     expect(taskBody.ok).toBe(true)
     expect(taskBody.threadId.startsWith('native:task:')).toBe(true)
-    // The trigger reached the real Engine store with the native Source identity.
+    // The trigger reached the real Engine store with the native Source identity
+    // and the attachment list normalized into Trigger.meta.attachments.
     const triggers = store.read.search('native task from mac app', 5)
     expect(triggers.some(entry => entry.kind === 'trigger')).toBe(true)
+    const savedTrigger = store.triggers.get(taskBody.triggerId as never)
+    expect(savedTrigger?.meta.attachments).toEqual([
+      { path: attachment, name: 'mac-screenshot.png', kind: 'photo', size: 9 },
+    ])
 
     await runtime.stop()
     expect(existsSync(discoveryPath)).toBe(false)

@@ -1689,7 +1689,15 @@ export class Runtime {
           ...(ticket.ends ? { ends: { reason: String(ticket.ends.reason ?? ''), at: ticket.ends.at } } : {}),
         }
       },
-      createTask: async ({ text, clientTaskId }: { text: string; clientTaskId?: string }): Promise<NativeTaskResult> => {
+      createTask: async ({
+        text,
+        clientTaskId,
+        attachments,
+      }: {
+        text: string
+        clientTaskId?: string
+        attachments?: Array<{ path: string; name: string; kind: 'photo' | 'document'; size: number }>
+      }): Promise<NativeTaskResult> => {
         const thread = `native:task:${randomUUID()}`
         const triggerId = `tr_native_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
         const trigger = makeTrigger(triggerId, 'native', {
@@ -1700,7 +1708,11 @@ export class Runtime {
           addressed: 'direct',
           text,
           channel: { source: 'native', thread, to: thread },
-          meta: { native: true, ...(clientTaskId ? { clientTaskId } : {}) },
+          meta: {
+            native: true,
+            ...(clientTaskId ? { clientTaskId } : {}),
+            ...(attachments && attachments.length > 0 ? { attachments } : {}),
+          },
         })
         const disposition = engine().sources.receive(trigger)
         if (disposition !== 'stored' && disposition !== 'duplicate') {

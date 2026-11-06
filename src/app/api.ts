@@ -31,7 +31,7 @@ import {
 export const API_PREFIX = '/superagent/api'
 export const API_STATE_PATH = `${API_PREFIX}/state`
 export const API_ACTION_PATH = `${API_PREFIX}/action`
-export const API_VERSION = '0.2.2'
+export const API_VERSION = '0.3.0'
 export const API_HEADER = 'x-superagent-request'
 
 export interface PluginView {
