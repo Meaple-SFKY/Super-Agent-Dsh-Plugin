@@ -9,7 +9,7 @@
  */
 
 import { execFile } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, statSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
@@ -29,6 +29,11 @@ export interface ExecutorConfig {
   clone?: boolean
   /** Repository used when the ticket does not carry one. */
   defaultRepo?: string
+  /** Bot account identity for repo-local git config (never the global config). */
+  gitName?: string
+  gitEmail?: string
+  /** Absolute path to the bot account's SSH private key (used via GIT_SSH_COMMAND). */
+  gitSshKeyFile?: string
   prepareTimeoutMs?: number
   gitTimeoutMs?: number
 }
@@ -43,7 +48,12 @@ export interface ExecutorOptions {
   now?: () => IsoTime
   config?: ExecutorConfig
   /** Injectable command runner (tests). Must reject on a non-zero exit. */
-  runCommand?: (command: string, cwd: string, timeoutMs: number) => Promise<void>
+  runCommand?: (
+    command: string,
+    cwd: string,
+    timeoutMs: number,
+    env?: Record<string, string>,
+  ) => Promise<void>
 }
 
 type IsoTime = string
@@ -65,15 +75,26 @@ function renderTemplate(template: string, values: Record<string, string>): strin
   return template.replace(/\{(\w+)\}/g, (match, key: string) => values[key] ?? match)
 }
 
-/** Default command runner: one bounded shell invocation. */
-function defaultRunCommand(command: string, cwd: string, timeoutMs: number): Promise<void> {
+/** Default command runner: one bounded shell invocation with extra env. */
+function defaultRunCommand(
+  command: string,
+  cwd: string,
+  timeoutMs: number,
+  env?: Record<string, string>,
+): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh'
     const args = process.platform === 'win32' ? ['/d', '/s', '/c', command] : ['-lc', command]
     execFile(
       shell,
       args,
-      { cwd, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, windowsHide: true },
+      {
+        cwd,
+        timeout: timeoutMs,
+        maxBuffer: 4 * 1024 * 1024,
+        windowsHide: true,
+        ...(env && Object.keys(env).length > 0 ? { env: { ...process.env, ...env } } : {}),
+      },
       (error, stdout, stderr) => {
         if (!error) {
           resolve()
@@ -93,10 +114,54 @@ export class Executor {
   private readonly launching = new Set<string>()
   private stopped = false
 
+  private readonly warnedKeys = new Set<string>()
+
   constructor(options: ExecutorOptions) {
     this.options = options
     this.logger = options.logger
     this.now = options.now ?? nowIso
+  }
+
+  /** GIT_SSH_COMMAND for the bot key, or undefined when none is configured. */
+  sshCommand(): string | undefined {
+    const key = this.options.config?.gitSshKeyFile?.trim()
+    if (!key) return undefined
+    return `ssh -i ${shellQuote(key)} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`
+  }
+
+  /** Warn (never block) when the bot key is missing or world-readable. */
+  private checkSshKey(): void {
+    const key = this.options.config?.gitSshKeyFile?.trim()
+    if (!key || this.warnedKeys.has(key)) return
+    this.warnedKeys.add(key)
+    if (!existsSync(key)) {
+      this.logger.warn('the configured git SSH key does not exist; git push will fail', { gitSshKeyFile: key })
+      return
+    }
+    if (process.platform !== 'win32') {
+      try {
+        const mode = statSync(key).mode & 0o777
+        if ((mode & 0o077) !== 0) {
+          this.logger.warn('the git SSH key is readable by group/others; use chmod 600', {
+            gitSshKeyFile: key,
+            mode: mode.toString(8),
+          })
+        }
+      } catch (error) {
+        this.logger.warn('could not check the git SSH key permissions', { error: errorMessage(error) })
+      }
+    }
+  }
+
+  /** Repo-local identity commands (never `--global`). */
+  private repoIdentityCommands(): string[] {
+    const config = this.options.config ?? {}
+    const commands: string[] = []
+    const ssh = this.sshCommand()
+    if (ssh) commands.push(`git config --local core.sshCommand ${shellQuote(ssh)}`)
+    if (config.gitName?.trim()) commands.push(`git config --local user.name ${shellQuote(config.gitName.trim())}`)
+    if (config.gitEmail?.trim()) commands.push(`git config --local user.email ${shellQuote(config.gitEmail.trim())}`)
+    return commands
   }
 
   /** Directory owned by a ticket; deterministic so recovery needs no state. */
@@ -125,6 +190,11 @@ export class Executor {
       this.options.sessions.bindAssignment(ticket.id, agent.session.id, assignment.id)
       const recovery = this.options.sessions.workerWasResumed(ticket.id)
       const triggers = this.originTriggers(ticket)
+      const gitIdentity = {
+        ...(this.options.config?.gitName?.trim() ? { name: this.options.config.gitName.trim() } : {}),
+        ...(this.options.config?.gitEmail?.trim() ? { email: this.options.config.gitEmail.trim() } : {}),
+        ...(this.sshCommand() ? { sshCommand: this.sshCommand()! } : {}),
+      }
       const text = renderAssignmentMessage({
         ticket,
         assignment: { ...assignment, startedAt: assignment.startedAt ?? this.now() },
@@ -132,6 +202,7 @@ export class Executor {
         triggers,
         recovery,
         branch: `agent/${ticket.id}`,
+        ...(Object.keys(gitIdentity).length > 0 ? { git: gitIdentity } : {}),
       })
       const sent = this.options.sessions.deliverWorker(ticket.id, text, 'wake')
       if (!sent) throw new Error(`worker session ${sessionId} is not live`)
@@ -277,13 +348,30 @@ export class Executor {
   private async prepareWorkspace(options: { ticket: Ticket; directory: string; repo?: string }): Promise<void> {
     const { ticket, directory, repo } = options
     const config = this.options.config ?? {}
+    this.checkSshKey()
+    const gitEnv = this.sshCommand() ? { GIT_SSH_COMMAND: this.sshCommand()! } : undefined
     await mkdir(directory, { recursive: true, mode: 0o700 })
     const cloneEnabled = config.clone !== false
     if (repo && cloneEnabled && !existsSync(join(directory, '.git'))) {
       const url = renderTemplate(config.cloneUrl ?? DEFAULT_CLONE_URL, { repo, ticket: ticket.id })
       const command = `git clone ${shellQuote(url)} ${shellQuote(directory)}`
-      await this.run(command, directory, config.gitTimeoutMs ?? 180_000)
+      await this.run(command, directory, config.gitTimeoutMs ?? 180_000, gitEnv)
       this.logger.info('cloned the ticket repository', { ticketId: ticket.id, repo, directory })
+    }
+    // Bot identity is repo-local only: clone or an existing checkout both get it,
+    // and a brand-new repo (no .git yet) gets it from the assignment message.
+    if (existsSync(join(directory, '.git'))) {
+      const identityCommands = this.repoIdentityCommands()
+      for (const command of identityCommands) {
+        await this.run(command, directory, 30_000)
+      }
+      if (identityCommands.length > 0) {
+        this.logger.info('configured the repo-local git identity', {
+          ticketId: ticket.id,
+          directory,
+          sshKeyConfigured: Boolean(this.sshCommand()),
+        })
+      }
     }
     if (config.prepare) {
       const command = renderTemplate(config.prepare, {
@@ -292,14 +380,14 @@ export class Executor {
         repo: repo ?? '',
         branch: `agent/${ticket.id}`,
       })
-      await this.run(command, directory, config.prepareTimeoutMs ?? 180_000)
+      await this.run(command, directory, config.prepareTimeoutMs ?? 180_000, gitEnv)
       this.logger.info('ran the prepare command', { ticketId: ticket.id, directory })
     }
   }
 
-  private async run(command: string, cwd: string, timeoutMs: number): Promise<void> {
+  private async run(command: string, cwd: string, timeoutMs: number, env?: Record<string, string>): Promise<void> {
     const runner = this.options.runCommand ?? defaultRunCommand
-    await withTimeout(runner(command, cwd, timeoutMs), timeoutMs + 5_000, `prepare command in ${cwd}`)
+    await withTimeout(runner(command, cwd, timeoutMs, env), timeoutMs + 5_000, `prepare command in ${cwd}`)
   }
 
   /** Stop accepting launches and drop in-flight guards. */

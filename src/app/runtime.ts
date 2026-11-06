@@ -15,6 +15,7 @@
 import { existsSync } from 'node:fs'
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { AgentOptions } from '@deepseek-ai/dsh-agent'
@@ -51,8 +52,8 @@ import { Sessions, hostServices, type SessionInfo, type SessionsOptions } from '
 import { Executor } from './executor.js'
 import { Assessor } from './assessor.js'
 import { Watchdog } from './watchdog.js'
-import { registerApi, API_VERSION, type ApiActionRequest, type ApiActionValue, type ApiDeps, type ApiState } from './api.js'
-import { SetupService, type ConfigEditorLike } from './setup.js'
+import { registerApi, API_HEADER, API_VERSION, type ApiActionRequest, type ApiActionValue, type ApiDeps, type ApiState } from './api.js'
+import { SETUP_SSH_KEY_PATH, SetupService, type ConfigEditorLike } from './setup.js'
 import { registerRouterTools } from '../tools/router.js'
 import { registerWorkerTools } from '../tools/worker.js'
 import { preloadPrompts } from '../prompts/index.js'
@@ -85,6 +86,8 @@ export interface GithubSourceConfig {
   observePulls?: boolean
   observeComments?: boolean
   observeCi?: boolean
+  /** GitHub logins invited as admin when a ticket creates a repository. */
+  collaborators?: string[]
   [key: string]: unknown
 }
 
@@ -101,6 +104,10 @@ export interface RuntimeConfig {
     cloneUrl?: string
     clone?: boolean
     defaultRepo?: string
+    /** Dedicated bot account: repo-local git identity and SSH key (absolute path). */
+    gitName?: string
+    gitEmail?: string
+    gitSshKeyFile?: string
     prepareTimeoutMs?: number
     gitTimeoutMs?: number
   }
@@ -139,6 +146,20 @@ export function validateConfig(raw: unknown): { config?: RuntimeConfig; problem?
   if (config.language !== undefined && config.language !== 'zh' && config.language !== 'en') {
     return { problem: { error: 'configuration.language must be zh or en' } }
   }
+  const gitSshKeyFile = config.executor?.gitSshKeyFile
+  if (gitSshKeyFile !== undefined && typeof gitSshKeyFile === 'string' && gitSshKeyFile.trim().length > 0) {
+    if (!gitSshKeyFile.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(gitSshKeyFile)) {
+      return { problem: { error: 'configuration.executor.gitSshKeyFile must be an absolute path' } }
+    }
+  } else if (gitSshKeyFile !== undefined && typeof gitSshKeyFile !== 'string') {
+    return { problem: { error: 'configuration.executor.gitSshKeyFile must be a string' } }
+  }
+  for (const key of ['gitName', 'gitEmail'] as const) {
+    const value = config.executor?.[key]
+    if (value !== undefined && typeof value !== 'string') {
+      return { problem: { error: `configuration.executor.${key} must be a string` } }
+    }
+  }
   const maxWorkers = config.executor?.maxWorkers
   if (maxWorkers !== undefined && (!Number.isInteger(maxWorkers) || maxWorkers < 1)) {
     return { problem: { error: 'configuration.executor.maxWorkers must be a positive integer' } }
@@ -164,6 +185,43 @@ export function resolveQuietMaxChars(quiet: { maxChars?: number; minChars?: numb
   const positive = (value: number | undefined): number | undefined =>
     typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined
   return positive(quiet?.maxChars) ?? positive(quiet?.minChars)
+}
+
+/** The effective bot git identity: explicit config wins, then the GitHub login. */
+export interface ResolvedGitIdentity {
+  gitName?: string
+  gitEmail?: string
+  gitSshKeyFile?: string
+}
+
+/**
+ * Resolve the repo-local git identity for Worker checkouts.
+ *
+ * Defaults: `gitName` = `sources.github.login`, `gitEmail` =
+ * `<login>@users.noreply.github.com`. The SSH key path is passed through; the
+ * executor only ever sets `GIT_SSH_COMMAND`/`core.sshCommand` per repository.
+ */
+export function resolveGitIdentity(
+  executor: RuntimeConfig['executor'] | undefined,
+  githubLogin: string | undefined,
+): ResolvedGitIdentity {
+  const login = typeof githubLogin === 'string' && githubLogin.trim().length > 0 ? githubLogin.trim() : undefined
+  const gitName = typeof executor?.gitName === 'string' && executor.gitName.trim() ? executor.gitName.trim() : login
+  const gitEmail =
+    typeof executor?.gitEmail === 'string' && executor.gitEmail.trim()
+      ? executor.gitEmail.trim()
+      : login
+        ? `${login}@users.noreply.github.com`
+        : undefined
+  const gitSshKeyFile =
+    typeof executor?.gitSshKeyFile === 'string' && executor.gitSshKeyFile.trim()
+      ? executor.gitSshKeyFile.trim()
+      : undefined
+  return {
+    ...(gitName ? { gitName } : {}),
+    ...(gitEmail ? { gitEmail } : {}),
+    ...(gitSshKeyFile ? { gitSshKeyFile } : {}),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +492,8 @@ export interface RuntimeOverrides {
   sources?: Array<{ id: SourceId; source: SourceLike }>
   /** Skip the state-directory lock (tests that share a directory). */
   skipLock?: boolean
+  /** Test seam: fake `ssh-keygen` runner for the setup SSH-key endpoint. */
+  runSshKeygen?: (args: string[]) => Promise<void>
 }
 
 interface EffectStat {
@@ -466,6 +526,7 @@ export class Runtime {
   private apiDispose?: () => void
   private apiDeps?: ApiDeps
   private setupService?: SetupService
+  private sshKeyRouteDispose?: () => void
   /** Serialized heartbeat writes; awaited during shutdown so teardown is clean. */
   private heartbeatQueue: Promise<void> = Promise.resolve()
 
@@ -643,6 +704,7 @@ export class Runtime {
         ...(config.executor?.cloneUrl ? { cloneUrl: config.executor.cloneUrl } : {}),
         ...(config.executor?.clone !== undefined ? { clone: config.executor.clone } : {}),
         ...(config.executor?.defaultRepo ? { defaultRepo: config.executor.defaultRepo } : {}),
+        ...resolveGitIdentity(config.executor, config.sources?.github?.login),
         ...(config.executor?.prepareTimeoutMs ? { prepareTimeoutMs: config.executor.prepareTimeoutMs } : {}),
         ...(config.executor?.gitTimeoutMs ? { gitTimeoutMs: config.executor.gitTimeoutMs } : {}),
       },
@@ -680,6 +742,11 @@ export class Runtime {
       hostEntry: () => (this.ctx as unknown as { fiber?: { entry?: unknown } }).fiber?.entry,
       redact: redactDetail,
       language: () => this.language,
+      ...(this.overrides.runSshKeygen ? { runSshKeygen: this.overrides.runSshKeygen } : {}),
+      gitIdentity: () => {
+        const resolved = resolveGitIdentity(this.config?.executor, this.config?.sources?.github?.login)
+        return { name: resolved.gitName ?? '', email: resolved.gitEmail ?? '', sshKeyFile: resolved.gitSshKeyFile ?? '' }
+      },
     })
     // A fresh runtime means the previous setup edit already restarted us.
     this.setupService.markRestarted()
@@ -693,6 +760,7 @@ export class Runtime {
     } catch (error) {
       this.logger.warn('could not register the management API', { error: errorMessage(error) })
     }
+    this.registerSshKeyRoute()
 
     // Router session: required for assessments and replies, retried in the background.
     await this.ensureRouter()
@@ -1230,6 +1298,75 @@ export class Runtime {
     }
   }
 
+  /**
+   * `POST /superagent/api/setup/github/ssh-key`: generate (or return) the bot
+   * SSH key pair. Registered from the runtime because docs/002's setup routes
+   * live here; same loopback + `x-superagent-request` fence as every other
+   * management route, and the plugin persists `executor.gitSshKeyFile` after
+   * responding (the config write restarts the plugin).
+   */
+  private registerSshKeyRoute(): void {
+    const webServer = this.ctx.get('webServer') as
+      | {
+          register?: (route: {
+            kind: 'exact' | 'prefix'
+            path: string
+            handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>
+          }) => () => void
+        }
+      | undefined
+    const setup = this.setupService
+    if (!webServer?.register || !setup) return
+    const loopback = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
+    try {
+      this.sshKeyRouteDispose = webServer.register({
+        kind: 'exact',
+        path: SETUP_SSH_KEY_PATH,
+        handler: async (req, res) => {
+          const reply = (status: number, body: Record<string, unknown>): void => {
+            try {
+              const text = JSON.stringify(body)
+              res.writeHead(status, {
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'no-store',
+                'content-length': Buffer.byteLength(text),
+              })
+              res.end(text)
+            } catch {
+              try {
+                res.end()
+              } catch {
+                // client already gone
+              }
+            }
+          }
+          try {
+            const address = req.socket?.remoteAddress
+            if (!address || !loopback.has(address) || req.headers[API_HEADER] !== '1') {
+              reply(403, { ok: false, error: 'forbidden' })
+              return
+            }
+            if (req.method !== 'POST') {
+              reply(405, { ok: false, error: 'method not allowed' })
+              return
+            }
+            const result = await setup.generateGithubSshKey()
+            const body: Record<string, unknown> = { ...result.body }
+            if (body.ok === true && typeof body.keyFile === 'string') {
+              body.restarting = setup.persistGitSshKey(body.keyFile)
+            }
+            reply(result.status, body)
+          } catch (error) {
+            this.logger.warn('setup ssh-key endpoint failed', { error: errorMessage(error) })
+            reply(500, { ok: false, error: 'internal_error', description: 'ssh key generation failed' })
+          }
+        },
+      })
+    } catch (error) {
+      this.logger.warn('could not register the setup ssh-key route', { error: errorMessage(error) })
+    }
+  }
+
   // -- management API ------------------------------------------------------
 
   private readPaused(): boolean {
@@ -1464,6 +1601,7 @@ export class Runtime {
       ['executor', () => this.executor?.stop()],
       ['sessions', async () => this.sessions?.stop('runtime stopped')],
       ['api', () => this.apiDispose?.()],
+      ['setup-ssh-route', () => this.sshKeyRouteDispose?.()],
       ['store', () => (this.ownsStore ? this.store?.close() : undefined)],
     ]
     for (const [name, run] of steps) {

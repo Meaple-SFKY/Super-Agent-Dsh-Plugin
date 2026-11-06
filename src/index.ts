@@ -120,6 +120,10 @@ export const Config: unknown = Schema.object({
         en: 'Optional extra logins treated as allowed askers.',
         zh: '可选：额外允许发起工作的 GitHub login。',
       }),
+      collaborators: Schema.array(Schema.string()).default([]).i18n({
+        en: 'GitHub logins invited as collaborators when the bot creates a repository (usually your personal account).',
+        zh: 'bot 新建仓库时自动邀请为 collaborator 的 GitHub 登录名（通常是你的个人账号）。',
+      }),
       allowSelf: Schema.boolean().default(false).i18n({
         en: 'Allow events from the token owner account itself. Enable when the agent runs as your own GitHub account; its own output is still filtered by the agent marker.',
         zh: '允许 token 所属账号自己的事件触发。使用与 agent 相同的 GitHub 账号时开启；agent 自身输出仍按 marker 过滤。',
@@ -199,6 +203,18 @@ export const Config: unknown = Schema.object({
     gitTimeoutMs: Schema.number().default(120_000).i18n({
       en: 'Timeout for git operations in milliseconds.',
       zh: 'git 操作超时（毫秒）。',
+    }),
+    gitSshKeyFile: Schema.string().default('').i18n({
+      en: 'Optional fallback: absolute path to an SSH private key for git. By default the host uses HTTPS with a credential helper generated from sources.github.tokenFile; leave empty to use that.',
+      zh: '可选回退项：git 使用的 SSH 私钥绝对路径。默认由 host 用 sources.github.tokenFile 自动生成 credential helper 走 HTTPS；留空即使用默认方式。',
+    }),
+    gitName: Schema.string().default('').i18n({
+      en: 'git commit author name for the bot account; empty derives it from sources.github.login.',
+      zh: 'bot 账号的 git 提交作者名；留空由 sources.github.login 推导。',
+    }),
+    gitEmail: Schema.string().default('').i18n({
+      en: 'git commit author email for the bot account; empty derives <login>@users.noreply.github.com.',
+      zh: 'bot 账号的 git 提交邮箱；留空推导为 <login>@users.noreply.github.com。',
     }),
   }).default({}),
   quiet: Schema.object({

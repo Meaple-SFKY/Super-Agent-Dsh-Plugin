@@ -218,12 +218,25 @@ describe('guardian Config schema', () => {
     expect(resolved.sources.github.enabled).toBe(false)
     expect(resolved.sources.github.repositories).toEqual([])
     expect(resolved.sources.github.allowSelf).toBe(false)
+    expect(resolved.sources.github.collaborators).toEqual([])
+    expect(resolved.executor.gitSshKeyFile).toBe('')
+    expect(resolved.executor.gitName).toBe('')
+    expect(resolved.executor.gitEmail).toBe('')
     expect(resolved.policy.rules).toEqual([])
     expect(resolved.executor.maxWorkers).toBe(3)
     expect(resolved.quiet.minChars).toBe(100)
 
     expect(Config({ sources: { github: { allowSelf: true } } }).sources.github.allowSelf).toBe(true)
     expect(Config({ language: 'en' }).language).toBe('en')
+    const dedicated = Config({
+      sources: { github: { login: 'acme-superagent', allowedLogins: ['alice'], collaborators: ['alice'] } },
+      executor: { gitSshKeyFile: '/home/me/.ssh/superagent_bot', gitName: 'Superagent Bot', gitEmail: 'bot@example.com' },
+    })
+    expect(dedicated.sources.github.collaborators).toEqual(['alice'])
+    expect(dedicated.sources.github.login).toBe('acme-superagent')
+    expect(dedicated.executor.gitSshKeyFile).toBe('/home/me/.ssh/superagent_bot')
+    expect(dedicated.executor.gitName).toBe('Superagent Bot')
+    expect(dedicated.executor.gitEmail).toBe('bot@example.com')
     expect(() => Config({ policy: { mode: 'bogus' } })).toThrow()
     expect(() => Config({ language: 'fr' })).toThrow()
 

@@ -273,6 +273,14 @@ export function renderCandidateMessage(candidate: Candidate, policy: Policy, too
   return lines.join('\n')
 }
 
+/** Repo-local git identity the worker must apply after `git init`/clone. */
+export interface AssignmentGitIdentity {
+  name?: string
+  email?: string
+  /** Full GIT_SSH_COMMAND, e.g. `ssh -i /path/key -o IdentitiesOnly=yes`. */
+  sshCommand?: string
+}
+
 export interface AssignmentRenderOptions {
   ticket: Ticket
   assignment: Assignment
@@ -282,11 +290,12 @@ export interface AssignmentRenderOptions {
   /** True when the session resumed an interrupted assignment. */
   recovery?: boolean
   branch?: string
+  git?: AssignmentGitIdentity
 }
 
 /** The assignment message that starts (or resumes) a worker turn. */
 export function renderAssignmentMessage(options: AssignmentRenderOptions): string {
-  const { ticket, assignment, directory, triggers, inputs = [], recovery = false, branch } = options
+  const { ticket, assignment, directory, triggers, inputs = [], recovery = false, branch, git } = options
   const lines: string[] = []
   lines.push('[superagent assignment]')
   lines.push(renderTicketCard(ticket))
@@ -299,6 +308,17 @@ export function renderAssignmentMessage(options: AssignmentRenderOptions): strin
       ? `repository: ${repo}`
       : 'repository: none — if this ticket asks you to create one, use superagent_github action=create_repository first (see the New repository section)',
   )
+  if (git && (git.name || git.email || git.sshCommand)) {
+    lines.push('git identity (repo-local only — NEVER run `git config --global`):')
+    if (git.sshCommand) lines.push(`- core.sshCommand: ${git.sshCommand}`)
+    if (git.name) lines.push(`- user.name: ${git.name}`)
+    if (git.email) lines.push(`- user.email: ${git.email}`)
+    lines.push(
+      '- after `git init` (new repository) or immediately in a cloned checkout, apply them with ' +
+        '`git config --local core.sshCommand "<value>"`, `git config --local user.name "<name>"`, ' +
+        '`git config --local user.email "<email>"` before any commit/push.',
+    )
+  }
   lines.push('requested outcome (acceptance criteria):')
   lines.push(`- deliver: ${oneLine(ticket.title, 200)}`)
   lines.push(

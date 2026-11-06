@@ -61,19 +61,39 @@ for you; do this before any other work:
    existed and you should reuse it.
 2. Initialise the local checkout inside your working directory:
    `git init -b main`
-3. Add the SSH remote from the result:
+3. Apply the repo-local git identity from the assignment message (bot account
+   name/email and the SSH key command), **never** the global config:
+   `git config --local core.sshCommand "<sshCommand>"`
+   `git config --local user.name "<gitName>"`
+   `git config --local user.email "<gitEmail>"`
+4. Add the SSH remote from the result:
    `git remote add origin <sshUrl>`
-4. Commit everything you produced:
+5. Commit everything you produced:
    `git add -A && git commit -m "chore: initial commit"`
-5. Push the default branch:
+6. Push the default branch:
    `git push -u origin main`
-6. Continue developing normally, and report `ready` with the repository URL
+7. Continue developing normally, and report `ready` with the repository URL
    (and a PR URL when you opened one).
 
 Never invent a repository name silently: if the ticket does not say one, pick a
 short kebab-case name derived from its title and mention it in your first
 `progress` report. The repository is created under the authenticated account,
 which must be the same account whose SSH key the host uses for pushes.
+
+## Git identity (repo-local, never global)
+
+The host may run the Worker as a dedicated GitHub bot account. The assignment
+message contains a `git identity (repo-local only)` block with `user.name`,
+`user.email` and `core.sshCommand` (the bot's SSH key). When it is present:
+
+- Apply it with `git config --local …` for every checkout you create; the
+  executor already applied it in cloned checkouts.
+- **Never** run `git config --global` / `--system`, never edit `~/.gitconfig`,
+  and never reuse the operator's personal SSH key.
+- If the block is absent, keep the environment's defaults (do not invent an
+  identity).
+- A missing SSH key or a repository you cannot push to is a `blocked` report
+  with one concrete question, not a reason to write tokens into git config.
 
 ## Acceptance criteria
 

@@ -82,11 +82,43 @@ describe('prompt files', () => {
     expect(assignment).toContain('do not post status/summary comments')
   })
 
+  it('renders the repo-local git identity block for the worker (never global)', () => {
+    const ticket = makeTicket()
+    const withIdentity = renderAssignmentMessage({
+      ticket,
+      assignment: ticket.assignments[0]!,
+      directory: '/tmp/work/t_1',
+      triggers: [],
+      git: {
+        name: 'cine-bot',
+        email: 'cine-bot@users.noreply.github.com',
+        sshCommand: 'ssh -i /keys/bot_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new',
+      },
+    })
+    expect(withIdentity).toContain('git identity (repo-local only')
+    expect(withIdentity).toContain('NEVER run `git config --global`')
+    expect(withIdentity).toContain('core.sshCommand: ssh -i /keys/bot_ed25519')
+    expect(withIdentity).toContain('user.name: cine-bot')
+    expect(withIdentity).toContain('user.email: cine-bot@users.noreply.github.com')
+    expect(withIdentity).toContain('git config --local core.sshCommand')
+
+    const withoutIdentity = renderAssignmentMessage({
+      ticket,
+      assignment: ticket.assignments[0]!,
+      directory: '/tmp/work/t_1',
+      triggers: [],
+    })
+    expect(withoutIdentity).not.toContain('git identity (repo-local only')
+  })
+
   it('guides a worker to create a repository when the ticket has none', () => {
     expect(workerSystemPrompt('en')).toContain('create_repository')
     expect(workerSystemPrompt('en')).toContain('git init -b main')
     expect(workerSystemPrompt('en')).toContain('git remote add origin')
     expect(workerSystemPrompt('en')).toContain('git push -u origin main')
+    expect(workerSystemPrompt('en')).toContain('Git identity (repo-local, never global)')
+    expect(workerSystemPrompt('en')).toContain('git config --local')
+    expect(workerSystemPrompt('en')).toContain('Never** run `git config --global`')
     const ticket = makeTicket()
     const none = renderAssignmentMessage({
       ticket,

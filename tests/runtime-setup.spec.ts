@@ -8,7 +8,7 @@
  * the HTTP fence/ordering through `registerApi`.
  */
 
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   SetupService,
+  SETUP_SSH_KEY_PATH,
   SETUP_CONFIG_PATH,
   SETUP_GITHUB_PATH,
   SETUP_PERMISSIONS_PATH,
@@ -274,8 +275,12 @@ describe('setup wizard backend', () => {
 
     const configured = harness.config.sources as { github: Record<string, unknown> }
     configured.github.allowSelf = true
-    const enabled = (await harness.service.state()).body.accounts as { github: { allowSelf: boolean } }
+    configured.github.collaborators = ['me-owner', 'reviewer']
+    const enabled = (await harness.service.state()).body.accounts as {
+      github: { allowSelf: boolean; collaborators: string[] }
+    }
     expect(enabled.github.allowSelf).toBe(true)
+    expect(enabled.github.collaborators).toEqual(['me-owner', 'reviewer'])
   })
 
   it('validates a GitHub token, lists repositories and caches only non-secret metadata', async () => {
@@ -399,6 +404,43 @@ describe('setup wizard backend', () => {
     expect(invalid.result.body.error).toBe('invalid_config')
   })
 
+  it('exposes the bot git identity without reading the key file', async () => {
+    const harness = makeHarness()
+    const keyFile = join(harness.stateDir, 'secrets', 'bot_ed25519')
+    mkdirSync(join(harness.stateDir, 'secrets'), { recursive: true, mode: 0o700 })
+    writeFileSync(keyFile, 'PRIVATE-KEY-CONTENT', { mode: 0o600 })
+    const config = harness.config.sources as { github: Record<string, unknown> }
+    config.github.login = 'cine-bot'
+    const executor = harness.config.executor as Record<string, unknown>
+    executor.gitSshKeyFile = keyFile
+
+    const state = (await harness.service.state()).body as {
+      git: { name: string; email: string; sshKeyFile: string; sshKeyConfigured: boolean }
+    }
+    expect(state.git).toEqual({
+      name: 'cine-bot',
+      email: 'cine-bot@users.noreply.github.com',
+      sshKeyFile: keyFile,
+      sshKeyConfigured: true,
+    })
+    expect(JSON.stringify(state)).not.toContain('PRIVATE-KEY-CONTENT')
+
+    executor.gitName = 'Cine Bot'
+    executor.gitEmail = 'bot@example.com'
+    const explicit = (await harness.service.state()).body as { git: { name: string; email: string } }
+    expect(explicit.git).toMatchObject({ name: 'Cine Bot', email: 'bot@example.com' })
+
+    const prepared = harness.service.prepareConfig({
+      config: { executor: { gitName: 'Cine Bot', gitEmail: 'bot@example.com', gitSshKeyFile: keyFile } },
+    })
+    expect(prepared.result.status).toBe(200)
+    expect(prepared.patch?.executor).toMatchObject({ gitName: 'Cine Bot', gitEmail: 'bot@example.com' })
+
+    const relativeKey = harness.service.prepareConfig({ config: { executor: { gitSshKeyFile: 'relative/key' } } })
+    expect(relativeKey.result.status).toBe(400)
+    expect(relativeKey.result.body.error).toBe('invalid_config')
+  })
+
   it('serves the static permissions explanation', () => {
     const harness = makeHarness()
     const result = harness.service.permissions()
@@ -513,6 +555,71 @@ describe('setup HTTP routes', () => {
   })
 })
 
+describe('runtime setup ssh-key route (task-33)', () => {
+  it('registers POST setup/github/ssh-key behind the fence and generates the key pair', async () => {
+    const stateDir = tempStateDir()
+    const host = createFakeHost()
+    const store = createMemoryStore()
+    const calls: string[][] = []
+    let generationCount = 0
+    const runtime = new Runtime(
+      host.ctx as unknown as Context,
+      {
+        stateDir,
+        sources: { telegram: { enabled: false }, github: { enabled: false } },
+        policy: { mode: 'observe' },
+        passIntervalMs: 60_000,
+        heartbeatIntervalMs: 60_000,
+        watchdog: { intervalMs: 60_000 },
+      },
+      {
+        store,
+        sources: [],
+        skipLock: true,
+        runSshKeygen: async (args: string[]) => {
+          calls.push(args)
+          generationCount += 1
+          const keyFile = args[args.indexOf('-f') + 1]!
+          mkdirSync(join(keyFile, '..'), { recursive: true, mode: 0o700 })
+          writeFileSync(keyFile, 'PRIVATE-KEY', { mode: 0o600 })
+          writeFileSync(`${keyFile}.pub`, 'ssh-ed25519 AAAA ROUTEKEY superagent-bot', { mode: 0o644 })
+        },
+      },
+    )
+    try {
+      await runtime.ready
+      const route = host.webServer.route(SETUP_SSH_KEY_PATH)
+      expect(route).toBeDefined()
+
+      const forbidden = new FakeResponse()
+      await route!.handler(new FakeRequest({ method: 'POST' }), forbidden)
+      expect(forbidden.statusCode).toBe(403)
+
+      const response = new FakeResponse()
+      await route!.handler(new FakeRequest({ method: 'POST', headers: { [API_HEADER]: '1' } }), response)
+      expect(response.statusCode).toBe(200)
+      const body = response.json<{ ok: boolean; publicKey: string; keyFile: string; created: boolean; restarting?: boolean }>()
+      expect(body).toMatchObject({ ok: true, created: true, restarting: false })
+      expect(body.publicKey).toContain('ssh-ed25519 AAAA ROUTEKEY')
+      expect(body.keyFile).toBe(join(stateDir, 'secrets', 'github-ssh', 'id_ed25519'))
+      expect(response.body).not.toContain('PRIVATE-KEY')
+      expect(statSync(body.keyFile).mode & 0o777).toBe(0o600)
+
+      const again = new FakeResponse()
+      await route!.handler(new FakeRequest({ method: 'POST', headers: { [API_HEADER]: '1' } }), again)
+      expect(again.json<{ created: boolean }>().created).toBe(false)
+      expect(generationCount).toBe(1)
+      expect(calls).toHaveLength(1)
+
+      const wrongMethod = new FakeResponse()
+      await route!.handler(new FakeRequest({ method: 'GET', headers: { [API_HEADER]: '1' } }), wrongMethod)
+      expect(wrongMethod.statusCode).toBe(405)
+    } finally {
+      await runtime.stop()
+    }
+  })
+})
+
 describe('runtime setup wiring', () => {
   it('boots a runtime that registers the setup routes and serves state', async () => {
     const stateDir = tempStateDir()
@@ -560,3 +667,102 @@ function ruin(run: () => unknown): boolean {
     return true
   }
 }
+
+describe('setup generated SSH key (task-33)', () => {
+  interface KeygenCall {
+    args: string[]
+  }
+
+  function fakeKeygen(calls: KeygenCall[], options: { failWith?: NodeJS.ErrnoException; skipPublic?: boolean } = {}) {
+    return async (args: string[]): Promise<void> => {
+      calls.push({ args })
+      if (options.failWith) throw options.failWith
+      const file = args[args.indexOf('-f') + 1]!
+      mkdirSync(join(file, '..'), { recursive: true, mode: 0o700 })
+      writeFileSync(file, 'PRIVATE-KEY-MATERIAL-MUST-NOT-LEAK', { mode: 0o600 })
+      if (!options.skipPublic) {
+        writeFileSync(`${file}.pub`, 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEY superagent-bot\n', { mode: 0o644 })
+      }
+    }
+  }
+
+  it('generates the key pair with strict permissions and is idempotent', async () => {
+    const calls: KeygenCall[] = []
+    const harness = makeHarness({ runSshKeygen: fakeKeygen(calls) })
+    const first = await harness.service.generateGithubSshKey()
+    expect(first.status).toBe(200)
+    expect(first.body).toMatchObject({ ok: true, created: true, keyFile: join(harness.stateDir, 'secrets', 'github-ssh', 'id_ed25519') })
+    expect(String(first.body.publicKey)).toContain('ssh-ed25519 ')
+    expect(JSON.stringify(first.body)).not.toContain('PRIVATE-KEY-MATERIAL')
+    const keyFile = String(first.body.keyFile)
+    expect(statSync(keyFile).mode & 0o777).toBe(0o600)
+    expect(statSync(join(harness.stateDir, 'secrets', 'github-ssh')).mode & 0o777).toBe(0o700)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.args).toEqual(['-t', 'ed25519', '-f', keyFile, '-N', '', '-C', 'superagent-bot', '-q'])
+
+    const second = await harness.service.generateGithubSshKey()
+    expect(second.body).toMatchObject({ ok: true, created: false, keyFile })
+    expect(calls).toHaveLength(1) // existing key is never overwritten
+    expect(JSON.stringify(second.body)).not.toContain('PRIVATE-KEY-MATERIAL')
+  })
+
+  it('reports a broken existing pair and a missing ssh-keygen without leaking the private key', async () => {
+    const calls: KeygenCall[] = []
+    const broken = makeHarness({ runSshKeygen: fakeKeygen(calls) })
+    const brokenKeyDir = join(broken.stateDir, 'secrets', 'github-ssh')
+    mkdirSync(brokenKeyDir, { recursive: true, mode: 0o700 })
+    writeFileSync(join(brokenKeyDir, 'id_ed25519'), 'PRIVATE-ONLY', { mode: 0o600 })
+    const incomplete = await broken.service.generateGithubSshKey()
+    expect(incomplete.status).toBe(409)
+    expect(incomplete.body.error).toBe('ssh_key_pair_incomplete')
+    expect(String(incomplete.body.description)).toContain('ssh-keygen -t ed25519')
+
+    const missing = makeHarness({
+      runSshKeygen: async () => {
+        throw Object.assign(new Error('spawn ssh-keygen ENOENT'), { code: 'ENOENT' })
+      },
+    })
+    const unavailable = await missing.service.generateGithubSshKey()
+    expect(unavailable.status).toBe(501)
+    expect(unavailable.body.error).toBe('ssh_keygen_unavailable')
+    expect(String(unavailable.body.description)).toContain('ssh-keygen -t ed25519')
+    expect(JSON.stringify(unavailable.body)).not.toContain('PRIVATE-KEY-MATERIAL')
+  })
+
+  it('persists executor.gitSshKeyFile after generation and exposes the public key in state', async () => {
+    const calls: KeygenCall[] = []
+    const harness = makeHarness({ runSshKeygen: fakeKeygen(calls) })
+    const generated = await harness.service.generateGithubSshKey()
+    const keyFile = String(generated.body.keyFile)
+
+    expect(await harness.service.state()).toBeDefined()
+    const state = (await harness.service.state()).body as {
+      git: { sshKeyFile: string; sshKeyConfigured: boolean; publicKey?: string }
+    }
+    expect(state.git.sshKeyFile).toBe(keyFile)
+    expect(state.git.sshKeyConfigured).toBe(true)
+    expect(state.git.publicKey).toContain('ssh-ed25519 ')
+    expect(JSON.stringify(state)).not.toContain('PRIVATE-KEY-MATERIAL')
+
+    expect(harness.service.persistGitSshKey(keyFile)).toBe(true)
+    expect(harness.kv.get<boolean>('superagent.setup.restartPending')).toBe(true)
+    runScheduled(harness)
+    await harness.service.waitForCommit()
+    expect(harness.editor.calls).toHaveLength(1)
+    expect((harness.editor.calls[0]!.next.executor as Record<string, unknown>).gitSshKeyFile).toBe(keyFile)
+  })
+
+  it('honours a custom configured key path in state and persists it only when configEditor exists', async () => {
+    const harness = makeHarness({}, { editor: null })
+    const custom = join(harness.stateDir, 'custom', 'bot_key')
+    mkdirSync(join(harness.stateDir, 'custom'), { recursive: true })
+    writeFileSync(custom, 'PRIVATE', { mode: 0o600 })
+    writeFileSync(`${custom}.pub`, 'ssh-ed25519 AAAACUSTOM superagent-bot', { mode: 0o644 })
+    const executor = harness.config.executor as Record<string, unknown>
+    executor.gitSshKeyFile = custom
+    const state = (await harness.service.state()).body as { git: { sshKeyFile: string; publicKey?: string } }
+    expect(state.git.sshKeyFile).toBe(custom)
+    expect(state.git.publicKey).toContain('AAAACUSTOM')
+    expect(harness.service.persistGitSshKey(custom)).toBe(false)
+  })
+})

@@ -74,7 +74,12 @@ function makeTicket(setup: Setup, text = 'please fix the build', meta: Record<st
   return { ticket, assignment, trigger }
 }
 
-function executorFor(setup: Setup, stateDir: string, config: Record<string, unknown> = {}, runCommand?: (command: string, cwd: string, timeoutMs: number) => Promise<void>): Executor {
+function executorFor(
+  setup: Setup,
+  stateDir: string,
+  config: Record<string, unknown> = {},
+  runCommand?: (command: string, cwd: string, timeoutMs: number, env?: Record<string, string>) => Promise<void>,
+): Executor {
   return new Executor({
     store: setup.store,
     sessions: setup.sessions,
@@ -465,5 +470,130 @@ describe('model fallback for new sessions (task-16)', () => {
       model: 'host-model',
     })
     await fallback.runtime.stop()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Dedicated bot account: repo-local git identity / SSH key (task-30)
+// ---------------------------------------------------------------------------
+
+import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
+import { resolveGitIdentity, validateConfig as validateRuntimeConfig } from '../src/app/runtime.js'
+
+describe('git identity for worker checkouts (task-30)', () => {
+  it('clones with GIT_SSH_COMMAND and writes repo-local identity after the clone', async () => {
+    const setup = makeSetup()
+    const stateDir = tempDir()
+    const { ticket, assignment } = makeTicket(setup, 'please fix the build', { repository: 'owner/repo' })
+    const keyFile = join(tempDir(), 'bot_ed25519')
+    writeFileSync(keyFile, 'fake-key', { mode: 0o600 })
+    const calls: Array<{ command: string; cwd: string; env?: Record<string, string> }> = []
+    const executor = executorFor(
+      setup,
+      stateDir,
+      { cloneUrl: 'git@github.com:{repo}.git', gitName: 'bot-user', gitEmail: 'bot@example.com', gitSshKeyFile: keyFile },
+      (command, cwd, _timeoutMs, env) => {
+        calls.push({ command, cwd, ...(env ? { env } : {}) })
+        if (command.startsWith('git clone')) mkdirSync(join(cwd, '.git'), { recursive: true })
+        return Promise.resolve()
+      },
+    )
+
+    await executor.launch(ticket, assignment)
+
+    const clone = calls.find(call => call.command.startsWith('git clone'))
+    expect(clone).toBeDefined()
+    expect(clone!.env?.GIT_SSH_COMMAND).toContain('ssh -i')
+    expect(clone!.env?.GIT_SSH_COMMAND).toContain(keyFile)
+    expect(clone!.env?.GIT_SSH_COMMAND).toContain('IdentitiesOnly=yes')
+    expect(clone!.env?.GIT_SSH_COMMAND).toContain('StrictHostKeyChecking=accept-new')
+
+    const configCommands = calls.filter(call => call.command.startsWith('git config --local'))
+    expect(configCommands.map(call => call.command)).toEqual([
+      expect.stringContaining('core.sshCommand'),
+      expect.stringContaining('user.name'),
+      expect.stringContaining('user.email'),
+    ])
+    expect(configCommands[0]!.command).toContain(keyFile)
+    expect(configCommands[1]!.command).toContain('bot-user')
+    expect(configCommands[2]!.command).toContain('bot@example.com')
+    expect(calls.every(call => !call.command.includes('--global'))).toBe(true)
+  })
+
+  it('applies the identity in an existing checkout too (no clone)', async () => {
+    const setup = makeSetup()
+    const stateDir = tempDir()
+    const { ticket, assignment } = makeTicket(setup)
+    mkdirSync(join(stateDir, 'work', ticket.id, '.git'), { recursive: true })
+    const calls: string[] = []
+    const executor = executorFor(
+      setup,
+      stateDir,
+      { gitName: 'bot-user', gitEmail: 'bot@example.com' },
+      command => {
+        calls.push(command)
+        return Promise.resolve()
+      },
+    )
+    await executor.launch(ticket, assignment)
+    expect(calls.some(command => command === 'git config --local user.name bot-user')).toBe(true)
+    expect(calls.some(command => command === 'git config --local user.email bot@example.com')).toBe(true)
+    expect(calls.some(command => command.includes('core.sshCommand'))).toBe(false)
+    expect(calls.some(command => command.includes('--global'))).toBe(false)
+  })
+
+  it('warns but does not block when the SSH key is missing or readable', async () => {
+    const setup = makeSetup()
+    const stateDir = tempDir()
+    const missingKey = join(tempDir(), 'missing-key')
+    const first = makeTicket(setup, 'first')
+    const executor = executorFor(
+      setup,
+      stateDir,
+      { gitSshKeyFile: missingKey },
+      () => Promise.resolve(),
+    )
+    await executor.launch(first.ticket, first.assignment)
+    expect(setup.logger.text()).toContain('git SSH key does not exist')
+
+    const worldReadable = join(tempDir(), 'readable-key')
+    writeFileSync(worldReadable, 'fake-key', { mode: 0o644 })
+    chmodSync(worldReadable, 0o644)
+    const second = makeTicket(setup, 'second')
+    const executor2 = executorFor(setup, stateDir, { gitSshKeyFile: worldReadable }, () => Promise.resolve())
+    await executor2.launch(second.ticket, second.assignment)
+    expect(setup.logger.text()).toContain('readable by group/others')
+  })
+
+  it('keeps the environment unchanged when no identity is configured', async () => {
+    const setup = makeSetup()
+    const stateDir = tempDir()
+    const { ticket, assignment } = makeTicket(setup, 'no identity')
+    const calls: Array<{ command: string; env?: Record<string, string> }> = []
+    const executor = executorFor(setup, stateDir, {}, (command, _cwd, _timeout, env) => {
+      calls.push({ command, ...(env ? { env } : {}) })
+      if (command.startsWith('git clone')) mkdirSync(join(stateDir, 'work', ticket.id, '.git'), { recursive: true })
+      return Promise.resolve()
+    })
+    // No repo → no clone; no identity → no config commands.
+    await executor.launch(ticket, assignment)
+    expect(calls.some(call => call.command.includes('git config'))).toBe(false)
+    expect(calls.every(call => call.env === undefined)).toBe(true)
+  })
+
+  it('derives the bot name/email from the GitHub login', () => {
+    expect(resolveGitIdentity(undefined, 'cine-bot')).toEqual({
+      gitName: 'cine-bot',
+      gitEmail: 'cine-bot@users.noreply.github.com',
+    })
+    expect(
+      resolveGitIdentity({ gitName: 'Bot', gitEmail: 'bot@example.com', gitSshKeyFile: '/keys/bot' }, 'cine-bot'),
+    ).toEqual({ gitName: 'Bot', gitEmail: 'bot@example.com', gitSshKeyFile: '/keys/bot' })
+    expect(resolveGitIdentity({ gitName: 'Bot' }, undefined)).toEqual({ gitName: 'Bot' })
+    expect(resolveGitIdentity(undefined, undefined)).toEqual({})
+    expect(validateRuntimeConfig({ stateDir: '/tmp/x', executor: { gitSshKeyFile: 'relative/key' } }).problem?.error).toContain(
+      'absolute path',
+    )
+    expect(validateRuntimeConfig({ stateDir: '/tmp/x', executor: { gitName: 42 } }).problem?.error).toContain('gitName')
   })
 })

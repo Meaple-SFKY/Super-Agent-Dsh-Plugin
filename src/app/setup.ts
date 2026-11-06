@@ -16,7 +16,8 @@
  * default under `stateDir` or an absolute path the user explicitly supplied.
  */
 
-import { chmod, mkdir, rename, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
 import { dirname, isAbsolute, join } from 'node:path'
 
 import type { KeyValueStore } from '../core/ports.js'
@@ -28,6 +29,7 @@ export const SETUP_TELEGRAM_PATH = '/superagent/api/setup/telegram'
 export const SETUP_GITHUB_PATH = '/superagent/api/setup/github'
 export const SETUP_CONFIG_PATH = '/superagent/api/setup/config'
 export const SETUP_PERMISSIONS_PATH = '/superagent/api/setup/permissions'
+export const SETUP_SSH_KEY_PATH = '/superagent/api/setup/github/ssh-key'
 
 export const SETUP_PATHS = {
   state: SETUP_STATE_PATH,
@@ -35,6 +37,7 @@ export const SETUP_PATHS = {
   github: SETUP_GITHUB_PATH,
   config: SETUP_CONFIG_PATH,
   permissions: SETUP_PERMISSIONS_PATH,
+  sshKey: SETUP_SSH_KEY_PATH,
 } as const
 
 // ---------------------------------------------------------------------------
@@ -64,7 +67,19 @@ export interface SetupAccountGithub {
   count: number
   /** GitHub Source option: let the authenticated account's own events trigger work. */
   allowSelf: boolean
+  /** GitHub logins invited as admin when a ticket creates a repository (wizard prefill). */
+  collaborators: string[]
   tokenFile?: string
+}
+
+export interface SetupGitIdentity {
+  name: string
+  email: string
+  sshKeyFile: string
+  /** True when the key file exists and is non-empty (private content is never read). */
+  sshKeyConfigured: boolean
+  /** Public key text (`<keyFile>.pub`), safe to show in the panel. */
+  publicKey?: string
 }
 
 export interface SetupState {
@@ -72,6 +87,8 @@ export interface SetupState {
   stateDir: string
   /** User-facing language for the bot (zh default). */
   language: 'zh' | 'en'
+  /** Dedicated bot account repo-local git identity (paths only, no key content). */
+  git: SetupGitIdentity
   plugin: { status: string; detail: string | null }
   accounts: { telegram: SetupAccountTelegram; github: SetupAccountGithub }
   permissions: SetupPermission[]
@@ -102,6 +119,8 @@ export interface SetupApi {
   saveGithub(body: unknown): Promise<SetupApiResult>
   prepareConfig(body: unknown): { result: SetupApiResult; patch?: SetupConfigPatch }
   commitConfigSoon(patch: SetupConfigPatch): void
+  generateGithubSshKey(): Promise<SetupApiResult>
+  persistGitSshKey(keyFile: string): boolean
 }
 
 export interface ConfigEditorLike {
@@ -144,6 +163,10 @@ export interface SetupDeps {
   hostEntry: () => unknown
   /** Current user-facing language (from the running config). */
   language?: () => 'zh' | 'en'
+  /** Effective bot git identity (defaults already resolved from the GitHub login). */
+  gitIdentity?: () => { name: string; email: string; sshKeyFile: string }
+  /** ssh-keygen runner (tests inject a fake; default runs the real binary). */
+  runSshKeygen?: (args: string[]) => Promise<void>
   redact?: (text: string) => string
   timeoutMs?: number
   /** Test seam for the post-response commit. Defaults to an unref'ed timer. */
@@ -348,6 +371,136 @@ export class SetupService implements SetupApi {
     }
   }
 
+  // -- generated SSH key ---------------------------------------------------
+
+  /** Default directory for the SuperAgent-generated bot SSH key. */
+  defaultSshKeyDir(): string {
+    return join(this.deps.stateDir, 'secrets', 'github-ssh')
+  }
+
+  /** Default private-key path (`<stateDir>/secrets/github-ssh/id_ed25519`). */
+  defaultSshKeyFile(): string {
+    return join(this.defaultSshKeyDir(), 'id_ed25519')
+  }
+
+  private manualSshKeyCommand(keyFile: string): string {
+    return `ssh-keygen -t ed25519 -f ${keyFile} -N "" -C "superagent-bot"`
+  }
+
+  private async sshKeygen(args: string[]): Promise<void> {
+    const runner = this.deps.runSshKeygen
+    if (runner) {
+      await runner(args)
+      return
+    }
+    await new Promise<void>((resolve, reject) => {
+      execFile('ssh-keygen', args, { timeout: 20_000, windowsHide: true }, (error, _stdout, stderr) => {
+        if (!error) {
+          resolve()
+          return
+        }
+        const code = (error as NodeJS.ErrnoException).code
+        const detail = String(stderr ?? '').slice(0, 300)
+        const wrapped = new Error(`ssh-keygen failed${detail ? `: ${detail}` : `: ${error.message}`}`)
+        ;(wrapped as NodeJS.ErrnoException).code = code
+        reject(wrapped)
+      })
+    })
+  }
+
+  /**
+   * Generate (or return) the dedicated bot SSH key pair.
+   *
+   * Idempotent: an existing private key is never overwritten; its public half is
+   * returned. Only the public key is ever read back, and the response never
+   * contains private key material.
+   */
+  async generateGithubSshKey(): Promise<SetupApiResult> {
+    const keyDir = this.defaultSshKeyDir()
+    const keyFile = this.defaultSshKeyFile()
+    const publicFile = `${keyFile}.pub`
+    try {
+      const exists = await this.fileConfigured(keyFile)
+      if (exists) {
+        const publicKey = await this.readPublicKey(publicFile)
+        if (!publicKey) {
+          throw new SetupError(
+            409,
+            'ssh_key_pair_incomplete',
+            `the private key exists but ${publicFile} is missing; regenerate manually: ${this.manualSshKeyCommand(keyFile)}`,
+          )
+        }
+        return { status: 200, body: { ok: true, publicKey, keyFile, created: false } }
+      }
+      await mkdir(keyDir, { recursive: true, mode: 0o700 })
+      await chmod(keyDir, 0o700).catch(() => undefined)
+      try {
+        await this.sshKeygen(['-t', 'ed25519', '-f', keyFile, '-N', '', '-C', 'superagent-bot', '-q'])
+      } catch (error) {
+        return this.sshKeyUnavailable(error, keyFile)
+      }
+      await chmod(keyFile, 0o600).catch(() => undefined)
+      await chmod(publicFile, 0o644).catch(() => undefined)
+      const publicKey = await this.readPublicKey(publicFile)
+      if (!publicKey) {
+        throw new SetupError(
+          500,
+          'ssh_key_generation_failed',
+          `ssh-keygen succeeded but ${publicFile} is missing or empty; run manually: ${this.manualSshKeyCommand(keyFile)}`,
+        )
+      }
+      return { status: 200, body: { ok: true, publicKey, keyFile, created: true } }
+    } catch (error) {
+      return this.failure(error)
+    }
+  }
+
+  /** Read the public half only; private key content is never read. */
+  private async readPublicKey(publicFile: string): Promise<string | undefined> {
+    try {
+      const text = (await readFile(publicFile, 'utf8')).trim()
+      return text.length > 0 && !text.includes('PRIVATE KEY') ? text : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Point `executor.gitSshKeyFile` at the generated key. Returns true when the
+   * configEditor is available and the write was scheduled (the plugin restarts
+   * right after the HTTP response is flushed).
+   */
+  persistGitSshKey(keyFile: string): boolean {
+    try {
+      const editor = this.deps.configEditor()
+      const entry = this.deps.hostEntry()
+      if (!editor || entry === undefined) return false
+      const current = (this.deps.currentConfig()?.executor as Record<string, unknown> | undefined)?.gitSshKeyFile
+      if (current === keyFile) return true
+      this.commitConfigSoon({ executor: { gitSshKeyFile: keyFile } })
+      return true
+    } catch (error) {
+      this.logger.warn('could not persist the generated git SSH key path', { error: this.sanitize(errorMessage(error)) })
+      return false
+    }
+  }
+
+  /** Failure path for ssh-keygen being missing (501 with a manual command). */
+  private sshKeyUnavailable(error: unknown, keyFile: string): SetupApiResult {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code
+    if (code === 'ENOENT') {
+      return {
+        status: 501,
+        body: {
+          ok: false,
+          error: 'ssh_keygen_unavailable',
+          description: `ssh-keygen is not available on this host; generate the key manually: ${this.manualSshKeyCommand(keyFile)}`,
+        },
+      }
+    }
+    return this.failure(error)
+  }
+
   // -- account state -------------------------------------------------------
 
   async state(): Promise<SetupApiResult> {
@@ -368,11 +521,41 @@ export class SetupService implements SetupApi {
       githubCache.repositories && githubCache.repositories.length > 0 ? githubCache.repositories : configuredRepositories
     const restartRequired = this.deps.kv.get<boolean>(KV_RESTART) === true
     const language = this.deps.language?.() ?? (config.language === 'en' ? 'en' : 'zh')
+    const executorConfig = isRecord(config.executor) ? config.executor : {}
+    const githubLogin = typeof (isRecord(sources.github) ? sources.github.login : undefined) === 'string'
+      ? String((sources.github as Record<string, unknown>).login)
+      : ''
+    const resolvedGit = this.deps.gitIdentity?.() ?? {
+      name: typeof executorConfig.gitName === 'string' && executorConfig.gitName ? executorConfig.gitName : githubLogin,
+      email:
+        typeof executorConfig.gitEmail === 'string' && executorConfig.gitEmail
+          ? executorConfig.gitEmail
+          : githubLogin
+            ? `${githubLogin}@users.noreply.github.com`
+            : '',
+      sshKeyFile: typeof executorConfig.gitSshKeyFile === 'string' ? executorConfig.gitSshKeyFile : '',
+    }
+    const defaultKeyFile = this.defaultSshKeyFile()
+    const configuredKeyFile = resolvedGit.sshKeyFile.length > 0 ? resolvedGit.sshKeyFile : ''
+    const effectiveKeyFile = configuredKeyFile
+      ? configuredKeyFile
+      : (await this.fileConfigured(defaultKeyFile))
+        ? defaultKeyFile
+        : ''
+    const publicKey = effectiveKeyFile ? await this.readPublicKey(`${effectiveKeyFile}.pub`) : undefined
+    const git: SetupGitIdentity = {
+      name: resolvedGit.name,
+      email: resolvedGit.email,
+      sshKeyFile: effectiveKeyFile,
+      sshKeyConfigured: effectiveKeyFile.length > 0 ? await this.fileConfigured(effectiveKeyFile) : false,
+      ...(publicKey ? { publicKey } : {}),
+    }
 
     const state: SetupState = {
       ok: true,
       stateDir: this.deps.stateDir,
       language,
+      git,
       plugin: this.deps.plugin(),
       accounts: {
         telegram: {
@@ -388,6 +571,9 @@ export class SetupService implements SetupApi {
           repositories,
           count: repositories.length,
           allowSelf: githubConfig.allowSelf === true,
+          collaborators: Array.isArray(githubConfig.collaborators)
+            ? githubConfig.collaborators.filter((entry): entry is string => typeof entry === 'string')
+            : [],
           ...(githubConfigured ? { tokenFile: githubFile } : {}),
         },
       },
