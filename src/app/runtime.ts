@@ -630,12 +630,22 @@ export class Runtime {
     const engine = this.engine
     const sessions = this.sessions
     if (!store || !engine || !sessions) return
+    const github = this.config?.sources?.github
     const deps: ToolDeps = {
       engine,
       store,
       sessions,
       logger: this.logger,
       now: () => this.clock.now(),
+      ...(github
+        ? {
+            github: {
+              ...(typeof github.tokenFile === 'string' ? { tokenFile: github.tokenFile } : {}),
+              ...(typeof github.tokenEnv === 'string' ? { tokenEnv: github.tokenEnv } : {}),
+              ...(typeof github.apiBaseUrl === 'string' ? { apiBaseUrl: github.apiBaseUrl } : {}),
+            },
+          }
+        : {}),
     }
     if (info.role === 'router') registerRouterTools(agentCtx, deps)
     else registerWorkerTools(agentCtx, deps)

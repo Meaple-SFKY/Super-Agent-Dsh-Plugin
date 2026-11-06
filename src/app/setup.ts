@@ -62,6 +62,8 @@ export interface SetupAccountGithub {
   login?: string
   repositories: string[]
   count: number
+  /** GitHub Source option: let the authenticated account's own events trigger work. */
+  allowSelf: boolean
   tokenFile?: string
 }
 
@@ -377,6 +379,7 @@ export class SetupService implements SetupApi {
           ...(githubCache.login ? { login: githubCache.login } : {}),
           repositories,
           count: repositories.length,
+          allowSelf: githubConfig.allowSelf === true,
           ...(githubConfigured ? { tokenFile: githubFile } : {}),
         },
       },

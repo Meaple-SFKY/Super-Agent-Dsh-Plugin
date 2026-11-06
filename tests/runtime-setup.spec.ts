@@ -267,6 +267,17 @@ describe('setup wizard backend', () => {
     expect(relative.body.error).toBe('invalid_token_file')
   })
 
+  it('reports the GitHub allowSelf option from the current configuration', async () => {
+    const harness = makeHarness()
+    const byDefault = (await harness.service.state()).body.accounts as { github: { allowSelf: boolean } }
+    expect(byDefault.github.allowSelf).toBe(false)
+
+    const configured = harness.config.sources as { github: Record<string, unknown> }
+    configured.github.allowSelf = true
+    const enabled = (await harness.service.state()).body.accounts as { github: { allowSelf: boolean } }
+    expect(enabled.github.allowSelf).toBe(true)
+  })
+
   it('validates a GitHub token, lists repositories and caches only non-secret metadata', async () => {
     const harness = makeHarness()
     const result = await harness.service.saveGithub({ token: 'ghp_super_secret' })

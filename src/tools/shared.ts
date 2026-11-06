@@ -15,6 +15,22 @@ import type { Sessions } from '../app/sessions.js'
 import type { AppLogger } from '../app/support.js'
 import { errorMessage, nowIso, oneLine } from '../app/support.js'
 
+/** GitHub credentials for the worker GitHub tool (runtime config or tests). */
+export interface GithubToolOptions {
+  /** Literal token (tests only; production reads a file or env). */
+  token?: string
+  /** Absolute token file; omitted → `<stateDir>/secrets/github-token` when present. */
+  tokenFile?: string
+  /** Environment variable name; defaults to the Source default `SUPERAGENT_GITHUB_TOKEN`. */
+  tokenEnv?: string
+  /** API base URL (GitHub Enterprise/tests); defaults to `https://api.github.com`. */
+  apiBaseUrl?: string
+  /** Per-request timeout in milliseconds. */
+  timeoutMs?: number
+  /** Injected fetch (tests). */
+  fetchImpl?: typeof fetch
+}
+
 export interface ToolDeps {
   engine: Engine
   store: Store
@@ -23,6 +39,8 @@ export interface ToolDeps {
   now?: () => IsoTime
   /** Prefix used for ids minted by tools (replies). */
   idPrefix?: string
+  /** GitHub credentials for `superagent_github`; resolved from env/secret file when absent. */
+  github?: GithubToolOptions
 }
 
 export function clockOf(deps: ToolDeps): () => IsoTime {
@@ -93,6 +111,8 @@ export interface WorkerCallContext {
   ticketId: TicketId
   assignmentId: string
   sessionId: string
+  /** The worker's working directory, when the session was created by the Executor. */
+  cwd?: string
 }
 
 export function workerCallContext(
@@ -117,7 +137,27 @@ export function workerCallContext(
   if (!assignmentId) {
     return failure('no_assignment', 'this ticket has no running assignment; the runtime will start one')
   }
-  return { ticketId, assignmentId, sessionId }
+  return { ticketId, assignmentId, sessionId, ...(info.cwd ? { cwd: info.cwd } : {}) }
+}
+
+/** Resolve a repository for a ticket: explicit argument, trigger meta, then mandate scope. */
+export function resolveRepository(deps: ToolDeps, ticketId: TicketId, explicit?: string): string | undefined {
+  const fromArgument = explicit?.trim()
+  if (fromArgument) return /^[\w.-]+\/[\w.-]+$/.test(fromArgument) ? fromArgument : undefined
+  const ticket = deps.store.tickets.get(ticketId)
+  if (!ticket) return undefined
+  const trigger = deps.store.triggers.get(ticket.origin.triggerId)
+  const meta = trigger?.meta ?? {}
+  for (const key of ['repository', 'repo', 'fullName', 'repoFullName']) {
+    const value = meta[key]
+    if (typeof value === 'string' && /^[\w.-]+\/[\w.-]+$/.test(value)) return value
+  }
+  const scope = ticket.mandate.scope
+  if (scope.startsWith('github:')) {
+    const repo = scope.slice('github:'.length)
+    if (/^[\w.-]+\/[\w.-]+$/.test(repo)) return repo
+  }
+  return undefined
 }
 
 /** The router identity check for router-scoped tools. */

@@ -84,6 +84,7 @@ describe('router tools', () => {
   it('registers the full router toolset and nothing from the worker role', async () => {
     const setup = await makeTools()
     const names = setup.host.toolsFor(setup.router).names().sort()
+    expect(names).not.toContain('superagent_github')
     expect(names).toEqual(
       [
         'superagent_pause',
@@ -240,6 +241,7 @@ describe('worker tools', () => {
       [
         'superagent_ack',
         'superagent_follow_context',
+        'superagent_github',
         'superagent_handback',
         'superagent_mark_unrelated',
         'superagent_report',
