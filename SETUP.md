@@ -207,10 +207,11 @@ node scripts/watchdog.mjs --state-dir "$HOME/.dsh/state/superagent" --dry-run
 | `sources.telegram.tokenEnv` / `tokenFile` | — | 二选一，指向 token |
 | `sources.telegram.allowedUserIds` | `[]` | 允许发起工作的数字 id；空 = 谁都接不了 |
 | `sources.github.tokenEnv` / `tokenFile` | — | 二选一 |
-| `sources.github.repositories` | `[]` | `owner/name` 列表 |
+| `sources.github.repositories` | `[]` | `owner/name` 列表；`["*"]` 表示自动发现你可访问的全部仓库（每 10 分钟刷新） |
 | `sources.github.login` | — | token 所属账号，用于识别 @ |
 | `sources.github.allowSelf` | `false` | 允许 token 所属账号自己的 Issue/PR/评论触发工作。用自己账号当 agent 时打开；专用机器账号保持关闭（agent 自身输出仍按 marker 过滤） |
 | `sources.github.observe*` | `false` | 是否也收未 @ 的 Issue/PR/评论/CI；建议 `observeComments`、`observeCi` 设为 `true`，否则已订阅线程的后续讨论/CI 结果收不到 |
+| `language` | `zh` | 机器人对你说话/汇报使用的语言：`zh` 或 `en`（面板 UI 语言独立） |
 | `policy.mode` | `observe` | `off` 只接明确请求；`observe` 只记录；`auto` 接推断候选 |
 | `policy.rules` | `[]` | `auto` 下的主动规则（id/name/enabled/instructions） |
 | `executor.maxWorkers` | 2 | 并行 Worker 数；笔记本建议 1–2 |
@@ -226,6 +227,14 @@ node scripts/watchdog.mjs --state-dir "$HOME/.dsh/state/superagent" --dry-run
 | `SUPERAGENT_START_TIMEOUT_MS` | 引擎启动超时，默认 30000，允许 50–120000（排障用） |
 | `SUPERAGENT_COMPAT_ASSUME_UNSUPPORTED=1` | 自检开关：模拟“DSH 版本不兼容”，用于验证降级路径 |
 | `DSH_VERSION` | 版本探测覆盖值（测试/排障用） |
+
+## 5.1 在 Telegram 里新建仓库并开发
+
+配置 `language: zh` 后，直接对 bot 说：
+
+> 新建一个私有仓库 `demo-cli`，用 TypeScript 写一个命令行小工具，初始化 README 和测试。
+
+流程：Router 接单 → Worker 调用 `superagent_github` 的 `create_repository`（默认私有）→ `git init` → SSH remote → 首次提交并 `push -u origin main` → 继续开发与验收。新仓库会在 GitHub 来源的下一次自动发现刷新后进入监听（`repositories: ["*"]`），不需要再改配置。
 
 ## 6. 升级与兼容
 

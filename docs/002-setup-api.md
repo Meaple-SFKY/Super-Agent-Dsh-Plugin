@@ -23,6 +23,7 @@
 - `accounts.*.configured` 只检查 token 文件存在且非空，不读取内容。
 - 已配置的 token 文件路径优先保留；向导再次提交 token 时覆盖。
 - GitHub 仓库列表用于向导勾选；用户确认后随 `PUT setup/config` 写入 `sources.github.repositories`。
+- `language` 为机器人对用户说话/汇报的语言（默认 `zh`），与面板 UI 语言无关；`sources.github.repositories: ["*"]` 时自动发现新仓库。
 - 保存后插件重启：向导用 `GET setup/state` 轮询（最多 60s），`plugin.status=ready` 且 accounts 匹配即完成。
 
 ## 3. 面板（`src/client/main.js`）
