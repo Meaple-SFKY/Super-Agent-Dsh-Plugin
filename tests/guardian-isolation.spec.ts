@@ -211,6 +211,7 @@ describe('guardian Config schema', () => {
       executor: { maxWorkers: 3 },
     })
     expect(resolved.stateDir).toBe('/tmp/superagent')
+    expect(resolved.language).toBe('zh')
     expect(resolved.policy.mode).toBe('auto')
     expect(resolved.sources.telegram.enabled).toBe(true)
     expect(resolved.sources.telegram.allowedUserIds).toEqual(['1'])
@@ -222,7 +223,9 @@ describe('guardian Config schema', () => {
     expect(resolved.quiet.minChars).toBe(100)
 
     expect(Config({ sources: { github: { allowSelf: true } } }).sources.github.allowSelf).toBe(true)
+    expect(Config({ language: 'en' }).language).toBe('en')
     expect(() => Config({ policy: { mode: 'bogus' } })).toThrow()
+    expect(() => Config({ language: 'fr' })).toThrow()
 
     // Cordis validates through the Standard Schema entry point, not by calling
     // the schema object itself.

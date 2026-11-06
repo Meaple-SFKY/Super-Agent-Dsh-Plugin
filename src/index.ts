@@ -64,6 +64,10 @@ export const Config: unknown = Schema.object({
     en: 'Absolute directory for the database, lock, secrets and worker checkouts.',
     zh: '绝对路径：数据库、锁、密钥文件和 Worker 工作目录。',
   }),
+  language: Schema.union(['zh', 'en']).default('zh').i18n({
+    en: 'Primary language the bot uses when it talks to you (not the panel UI language).',
+    zh: '机器人对你说话、汇报时使用的语言（不是面板 UI 语言）。',
+  }),
   sources: Schema.object({
     telegram: Schema.object({
       enabled: Schema.boolean().default(false).i18n({

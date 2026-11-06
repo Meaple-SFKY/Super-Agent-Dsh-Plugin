@@ -46,7 +46,7 @@ interface Wizard {
     error: string
     skipped: boolean
   }
-  behavior: { allowedUserIds: string; mode: string; maxWorkers: number }
+  behavior: { allowedUserIds: string; mode: string; maxWorkers: number; language: string }
   finish: { status: string; error: string; elapsed: number }
 }
 
@@ -66,6 +66,7 @@ interface Internals {
   stepStates: (wizard: Wizard) => string[]
   canAdvance: (step: number, wizard: Wizard) => boolean
   buildConfig: (wizard: Wizard) => {
+    language: string
     sources: {
       telegram: { enabled: boolean; tokenFile?: string; allowedUserIds?: string[] }
       github: { enabled: boolean; tokenFile?: string; repositories?: string[]; allowSelf?: boolean }
@@ -74,6 +75,7 @@ interface Internals {
     executor: { maxWorkers: number }
   }
   parseUserIds: (value: string) => string[]
+  setupLanguage: (setup: unknown) => string
   repoEntry: (value: unknown) => { fullName: string } | undefined
   isSetupConfigured: (setup: unknown) => boolean
   expectedAccounts: (wizard: Wizard) => { telegram: boolean; github: boolean }
@@ -249,7 +251,7 @@ function validatedWizard(module: FakeModule): Wizard {
     repositories: [{ fullName: 'acme/widgets' }, { fullName: 'acme/docs' }],
     selected: ['acme/widgets', 'acme/docs'],
   }
-  wizard.behavior = { allowedUserIds: '123, 456 123', mode: 'auto', maxWorkers: 3 }
+  wizard.behavior = { allowedUserIds: '123, 456 123', mode: 'auto', maxWorkers: 3, language: 'zh' }
   return wizard
 }
 
@@ -344,6 +346,7 @@ describe('setup wizard state machine', () => {
     expect(wizard.github.status).toBe('idle')
     expect(wizard.behavior.mode).toBe('observe')
     expect(wizard.behavior.maxWorkers).toBe(2)
+    expect(wizard.behavior.language).toBe('zh')
     expect(internalsOf(module).stepStates(wizard)).toEqual(['current', 'todo', 'todo', 'todo'])
     expect(internalsOf(module).canAdvance(0, wizard)).toBe(false)
   })
@@ -353,6 +356,7 @@ describe('setup wizard state machine', () => {
     const internals = internalsOf(module)
     const configured = internals.wizardFromSetup(
       setupState({
+        language: 'en',
         accounts: {
           telegram: { configured: true, enabled: true, botUsername: 'demo_bot' },
           github: { configured: true, enabled: true, login: 'agent', repositories: ['acme/widgets'], count: 1, allowSelf: true },
@@ -364,8 +368,10 @@ describe('setup wizard state machine', () => {
     expect(configured.github.status).toBe('validated')
     expect(configured.github.selected).toEqual(['acme/widgets'])
     expect(configured.github.allowSelf).toBe(true)
+    expect(configured.behavior.language).toBe('en')
     expect(internals.isSetupConfigured(setupState({ accounts: { telegram: { configured: true }, github: {} } }))).toBe(true)
     expect(internals.isSetupConfigured(setupState())).toBe(false)
+    expect(internals.wizardFromSetup(setupState()).behavior.language).toBe('zh')
   })
 
   it('gates each step on its verification result', async () => {
@@ -384,14 +390,17 @@ describe('setup wizard state machine', () => {
     expect(internals.canAdvance(1, wizard)).toBe(true)
 
     wizard.telegram = { ...wizard.telegram, skipped: false, status: 'validated' }
-    wizard.behavior = { allowedUserIds: '', mode: 'observe', maxWorkers: 2 }
+    wizard.behavior = { allowedUserIds: '', mode: 'observe', maxWorkers: 2, language: 'zh' }
     expect(internals.canAdvance(2, wizard)).toBe(false)
-    wizard.behavior = { allowedUserIds: '123,456', mode: 'auto', maxWorkers: 3 }
+    wizard.behavior = { allowedUserIds: '123,456', mode: 'auto', maxWorkers: 3, language: 'zh' }
     expect(internals.canAdvance(2, wizard)).toBe(true)
     wizard.behavior = { ...wizard.behavior, mode: 'bogus' }
     expect(internals.canAdvance(2, wizard)).toBe(false)
     wizard.behavior = { ...wizard.behavior, mode: 'observe', maxWorkers: 99 }
     expect(internals.canAdvance(2, wizard)).toBe(false)
+    wizard.behavior = { ...wizard.behavior, maxWorkers: 2, language: 'fr' }
+    expect(internals.canAdvance(2, wizard)).toBe(false)
+    wizard.behavior = { ...wizard.behavior, language: 'zh' }
     expect(internals.canAdvance(3, wizard)).toBe(true)
   })
 
@@ -413,8 +422,22 @@ describe('setup wizard state machine', () => {
       login: 'agent-account',
       tokenFile: '/tmp/superagent/secrets/github-token',
     })
+    expect(config.language).toBe('zh')
     expect(config.policy).toEqual({ mode: 'auto' })
     expect(config.executor).toEqual({ maxWorkers: 3 })
+  })
+
+  it('writes the bot language and hydrates it from setup/state', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    const wizard = validatedWizard(module)
+    wizard.behavior = { ...wizard.behavior, language: 'en' }
+    expect(internals.buildConfig(wizard).language).toBe('en')
+    expect(internals.buildConfig(baseWizard(module)).language).toBe('zh')
+    expect(internals.setupLanguage({ language: 'en' })).toBe('en')
+    expect(internals.setupLanguage({ language: 'zh' })).toBe('zh')
+    expect(internals.setupLanguage({ language: 'fr' })).toBe('zh')
+    expect(internals.setupLanguage(undefined)).toBe('zh')
   })
 
   it('writes sources.github.allowSelf when the single-account option is on', async () => {
@@ -434,7 +457,7 @@ describe('setup wizard state machine', () => {
     const wizard = baseWizard(module)
     wizard.telegram = { ...wizard.telegram, skipped: true }
     wizard.github = { ...wizard.github, skipped: true }
-    wizard.behavior = { allowedUserIds: '', mode: 'observe', maxWorkers: 2 }
+    wizard.behavior = { allowedUserIds: '', mode: 'observe', maxWorkers: 2, language: 'zh' }
     const config = internals.buildConfig(wizard)
     expect(config.sources.telegram).toEqual({ enabled: false })
     expect(config.sources.github).toEqual({ enabled: false })

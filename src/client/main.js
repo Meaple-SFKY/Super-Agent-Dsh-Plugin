@@ -68,6 +68,8 @@ function build(require) {
 
   const ZH = {
     'app.title': 'Superagent',
+    'language.zh': '中文',
+    'language.en': 'English',
     'panel': 'Superagent',
     'app.subtitle': '常驻在线的个人助手 · Telegram + GitHub',
     'nav.overview': '看板',
@@ -203,6 +205,10 @@ function build(require) {
     'behavior.workers': '并行 Worker 数',
     'behavior.workersHint': '同时运行的 Ticket 上限，笔记本建议 1–2。',
     'behavior.errorUsers': '请至少填一个允许的 Telegram user id，或跳过 Telegram。',
+    'behavior.language': '机器人主语言',
+    'behavior.languageHint': '机器人对你回复、汇报时使用的语言，独立于面板 UI 语言；默认中文。',
+    'behavior.languageZh': '中文',
+    'behavior.languageEn': 'English',
     'behavior.errorMode': '请选择接受模式。',
     'behavior.telegramSkipped': 'Telegram 未启用，可留空；启用 Telegram 后必须填写。',
     'finish.title': '保存并启用',
@@ -261,6 +267,8 @@ function build(require) {
 
   const EN = {
     'app.title': 'Superagent',
+    'language.zh': 'Chinese (中文)',
+    'language.en': 'English',
     'panel': 'Superagent',
     'app.subtitle': 'A personal always-on agent · Telegram + GitHub',
     'nav.overview': 'Overview',
@@ -396,6 +404,10 @@ function build(require) {
     'behavior.workers': 'Parallel workers',
     'behavior.workersHint': 'Maximum tickets running at once; 1–2 on a laptop.',
     'behavior.errorUsers': 'Add at least one allowed Telegram user id, or skip Telegram.',
+    'behavior.language': 'Bot language',
+    'behavior.languageHint': 'The language the bot replies and reports in; independent of the panel UI language. Defaults to Chinese.',
+    'behavior.languageZh': '中文',
+    'behavior.languageEn': 'English',
     'behavior.errorMode': 'Choose an accept mode.',
     'behavior.telegramSkipped': 'Telegram is off, so this may stay empty; enabling Telegram requires at least one id.',
     'finish.title': 'Save and enable',
@@ -503,6 +515,16 @@ function build(require) {
     return ids
   }
 
+  function isLanguage(value) {
+    return value === 'zh' || value === 'en'
+  }
+
+  /** Bot language reported by the setup API; defaults to Chinese. */
+  function setupLanguage(setup) {
+    if (setup && typeof setup === 'object' && isLanguage(setup.language)) return setup.language
+    return 'zh'
+  }
+
   function repoEntry(value) {
     if (typeof value === 'string' && value.length > 0) {
       return { fullName: value, private: false, pushedAt: '' }
@@ -554,7 +576,7 @@ function build(require) {
       step: 0,
       telegram: { status: 'idle', token: '', botUsername: '', tokenFile: '', error: '', skipped: false },
       github: { status: 'idle', token: '', login: '', tokenFile: '', repositories: [], selected: [], allowSelf: false, error: '', skipped: false },
-      behavior: { allowedUserIds: '', mode: 'observe', maxWorkers: 2 },
+      behavior: { allowedUserIds: '', mode: 'observe', maxWorkers: 2, language: 'zh' },
       finish: { status: 'idle', error: '', elapsed: 0 },
     }
   }
@@ -583,6 +605,7 @@ function build(require) {
         ...base.behavior,
         mode: 'observe',
         maxWorkers: 2,
+        language: setupLanguage(setup),
       },
     }
   }
@@ -615,6 +638,7 @@ function build(require) {
       return wizard.github.status === 'validated' && listOf(wizard.github.selected).length > 0
     }
     if (step === 2) {
+      if (!isLanguage(wizard.behavior.language)) return false
       if (!['off', 'observe', 'auto'].includes(wizard.behavior.mode)) return false
       const workers = asNumber(wizard.behavior.maxWorkers, 0)
       if (workers < 1 || workers > MAX_WORKERS) return false
@@ -625,6 +649,7 @@ function build(require) {
   }
 
   function behaviorError(wizard, t) {
+    if (!isLanguage(wizard.behavior.language)) return t('behavior.languageHint')
     if (!['off', 'observe', 'auto'].includes(wizard.behavior.mode)) return t('behavior.errorMode')
     const workers = asNumber(wizard.behavior.maxWorkers, 0)
     if (workers < 1 || workers > MAX_WORKERS) return t('behavior.workersHint')
@@ -650,6 +675,7 @@ function build(require) {
       if (wizard.github.tokenFile) github.tokenFile = wizard.github.tokenFile
     }
     return {
+      language: isLanguage(wizard.behavior.language) ? wizard.behavior.language : 'zh',
       sources: { telegram, github },
       policy: { mode: wizard.behavior.mode },
       executor: { maxWorkers: asNumber(wizard.behavior.maxWorkers, 2) },
@@ -1593,6 +1619,7 @@ function build(require) {
     const health = listOf(data.health)
     const healthy = sources.filter(source => source && source.health === 'ready').length
     const configured = setupData === undefined ? true : isSetupConfigured(setupData)
+    const language = setupLanguage(setupData)
     const tone = pluginTone(status)
 
     const kindTone = kind => (kind === 'ready' ? 'ok' : kind === 'failed' ? 'error' : 'warn')
@@ -1704,6 +1731,7 @@ function build(require) {
             { className: 'sa-hero-title' },
             paused ? t('status.paused') : statusLabel(status, t),
             paused ? h(Pill, { tone: 'warn' }, t('overview.resume')) : null,
+            h(Pill, { tone: 'plain', icon: 'globe' }, t(`language.${language}`)),
             plugin.version ? h(Pill, { tone: 'plain' }, `v${plugin.version}`) : null,
           ),
           h(
@@ -2197,6 +2225,24 @@ function build(require) {
             }),
           ),
           h('div', { className: 'sa-divider' }),
+          h('div', { className: 'sa-section-title' }, t('behavior.language')),
+          h(
+            'div',
+            { role: 'radiogroup', 'aria-label': t('behavior.language') },
+            h(RadioCard, {
+              checked: behavior.language === 'zh',
+              title: t('behavior.languageZh'),
+              badge: t('common.recommended'),
+              onSelect: () => patchBehavior({ language: 'zh' }),
+            }),
+            h(RadioCard, {
+              checked: behavior.language === 'en',
+              title: t('behavior.languageEn'),
+              onSelect: () => patchBehavior({ language: 'en' }),
+            }),
+          ),
+          h('div', { className: 'sa-hint', style: { marginTop: 8 } }, t('behavior.languageHint')),
+          h('div', { className: 'sa-divider' }),
           h('div', { className: 'sa-section-title' }, t('behavior.mode')),
           h(
             'div',
@@ -2257,6 +2303,7 @@ function build(require) {
                 h(Pill, { tone: 'plain' }, t('github.selected', { count: listOf(github.selected).length })),
                 github.allowSelf === true ? h(Pill, { tone: 'ok' }, 'allowSelf') : null)
             : t('finish.noGithub')),
+        h(SummaryRow, { label: t('behavior.language') }, t(`language.${behavior.language === 'en' ? 'en' : 'zh'}`)),
         h(SummaryRow, { label: t('finish.mode') }, behavior.mode),
         h(SummaryRow, { label: t('finish.workers') }, String(asNumber(behavior.maxWorkers, 2))),
       )
@@ -2876,6 +2923,7 @@ function build(require) {
       behaviorError,
       buildConfig,
       parseUserIds,
+      setupLanguage,
       repoEntry,
       repositoryChoices,
       isSetupConfigured,
