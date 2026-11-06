@@ -85,7 +85,7 @@ export interface Trigger {
 }
 
 /** The outcome of offering a Trigger to the Engine. */
-export type ReceiveDisposition = 'stored' | 'duplicate' | 'filtered'
+export type ReceiveDisposition = 'stored' | 'duplicate' | 'filtered' | 'failed'
 
 /** A running or queued Eval of one Thread's Trigger batch. */
 export interface EvalRun {
