@@ -58,6 +58,12 @@ const DEFAULT_ENV = 'SUPERAGENT_GITHUB_TOKEN'
 const CURSOR_LAG_MS = 5000
 /** Cap review reads per poll so one noisy repository cannot exhaust the rate limit. */
 const MAX_REVIEW_PULLS = 10
+/** Automatic repository discovery (`repositories: ['*']`) refresh cadence. */
+const AUTO_REPOSITORIES_REFRESH_MS = 10 * 60_000
+/** First retry delay after a failed discovery; doubles up to the refresh cadence. */
+const AUTO_REPOSITORIES_RETRY_MS = 30_000
+/** Discovery is capped so one very large account cannot blow the poll budget. */
+const AUTO_REPOSITORIES_LIMIT = 200
 const FAILED_CONCLUSIONS = new Set([
   'failure',
   'timed_out',
@@ -106,7 +112,12 @@ export interface GithubConfig {
   tokenEnv?: string
   /** File containing the token; wins over `tokenEnv`. */
   tokenFile?: string
-  /** Repositories to watch, `owner/name`. */
+  /**
+   * Repositories to watch, `owner/name`. `"*"` discovers every repository the
+   * token can access (owner/collaborator/organization member, at most 200),
+   * refreshed about every 10 minutes and after a failed refresh; explicit
+   * entries are always kept and may be combined with `"*"`.
+   */
   repositories?: string[]
   /** The agent's own login; fetched from `/user` when unset. */
   login?: string
@@ -173,14 +184,21 @@ function clampNumber(value: number, min: number, max: number): number {
 /** Apply defaults; unknown/blank repository entries are dropped. */
 export function normalizeGithubConfig(config: GithubConfig = {}): NormalizedGithubConfig {
   const repositories: string[] = []
+  let wildcard = false
   for (const value of stringList(config.repositories)) {
+    if (value === '*') {
+      wildcard = true
+      continue
+    }
     const parts = value.split('/')
     if (parts.length === 2 && parts[0] && parts[1]) repositories.push(`${parts[0]}/${parts[1]}`)
   }
+  const normalizedRepositories = [...new Set(repositories)]
+  if (wildcard) normalizedRepositories.unshift('*')
   return {
     ...(config.tokenEnv?.trim() ? { tokenEnv: config.tokenEnv.trim() } : {}),
     ...(config.tokenFile?.trim() ? { tokenFile: config.tokenFile.trim() } : {}),
-    repositories: [...new Set(repositories)],
+    repositories: normalizedRepositories,
     ...(config.login?.trim() ? { login: config.login.trim() } : {}),
     allowSelf: config.allowSelf === true,
     allowedLogins: stringList(config.allowedLogins),
@@ -374,6 +392,8 @@ export interface GithubPollResult {
   emitted: number
   filtered: number
   errors: string[]
+  /** Non-fatal problems (e.g. stale automatic repository discovery). */
+  warnings: string[]
 }
 
 interface RepoPollResult {
@@ -395,6 +415,11 @@ export class GithubSource implements Source {
   private loopPromise: Promise<void> | undefined
   private lastHealth: HealthState = 'off'
   private readonly branchCache = new Map<string, string>()
+  /** Resolved repositories when `repositories` contains `"*"`. */
+  private autoRepositories: { repositories: string[]; resolvedAt: number } | undefined
+  private autoRepositoryFailures = 0
+  private autoRepositoryLastAttempt = 0
+  private autoRepositoryLastError: string | undefined
 
   constructor(config: GithubConfig, ctx: SourceContext) {
     this.ctx = ctx
@@ -436,10 +461,12 @@ export class GithubSource implements Source {
         const result = await this.pollOnce(signal)
         failures = result.errors.length > 0 ? failures + 1 : 0
         if (signal.aborted) break
+        const auto = this.wantsAutoRepositories() ? ' (auto)' : ''
+        const warning = result.warnings.length > 0 ? `; ${result.warnings[0]}` : ''
         const detail =
           result.errors.length > 0
-            ? `${result.emitted} trigger(s); ${result.errors.length} repo read(s) failed: ${result.errors[0]}`
-            : `${result.emitted} trigger(s), ${result.filtered} filtered in ${result.repos} repo(s)`
+            ? `${result.emitted} trigger(s); ${result.errors.length} repo read(s) failed: ${result.errors[0]}; ${result.repos} repo(s)${auto}${warning}`
+            : `${result.emitted} trigger(s), ${result.filtered} filtered in ${result.repos} repo(s)${auto}${warning}`
         this.report(failures >= 3 ? 'error' : 'ready', detail)
         await this.sleep(this.config.pollSeconds * 1000, signal)
       } catch (error) {
@@ -501,13 +528,32 @@ export class GithubSource implements Source {
       const user = await api.getAuthenticatedUser({ signal })
       this.login = user.login
     }
+    const errors: string[] = []
+    // Resolve `repositories: ['*']` before the round; a failure with no cached
+    // list is reported as a read error and retried on the next poll.
+    try {
+      await this.refreshAutoRepositories(api, signal)
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) throw error
+      errors.push(`repository discovery: ${describeError(error)}`)
+    }
+    const warnings: string[] = []
+    if (this.autoRepositoryLastError && this.autoRepositories) {
+      warnings.push(`repository discovery: ${this.autoRepositoryLastError}`)
+    } else if (this.autoRepositoryLastError && !this.autoRepositories) {
+      // Nothing to poll yet: keep the failure visible in health until the
+      // backoff elapses and discovery is retried.
+      warnings.push(`repository discovery: retrying after error: ${this.autoRepositoryLastError}`)
+    }
+    const repositories = this.effectiveRepositories()
     const result: GithubPollResult = {
-      repos: this.config.repositories.length,
+      repos: repositories.length,
       emitted: 0,
       filtered: 0,
-      errors: [],
+      errors,
+      warnings,
     }
-    for (const repo of this.config.repositories) {
+    for (const repo of repositories) {
       if (signal.aborted) throw abortError()
       try {
         const repoResult = await this.pollRepo(api, repo, signal)
@@ -519,6 +565,89 @@ export class GithubSource implements Source {
       }
     }
     return result
+  }
+
+  // -------------------------------------------------------------------------
+  // Automatic repository discovery (`repositories: ['*']`)
+  // -------------------------------------------------------------------------
+
+  private wantsAutoRepositories(): boolean {
+    return this.config.repositories.includes('*')
+  }
+
+  private explicitRepositories(): string[] {
+    return this.config.repositories.filter(repo => repo !== '*')
+  }
+
+  /** Explicit entries first, then discovered repositories (case-insensitively deduped). */
+  private effectiveRepositories(): string[] {
+    const repositories = [...this.explicitRepositories()]
+    const seen = new Set(repositories.map(repo => repo.toLowerCase()))
+    for (const repo of this.autoRepositories?.repositories ?? []) {
+      const key = repo.toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      repositories.push(repo)
+    }
+    return repositories
+  }
+
+  private autoRepositoriesDue(now: number): boolean {
+    if (!this.wantsAutoRepositories()) return false
+    if (!this.autoRepositories) {
+      if (this.autoRepositoryFailures === 0) return true
+      return this.autoRetryDue(now)
+    }
+    if (this.autoRepositoryFailures > 0) return this.autoRetryDue(now)
+    if (!Number.isFinite(now)) return true
+    return now - this.autoRepositories.resolvedAt >= AUTO_REPOSITORIES_REFRESH_MS
+  }
+
+  private autoRetryDue(now: number): boolean {
+    if (!Number.isFinite(now)) return true
+    const delay = Math.min(
+      AUTO_REPOSITORIES_REFRESH_MS,
+      AUTO_REPOSITORIES_RETRY_MS * 2 ** Math.max(0, this.autoRepositoryFailures - 1),
+    )
+    return now - this.autoRepositoryLastAttempt >= delay
+  }
+
+  /**
+   * Refresh the discovered repository set on startup, about every 10 minutes,
+   * and after a failure (with backoff). A failed refresh keeps using the cached
+   * list so a transient API error does not stop polling.
+   */
+  private async refreshAutoRepositories(api: GithubApi, signal: AbortSignal): Promise<void> {
+    if (!this.wantsAutoRepositories()) return
+    const now = Date.parse(this.ctx.now())
+    if (!this.autoRepositoriesDue(now)) return
+    this.autoRepositoryLastAttempt = now
+    try {
+      const page = await api.listUserRepositories({ signal, maxPages: 2, perPage: 100 })
+      const repositories = page.items
+        .map(item => (typeof item.full_name === 'string' ? item.full_name : ''))
+        .filter(name => name.length > 0)
+        .slice(0, AUTO_REPOSITORIES_LIMIT)
+      this.autoRepositories = { repositories, resolvedAt: now }
+      this.autoRepositoryFailures = 0
+      this.autoRepositoryLastError = undefined
+      this.ctx.logger.debug('github: automatic repository discovery refreshed', {
+        repositories: repositories.length,
+        truncated: page.truncated,
+      })
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) throw error
+      this.autoRepositoryFailures += 1
+      this.autoRepositoryLastError = describeError(error)
+      if (this.autoRepositories) {
+        // Keep polling what we already know; retry sooner than the full cadence.
+        this.ctx.logger.warn('github: repository discovery failed; using the cached list', {
+          error: this.autoRepositoryLastError,
+        })
+        return
+      }
+      throw error
+    }
   }
 
   private async pollRepo(api: GithubApi, repo: string, signal: AbortSignal): Promise<RepoPollResult> {
@@ -936,7 +1065,7 @@ export class GithubSource implements Source {
   }
 
   private isTrackedRepo(repo: string): boolean {
-    return this.config.repositories.some(candidate => sameName(candidate, repo))
+    return this.effectiveRepositories().some(candidate => sameName(candidate, repo))
   }
 
   private isNewItem(at: string | undefined, since: string): boolean {

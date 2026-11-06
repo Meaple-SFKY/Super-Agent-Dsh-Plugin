@@ -212,6 +212,8 @@ export interface GithubRepo {
   archived?: boolean
   fork?: boolean
   pushed_at?: string | null
+  ssh_url?: string
+  clone_url?: string
 }
 
 export interface GithubIssue {
@@ -702,6 +704,22 @@ export class GithubApi {
     )
   }
 
+  /** Create a repository under the authenticated user's account. */
+  async createRepository(
+    input: { name: string; private?: boolean; description?: string; autoInit?: boolean; signal?: AbortSignal },
+  ): Promise<GithubRepo> {
+    return this.must<GithubRepo>('/user/repos', {
+      method: 'POST',
+      body: {
+        name: input.name,
+        ...(input.private !== undefined ? { private: input.private } : {}),
+        ...(input.description !== undefined ? { description: input.description } : {}),
+        ...(input.autoInit !== undefined ? { auto_init: input.autoInit } : {}),
+      },
+      ...(input.signal ? { signal: input.signal } : {}),
+    })
+  }
+
   /** Issues (including pull requests) updated since an ISO timestamp, oldest first. */
   async listIssuesUpdatedSince(
     repo: string,
@@ -1013,4 +1031,91 @@ export async function listGithubRepositories(
     archived: repo.archived === true,
     fork: repo.fork === true,
   }))
+}
+
+/** Input of {@link createGithubRepository}; `autoInit` maps to `auto_init`. */
+export interface CreateGithubRepositoryInput {
+  name: string
+  private?: boolean
+  description?: string
+  /** Create the repository with an initial README and a default branch. */
+  autoInit?: boolean
+}
+
+/** Result of {@link createGithubRepository}; `created` is false when it existed. */
+export interface GithubRepositoryCreated {
+  ok: true
+  created: boolean
+  fullName: string
+  name: string
+  private: boolean
+  htmlUrl: string
+  sshUrl: string
+  cloneUrl: string | null
+  defaultBranch: string
+}
+
+function mapCreatedRepository(repo: GithubRepo, created: boolean): GithubRepositoryCreated {
+  return {
+    ok: true,
+    created,
+    fullName: repo.full_name,
+    name: repo.name,
+    private: repo.private === true,
+    htmlUrl: typeof repo.html_url === 'string' ? repo.html_url : '',
+    sshUrl: typeof repo.ssh_url === 'string' ? repo.ssh_url : '',
+    cloneUrl: typeof repo.clone_url === 'string' ? repo.clone_url : null,
+    defaultBranch: typeof repo.default_branch === 'string' ? repo.default_branch : '',
+  }
+}
+
+/**
+ * Create a repository under the authenticated user's account, statelessly.
+ *
+ * A 422 "name already exists" answer is not an error: the helper reads the
+ * existing repository and returns it with `created: false`, so retries and
+ * "make sure this repo exists" calls are idempotent. Any other failure is
+ * thrown as a readable, token-free {@link GithubApiError}.
+ */
+export async function createGithubRepository(
+  token: string,
+  input: CreateGithubRepositoryInput,
+  options: SetupHelperOptions = {},
+): Promise<GithubRepositoryCreated> {
+  const name = input.name.trim()
+  if (!name) {
+    throw new GithubApiError({
+      status: 422,
+      method: 'POST',
+      path: '/user/repos',
+      details: 'repository name is empty',
+    })
+  }
+  if (name.length > 100 || !/^[A-Za-z0-9._-]+$/.test(name)) {
+    throw new GithubApiError({
+      status: 422,
+      method: 'POST',
+      path: '/user/repos',
+      details: 'repository names must be 1-100 characters of letters, digits, dots, underscores or hyphens',
+    })
+  }
+  const api = setupApi(token, options)
+  try {
+    const repo = await api.createRepository({
+      name,
+      ...(input.private !== undefined ? { private: input.private } : {}),
+      ...(input.description !== undefined ? { description: input.description } : {}),
+      ...(input.autoInit !== undefined ? { autoInit: input.autoInit } : {}),
+    })
+    return mapCreatedRepository(repo, true)
+  } catch (error) {
+    // GitHub signals an existing name with 422; return it instead of failing.
+    if (!(error instanceof GithubApiError) || error.status !== 422 || !/already exists/i.test(error.details ?? '')) {
+      throw error
+    }
+    const user = await api.getAuthenticatedUser()
+    const existing = await api.getRepo(`${user.login}/${name}`)
+    if (!existing) throw error
+    return mapCreatedRepository(existing, false)
+  }
 }

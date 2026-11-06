@@ -24,6 +24,7 @@ import {
   GithubApi,
   GithubApiError,
   GithubTokenValidationError,
+  createGithubRepository,
   createGithubTokenProvider,
   listGithubRepositories,
   validateGithubToken,
@@ -150,6 +151,8 @@ interface TestContext {
 interface TestContextOptions {
   /** Override the Engine answer; `undefined` falls back to normal dedupe. */
   receive?: (trigger: Trigger) => Disposition | undefined
+  /** Clock override for cursor/refresh-window tests. */
+  now?: () => string
 }
 
 function makeContext(id = 'github', options: TestContextOptions = {}): TestContext {
@@ -175,7 +178,7 @@ function makeContext(id = 'github', options: TestContextOptions = {}): TestConte
   const ctx = {
     id,
     stateDir: '/tmp/superagent-sources-test',
-    now: () => new Date().toISOString(),
+    now: options.now ?? (() => new Date().toISOString()),
     newId: (prefix: string) => `${prefix}-${(counter += 1)}`,
     receive,
     logger,
@@ -898,6 +901,142 @@ describe('github source: CI', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Automatic repository discovery (`repositories: ['*']`)
+// ---------------------------------------------------------------------------
+
+describe('github source: automatic repository discovery', () => {
+  it('resolves "*", refreshes every ~10 minutes and starts polling new repositories', async () => {
+    let discovered = ['agent/auto-one', 'agent/auto-two']
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repos') {
+        return {
+          body: discovered.map((fullName, index) => ({
+            id: index + 1,
+            full_name: fullName,
+            name: fullName.split('/')[1],
+            owner: { login: 'agent' },
+            default_branch: 'main',
+          })),
+        }
+      }
+      const match = /^\/repos\/([^/]+\/[^/]+)\//.exec(request.path)
+      if (!match || !discovered.includes(match[1]!)) return undefined
+      return emptyStreams(request, match[1]!)
+    })
+    let nowMs = Date.now()
+    const { ctx, kv } = makeContext('github', { now: () => new Date(nowMs).toISOString() })
+    const source = createSource(baseConfig(fake.url, { repositories: ['*'] }), ctx) as GithubSource
+
+    const first = await source.pollOnce(signal())
+    expect(first.repos).toBe(2)
+    expect(first.errors).toEqual([])
+    expect(kv.get('github:cursors:agent/auto-one')).toBeDefined()
+    expect(kv.get('github:cursors:agent/auto-two')).toBeDefined()
+    expect(
+      source.channelAllowed({ source: 'github', thread: 'github:agent/auto-one#1', to: 'agent/auto-one#1' }),
+    ).toBe(true)
+    expect(
+      source.channelAllowed({ source: 'github', thread: 'github:agent/unknown#1', to: 'agent/unknown#1' }),
+    ).toBe(false)
+
+    // A new repository is not picked up before the refresh interval elapses.
+    discovered = [...discovered, 'agent/auto-three']
+    const tooSoon = await source.pollOnce(signal())
+    expect(tooSoon.repos).toBe(2)
+    expect(kv.get('github:cursors:agent/auto-three')).toBeUndefined()
+
+    // After ~10 minutes the discovery refreshes and the new repository is polled.
+    nowMs += 11 * 60_000
+    const refreshed = await source.pollOnce(signal())
+    expect(refreshed.repos).toBe(3)
+    expect(refreshed.errors).toEqual([])
+    expect(kv.get('github:cursors:agent/auto-three')).toBeDefined()
+  })
+
+  it('retries repository discovery after a failure, then polls the discovered repositories', async () => {
+    let discoveryCalls = 0
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repos') {
+        discoveryCalls += 1
+        if (discoveryCalls === 1) {
+          return { status: 403, body: { message: 'Resource not accessible by integration' } }
+        }
+        return {
+          body: [{ id: 1, full_name: 'agent/late', name: 'late', owner: { login: 'agent' }, default_branch: 'main' }],
+        }
+      }
+      const match = /^\/repos\/([^/]+\/[^/]+)\//.exec(request.path)
+      if (match && match[1] === 'agent/late') return emptyStreams(request, 'agent/late')
+      return undefined
+    })
+    let nowMs = Date.now()
+    const { ctx, kv } = makeContext('github', { now: () => new Date(nowMs).toISOString() })
+    const source = createSource(baseConfig(fake.url, { repositories: ['*'] }), ctx) as GithubSource
+
+    const failed = await source.pollOnce(signal())
+    expect(failed.repos).toBe(0)
+    expect(failed.errors).toHaveLength(1)
+    expect(failed.errors[0]).toContain('repository discovery')
+
+    // The retry backoff is 30s; before that the poll does not hammer the API,
+    // but health keeps the failure visible as a warning.
+    const stillWaiting = await source.pollOnce(signal())
+    expect(stillWaiting.errors).toEqual([])
+    expect(stillWaiting.warnings[0]).toContain('repository discovery')
+    expect(discoveryCalls).toBe(1)
+
+    nowMs += 31_000
+    const retried = await source.pollOnce(signal())
+    expect(retried.errors).toEqual([])
+    expect(retried.repos).toBe(1)
+    expect(kv.get('github:cursors:agent/late')).toBeDefined()
+  })
+
+  it('keeps the explicit repository list working without discovery calls', async () => {
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repos') return { body: [] }
+      return emptyStreams(request)
+    })
+    const { ctx } = makeContext('github')
+    const source = createSource(baseConfig(fake.url), ctx) as GithubSource
+
+    const result = await source.pollOnce(signal())
+    expect(result.repos).toBe(1)
+    expect(result.errors).toEqual([])
+    expect(fake.requestsTo('/user/repos')).toHaveLength(0)
+  })
+
+  it('reports the resolved count as "N repo(s) (auto)" in health', async () => {
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repos') {
+        return {
+          body: ['agent/health-one', 'agent/health-two'].map((fullName, index) => ({
+            id: index + 1,
+            full_name: fullName,
+            name: fullName.split('/')[1],
+            owner: { login: 'agent' },
+            default_branch: 'main',
+          })),
+        }
+      }
+      const match = /^\/repos\/([^/]+\/[^/]+)\//.exec(request.path)
+      if (match && ['agent/health-one', 'agent/health-two'].includes(match[1]!)) {
+        return emptyStreams(request, match[1]!)
+      }
+      return undefined
+    })
+    const { ctx, health } = makeContext('github')
+    const source = createSource(baseConfig(fake.url, { repositories: ['*'], pollSeconds: 10 }), ctx) as GithubSource
+
+    await source.start()
+    await waitFor(() =>
+      health.some(entry => entry.state === 'ready' && (entry.detail ?? '').includes('2 repo(s) (auto)')),
+    )
+    await source.stop()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Sending and allowlists
 // ---------------------------------------------------------------------------
 
@@ -1214,6 +1353,124 @@ describe('github setup helpers (stateless token validation and repository discov
       .requestsTo('/user/repos')
       .filter(request => request.query.get('page') === '3')
     expect(thirdPage).toHaveLength(0)
+  })
+
+  it('creates a repository under the user account with auto-init', async () => {
+    const fake = await startGithub(request => {
+      if (request.method === 'POST' && request.path === '/user/repos') {
+        return {
+          status: 201,
+          body: {
+            id: 1,
+            full_name: 'agent/new-repo',
+            name: 'new-repo',
+            owner: { login: 'agent' },
+            default_branch: 'main',
+            private: true,
+            html_url: 'https://github.com/agent/new-repo',
+            ssh_url: 'git@github.com:agent/new-repo.git',
+            clone_url: 'https://github.com/agent/new-repo.git',
+          },
+        }
+      }
+      return undefined
+    })
+
+    const created = await createGithubRepository(
+      TOKEN,
+      { name: 'new-repo', private: true, description: 'demo', autoInit: true },
+      { apiBaseUrl: fake.url, timeoutMs: 1_000 },
+    )
+
+    expect(created).toEqual({
+      ok: true,
+      created: true,
+      fullName: 'agent/new-repo',
+      name: 'new-repo',
+      private: true,
+      htmlUrl: 'https://github.com/agent/new-repo',
+      sshUrl: 'git@github.com:agent/new-repo.git',
+      cloneUrl: 'https://github.com/agent/new-repo.git',
+      defaultBranch: 'main',
+    })
+    const posted = fake.requestsTo('/user/repos')[0]!
+    expect(posted.body).toEqual({
+      name: 'new-repo',
+      private: true,
+      description: 'demo',
+      auto_init: true,
+    })
+  })
+
+  it('treats an existing repository as created:false instead of an error', async () => {
+    const fake = await startGithub(request => {
+      if (request.method === 'POST' && request.path === '/user/repos') {
+        return {
+          status: 422,
+          body: {
+            message: 'Repository creation failed.',
+            errors: [{ resource: 'Repository', field: 'name', message: 'name already exists on this account' }],
+          },
+        }
+      }
+      if (request.path === '/user') return { body: { login: 'agent', id: 9 } }
+      if (request.path === '/repos/agent/existing') {
+        return {
+          body: {
+            id: 2,
+            full_name: 'agent/existing',
+            name: 'existing',
+            owner: { login: 'agent' },
+            default_branch: 'main',
+            private: false,
+            html_url: 'https://github.com/agent/existing',
+            ssh_url: 'git@github.com:agent/existing.git',
+            clone_url: 'https://github.com/agent/existing.git',
+          },
+        }
+      }
+      return undefined
+    })
+
+    const result = await createGithubRepository(
+      TOKEN,
+      { name: 'existing' },
+      { apiBaseUrl: fake.url, timeoutMs: 1_000 },
+    )
+
+    expect(result).toMatchObject({ ok: true, created: false, fullName: 'agent/existing', defaultBranch: 'main' })
+    expect(fake.requestsTo('/user/repos')).toHaveLength(1)
+  })
+
+  it('rejects an invalid repository name without calling the API', async () => {
+    const fake = await startGithub(() => undefined)
+    await expect(
+      createGithubRepository(TOKEN, { name: 'not a repo name' }, { apiBaseUrl: fake.url }),
+    ).rejects.toThrow(/repository names/)
+    await expect(
+      createGithubRepository(TOKEN, { name: '' }, { apiBaseUrl: fake.url }),
+    ).rejects.toThrow(/empty/)
+    expect(fake.requests).toHaveLength(0)
+  })
+
+  it('reports a 401 on repository creation without leaking the token', async () => {
+    const fake = await startGithub(request => {
+      if (request.method === 'POST' && request.path === '/user/repos') {
+        return { status: 401, body: { message: 'Bad credentials' } }
+      }
+      return undefined
+    })
+    let error: unknown
+    try {
+      await createGithubRepository(TOKEN, { name: 'nope' }, { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+      expect.unreachable()
+    } catch (caught) {
+      error = caught
+    }
+    expect(error).toBeInstanceOf(GithubApiError)
+    expect((error as GithubApiError).status).toBe(401)
+    expect(String(error)).toContain('Bad credentials')
+    expect(String(error)).not.toContain(TOKEN)
   })
 
   it('reports a 403 while listing repositories readably without leaking the token', async () => {
