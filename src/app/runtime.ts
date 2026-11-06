@@ -106,6 +106,8 @@ export interface RuntimeConfig {
   }
   quiet?: { maxChars?: number; minChars?: number }
   watchdog?: { stallMs?: number; escalateMs?: number; intervalMs?: number; silentMs?: number; silentMaxAttempts?: number }
+  /** User-facing language for the bot (default zh). */
+  language?: 'zh' | 'en'
   /** Explicit accept-mode acknowledgement behaviour (default false: quiet). */
   acknowledgeOnAccept?: boolean
   /** Optional override for the recurring engine pass (default 2 s). */
@@ -134,6 +136,9 @@ export function validateConfig(raw: unknown): { config?: RuntimeConfig; problem?
   if (mode !== undefined && mode !== 'off' && mode !== 'observe' && mode !== 'auto') {
     return { problem: { error: 'configuration.policy.mode must be off|observe|auto' } }
   }
+  if (config.language !== undefined && config.language !== 'zh' && config.language !== 'en') {
+    return { problem: { error: 'configuration.language must be zh or en' } }
+  }
   const maxWorkers = config.executor?.maxWorkers
   if (maxWorkers !== undefined && (!Number.isInteger(maxWorkers) || maxWorkers < 1)) {
     return { problem: { error: 'configuration.executor.maxWorkers must be a positive integer' } }
@@ -144,6 +149,63 @@ export function validateConfig(raw: unknown): { config?: RuntimeConfig; problem?
     }
   }
   return { config: { ...config, stateDir } }
+}
+
+// ---------------------------------------------------------------------------
+// Localized operational copy
+// ---------------------------------------------------------------------------
+
+export type CommandName = 'status' | 'pause' | 'resume' | 'tickets' | 'stop' | 'retry' | 'notFound'
+
+export interface CommandReplyVars {
+  state?: string
+  paused?: boolean
+  open?: number
+  sources?: string
+  items?: string
+  title?: string
+  ticketId?: string
+}
+
+/** Render one Telegram command reply in the configured language (zh default). */
+export function renderCommandReply(
+  command: CommandName,
+  language: 'zh' | 'en',
+  vars: CommandReplyVars = {},
+): string {
+  const zh = language !== 'en'
+  switch (command) {
+    case 'status': {
+      const state = vars.state ?? 'unknown'
+      const localized =
+        zh
+          ? ({ ready: '正常', degraded: '降级', starting: '启动中', stopped: '已停止' } as Record<string, string>)[state] ?? state
+          : state
+      if (zh) {
+        return truncateCommand(
+          `${localized}${vars.paused ? ' · 已暂停' : ''} · ${vars.open ?? 0} 个 Ticket · ${vars.sources || '无来源'}`,
+          100,
+        )
+      }
+      return truncateCommand(
+        `${localized}${vars.paused ? ' · paused' : ''} · ${vars.open ?? 0} ticket(s) · ${vars.sources || 'no sources'}`,
+        100,
+      )
+    }
+    case 'pause':
+      return zh ? '已暂停。现有 Ticket 保持原状态。' : 'Paused. Existing tickets keep their state.'
+    case 'resume':
+      return zh ? '已恢复。' : 'Resumed.'
+    case 'tickets':
+      return truncateCommand(vars.items || (zh ? '没有未完成的 Ticket。' : 'No open tickets.'), 100)
+    case 'stop':
+      return zh ? `已停止：${truncateCommand(vars.title ?? '', 60)}` : `Stopped ${truncateCommand(vars.title ?? '', 60)}.`
+    case 'retry':
+      return zh ? `已排入重试：${truncateCommand(vars.title ?? '', 60)}` : `Retry queued for ${truncateCommand(vars.title ?? '', 60)}.`
+    case 'notFound':
+    default:
+      return zh ? `未找到 Ticket ${vars.ticketId ?? ''}。` : `Ticket ${vars.ticketId ?? ''} not found.`
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +474,11 @@ export class Runtime {
     return this.statusDetail ?? this.safeModeReason
   }
 
+  /** User-facing language for the bot (zh default). */
+  get language(): 'zh' | 'en' {
+    return this.config?.language === 'en' ? 'en' : 'zh'
+  }
+
   /** The API implementation handed to `registerApi`. */
   get api(): ApiDeps {
     if (!this.apiDeps) {
@@ -472,6 +539,7 @@ export class Runtime {
       assessor: () => this.assessor as unknown as AssessorPort,
       executor: () => this.executor as unknown as ExecutorPort,
       acknowledgeOnAccept: config.acknowledgeOnAccept === true,
+      language: this.language,
       ...(config.quiet?.maxChars !== undefined || config.quiet?.minChars !== undefined
         ? { maxMessageChars: config.quiet?.maxChars ?? config.quiet?.minChars }
         : {}),
@@ -486,6 +554,7 @@ export class Runtime {
       kv: this.store.kv,
       now: () => this.clock.now(),
       presetIds: { router: 'superagent-router', worker: 'superagent-worker' },
+      language: this.language,
       defaultModel: () => this.defaultAgentOptions(),
       maxWorkers: config.executor?.maxWorkers ?? 2,
       createTimeoutMs: 60_000,
@@ -553,6 +622,7 @@ export class Runtime {
       configEditor: () => this.ctx.get('configEditor') as ConfigEditorLike | undefined,
       hostEntry: () => (this.ctx as unknown as { fiber?: { entry?: unknown } }).fiber?.entry,
       redact: redactDetail,
+      language: () => this.language,
     })
     // A fresh runtime means the previous setup edit already restarted us.
     this.setupService.markRestarted()
@@ -883,7 +953,9 @@ export class Runtime {
         this.logger.warn('could not stop effects in safe mode', { error: errorMessage(error) })
       }
       this.writeHeartbeat()
-      await this.notifyUser(`SuperAgent paused itself: ${reason}`)
+      await this.notifyUser(
+        this.language === 'en' ? `SuperAgent paused itself: ${reason}` : `SuperAgent 已自动暂停：${reason}`,
+      )
     })().catch((error: unknown) => {
       this.logger.warn('safe mode transition failed', { error: errorMessage(error) })
     })
@@ -966,43 +1038,45 @@ export class Runtime {
   }
 
   private telegramCommands(): Record<string, unknown> {
+    const language = this.language
     return {
       status: async () => {
         const snapshot = this.buildState()
         const open = snapshot.tickets.active.length + snapshot.tickets.attention.length
         const sourceStates = snapshot.sources.map(source => `${source.id}:${source.health}`).join(' ')
-        const state = snapshot.plugin.status
-        return truncateCommand(
-          `${state}${this.paused ? ' · paused' : ''} · ${open} ticket(s) · ${sourceStates || 'no sources'}`,
-          100,
-        )
+        return renderCommandReply('status', language, {
+          state: snapshot.plugin.status,
+          paused: this.paused,
+          open,
+          sources: sourceStates,
+        })
       },
       pause: async () => {
         this.setPaused(true)
-        return 'Paused. Existing tickets keep their state.'
+        return renderCommandReply('pause', language)
       },
       resume: async () => {
         this.setPaused(false)
         if (this.safeMode) this.exitSafeMode()
-        return 'Resumed.'
+        return renderCommandReply('resume', language)
       },
       tickets: async () => {
         const snapshot = this.buildState()
         const active = snapshot.tickets.active.slice(0, 3).map(ticket => `${ticket.id} ${ticket.title}`)
         const attention = snapshot.tickets.attention.slice(0, 2).map(ticket => `${ticket.id} ${ticket.kind}`)
-        return truncateCommand([...active, ...attention].join(' · ') || 'No open tickets.', 100)
+        return renderCommandReply('tickets', language, { items: [...active, ...attention].join(' · ') })
       },
       stopTicket: async (ticketId: string) => {
         const ticket = this.store?.tickets.get(ticketId)
-        if (!ticket) return `Ticket ${ticketId} not found.`
+        if (!ticket) return renderCommandReply('notFound', language, { ticketId })
         this.engine!.people.stopTicket(ticketId, 'stopped from chat')
-        return `Stopped ${truncateCommand(ticket.title, 60)}.`
+        return renderCommandReply('stop', language, { title: ticket.title })
       },
       retryTicket: async (ticketId: string) => {
         const ticket = this.store?.tickets.get(ticketId)
-        if (!ticket) return `Ticket ${ticketId} not found.`
+        if (!ticket) return renderCommandReply('notFound', language, { ticketId })
         this.engine!.people.retryTicket(ticketId)
-        return `Retry queued for ${truncateCommand(ticket.title, 60)}.`
+        return renderCommandReply('retry', language, { title: ticket.title })
       },
     }
   }

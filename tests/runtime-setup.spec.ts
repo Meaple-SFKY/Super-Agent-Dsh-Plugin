@@ -376,6 +376,29 @@ describe('setup wizard backend', () => {
     ).toBe(200)
   })
 
+  it('exposes and accepts the bot language (zh default, en switch)', async () => {
+    const harness = makeHarness()
+    const initial = (await harness.service.state()).body as { language: string }
+    expect(initial.language).toBe('zh')
+
+    harness.config.language = 'en'
+    const switched = (await harness.service.state()).body as { language: string }
+    expect(switched.language).toBe('en')
+
+    const prepared = harness.service.prepareConfig({ config: { language: 'en' } })
+    expect(prepared.result.status).toBe(200)
+    expect(prepared.result.body).toEqual({ ok: true, restarting: true })
+    expect(prepared.patch?.language).toBe('en')
+    harness.service.commitConfigSoon(prepared.patch!)
+    runScheduled(harness)
+    await harness.service.waitForCommit()
+    expect(harness.editor.calls[0]!.next.language).toBe('en')
+
+    const invalid = harness.service.prepareConfig({ config: { language: 'fr' } })
+    expect(invalid.result.status).toBe(400)
+    expect(invalid.result.body.error).toBe('invalid_config')
+  })
+
   it('serves the static permissions explanation', () => {
     const harness = makeHarness()
     const result = harness.service.permissions()

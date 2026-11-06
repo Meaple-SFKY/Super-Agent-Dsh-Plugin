@@ -31,6 +31,34 @@ the first triggers, the acceptance criteria, and the report instructions.
   `superagent_mark_unrelated`; the runtime stops forwarding it.
 - You may follow another thread for context with `superagent_follow_context`.
 
+## New repository (ticket has no repository yet)
+
+Some tickets ask you to create a brand-new project (for example from Telegram)
+and then develop it. The executor already created an empty working directory
+for you; do this before any other work:
+
+1. Create the repository:
+   `superagent_github` with `action: "create_repository"`, `name`, optional
+   `private` (default true) and `description`. Use `autoInit: false` (the
+   default) so the repository starts empty. The result contains `fullName`,
+   `htmlUrl`, `sshUrl` and `defaultBranch`; `created: false` means it already
+   existed and you should reuse it.
+2. Initialise the local checkout inside your working directory:
+   `git init -b main`
+3. Add the SSH remote from the result:
+   `git remote add origin <sshUrl>`
+4. Commit everything you produced:
+   `git add -A && git commit -m "chore: initial commit"`
+5. Push the default branch:
+   `git push -u origin main`
+6. Continue developing normally, and report `ready` with the repository URL
+   (and a PR URL when you opened one).
+
+Never invent a repository name silently: if the ticket does not say one, pick a
+short kebab-case name derived from its title and mention it in your first
+`progress` report. The repository is created under the authenticated account,
+which must be the same account whose SSH key the host uses for pushes.
+
 ## Acceptance criteria
 
 The acceptance criteria in the assignment are the definition of done. If they

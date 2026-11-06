@@ -87,7 +87,24 @@ function pullRequestOf(args: Record<string, unknown>): PullRequestRef | undefine
 // variable (never passed in the tool arguments, never returned or logged).
 // ---------------------------------------------------------------------------
 
+interface GithubRepositoryCreated {
+  ok: true
+  created: boolean
+  fullName: string
+  name: string
+  private: boolean
+  htmlUrl: string
+  sshUrl: string
+  cloneUrl: string | null
+  defaultBranch: string
+}
+
 interface GithubModule {
+  createGithubRepository?: (
+    token: string,
+    input: { name: string; private?: boolean; description?: string; autoInit?: boolean },
+    options?: { apiBaseUrl?: string; timeoutMs?: number },
+  ) => Promise<GithubRepositoryCreated>
   GithubApi: new (options: {
     token: string | (() => Promise<string>)
     baseUrl?: string
@@ -145,34 +162,41 @@ function secretFileFor(deps: ToolDeps, call: WorkerCallContext, name: string): s
   return existsSync(candidate) ? candidate : undefined
 }
 
+type GithubTokenResult = { token: string; tokenSource: 'literal' | 'file' | 'env' } | { ok: false; error: string; detail?: string }
 type GithubClientResult = { client: GithubApi; tokenSource: 'literal' | 'file' | 'env' } | { ok: false; error: string; detail?: string }
+
+/** Resolve the configured token without building a client (used by repo creation). */
+async function githubToken(deps: ToolDeps, call: WorkerCallContext): Promise<GithubTokenResult> {
+  const module = await loadGithubModule()
+  if (!module) return failure('github_unavailable', 'the GitHub API module is unavailable in this build')
+  const options = deps.github ?? {}
+  if (typeof options.token === 'string' && options.token.trim().length > 0) {
+    return { token: options.token.trim(), tokenSource: 'literal' }
+  }
+  const tokenFile = secretFileFor(deps, call, 'github-token')
+  const provider = module.createGithubTokenProvider({
+    ...(tokenFile ? { tokenFile } : {}),
+    ...(options.tokenEnv ? { tokenEnv: options.tokenEnv } : {}),
+  })
+  let token: string
+  try {
+    token = (await provider()).trim()
+  } catch (error) {
+    return mapGithubError(error)
+  }
+  if (token.length === 0) return failure('github_token_missing', 'the GitHub token is empty')
+  return { token, tokenSource: tokenFile ? 'file' : 'env' }
+}
 
 /** Build an authenticated client; token failures are structured, never thrown with the secret. */
 async function githubClient(deps: ToolDeps, call: WorkerCallContext): Promise<GithubClientResult> {
   const module = await loadGithubModule()
   if (!module) return failure('github_unavailable', 'the GitHub API module is unavailable in this build')
+  const tokenResult = await githubToken(deps, call)
+  if ('ok' in tokenResult) return tokenResult
   const options = deps.github ?? {}
-  let token: string
-  let tokenSource: 'literal' | 'file' | 'env'
-  if (typeof options.token === 'string' && options.token.trim().length > 0) {
-    token = options.token.trim()
-    tokenSource = 'literal'
-  } else {
-    const tokenFile = secretFileFor(deps, call, 'github-token')
-    const provider = module.createGithubTokenProvider({
-      ...(tokenFile ? { tokenFile } : {}),
-      ...(options.tokenEnv ? { tokenEnv: options.tokenEnv } : {}),
-    })
-    try {
-      token = (await provider()).trim()
-    } catch (error) {
-      return mapGithubError(error)
-    }
-    if (token.length === 0) return failure('github_token_missing', 'the GitHub token is empty')
-    tokenSource = tokenFile ? 'file' : 'env'
-  }
   const client = new module.GithubApi({
-    token,
+    token: tokenResult.token,
     ...(options.apiBaseUrl ? { baseUrl: options.apiBaseUrl } : {}),
     ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
@@ -180,7 +204,7 @@ async function githubClient(deps: ToolDeps, call: WorkerCallContext): Promise<Gi
     baseDelayMs: 250,
     maxDelayMs: 2_000,
   })
-  return { client, tokenSource }
+  return { client, tokenSource: tokenResult.tokenSource }
 }
 
 const PR_CACHE_PREFIX = 'superagent.github.pr.'
@@ -299,10 +323,22 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
   const definition = jsonTool({
     name: 'superagent_github',
     description:
-      'GitHub actions for your ticket: open (or return) a pull request for your branch, comment on a PR/issue, or read CI checks. ' +
-      'Uses the configured SuperAgent GitHub token; never pass a token. Idempotent: the same branch returns the existing PR, and a repeated comment is not posted twice.',
+      'GitHub actions for your ticket: create a repository, open (or return) a pull request for your branch, comment on a PR/issue, or read CI checks. ' +
+      'Uses the configured SuperAgent GitHub token; never pass a token. Idempotent: an existing repository returns created:false, the same branch returns the existing PR, and a repeated comment is not posted twice.',
     parameters: {
-      action: { type: 'string', enum: ['pull_request', 'comment', 'checks'], required: true, description: 'Which GitHub action to perform' },
+      action: {
+        type: 'string',
+        enum: ['create_repository', 'pull_request', 'comment', 'checks'],
+        required: true,
+        description: 'Which GitHub action to perform',
+      },
+      name: { type: 'string', description: 'create_repository: repository name (letters, digits, dot, dash, underscore; max 100)' },
+      private: { type: 'boolean', description: 'create_repository: private repository (default true)' },
+      description: { type: 'string', description: 'create_repository: optional repository description' },
+      autoInit: {
+        type: 'boolean',
+        description: 'create_repository: create with an initial README/default branch (default false; the worker pushes main itself)',
+      },
       repo: { type: 'string', description: 'owner/name; defaults to the repository inferred from the ticket' },
       head: { type: 'string', description: 'pull_request: source branch (default agent/<ticketId>)' },
       base: { type: 'string', description: 'pull_request: target branch (default: repository default branch)' },
@@ -316,9 +352,60 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
       const call = workerCallContext(exec, deps)
       if ('ok' in call) return call
       const action = String(args.action ?? '')
-      if (action !== 'pull_request' && action !== 'comment' && action !== 'checks') {
-        return failure('invalid_action', 'expected pull_request, comment or checks')
+      if (action !== 'create_repository' && action !== 'pull_request' && action !== 'comment' && action !== 'checks') {
+        return failure('invalid_action', 'expected create_repository, pull_request, comment or checks')
       }
+
+      if (action === 'create_repository') {
+        const module = await loadGithubModule()
+        if (!module?.createGithubRepository) {
+          return failure(
+            'github_create_repository_unavailable',
+            'repository creation is unavailable in this build; update the SuperAgent bundle',
+          )
+        }
+        const name = String(args.name ?? '').trim()
+        if (!name) return failure('name_required', 'create_repository needs a repository name')
+        if (name.length > 100 || !/^[A-Za-z0-9._-]+$/.test(name)) {
+          return failure('invalid_name', 'repository names may use letters, digits, dot, dash and underscore (max 100)')
+        }
+        const tokenResult = await githubToken(deps, call)
+        if ('ok' in tokenResult) return tokenResult
+        const options = deps.github ?? {}
+        try {
+          const created = await module.createGithubRepository(
+            tokenResult.token,
+            {
+              name,
+              private: args.private !== false,
+              ...(typeof args.description === 'string' && args.description.trim()
+                ? { description: args.description.trim().slice(0, 350) }
+                : {}),
+              autoInit: args.autoInit === true,
+            },
+            {
+              ...(options.apiBaseUrl ? { apiBaseUrl: options.apiBaseUrl } : {}),
+              ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
+            },
+          )
+          return {
+            ok: true,
+            action: 'create_repository',
+            repo: created.fullName,
+            fullName: created.fullName,
+            name: created.name,
+            private: created.private,
+            htmlUrl: created.htmlUrl,
+            sshUrl: created.sshUrl,
+            cloneUrl: created.cloneUrl,
+            defaultBranch: created.defaultBranch,
+            created: created.created,
+          }
+        } catch (error) {
+          return mapGithubError(error)
+        }
+      }
+
       const repo = resolveRepository(deps, call.ticketId, typeof args.repo === 'string' ? args.repo : undefined)
       if (!repo) {
         return failure(

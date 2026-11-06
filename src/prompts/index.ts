@@ -30,6 +30,34 @@ import { oneLine, clampText } from '../app/support.js'
 
 export type PromptName = 'router' | 'admission' | 'worker'
 
+/** Bot language: the user-facing copy language (zh is the default). */
+export type Language = 'zh' | 'en'
+
+/** Normalize a configured language value; anything unknown falls back to zh. */
+export function normalizeLanguage(value: unknown): Language {
+  return value === 'en' ? 'en' : 'zh'
+}
+
+/**
+ * Injected at the end of every role prompt, so the English rule body stays
+ * stable while the user-visible language follows the configuration.
+ */
+export function languageRule(language: Language): string {
+  return language === 'en'
+    ? [
+        '## Language',
+        'Always communicate with the user, write reports, ask questions and write ticket copy in English.',
+        'Keep code, identifiers, commands, logs and URLs in their original form.',
+        'If the user clearly writes in another language, follow the user.',
+      ].join('\n')
+    : [
+        '## 语言',
+        '始终使用简体中文与用户交流、写报告、提问和撰写工单文案。',
+        '代码、标识符、命令、日志与 URL 保持原样。',
+        '如果用户明显使用其他语言，跟随用户的语言。',
+      ].join('\n')
+}
+
 /** Full embedded text, used when no markdown file can be read. */
 const BUILTIN: Record<PromptName, string> = {
   router: ROUTER,
@@ -98,14 +126,14 @@ export function loadPrompt(name: PromptName): string {
   return text
 }
 
-/** The Router's system prompt: governance rules plus the admission rubric. */
-export function routerSystemPrompt(): string {
-  return `${loadPrompt('router').trim()}\n\n${loadPrompt('admission').trim()}`
+/** The Router's system prompt: governance rules, the admission rubric, and the language rule. */
+export function routerSystemPrompt(language: Language = 'zh'): string {
+  return `${loadPrompt('router').trim()}\n\n${loadPrompt('admission').trim()}\n\n${languageRule(language)}`
 }
 
-/** The Worker's system prompt. */
-export function workerSystemPrompt(): string {
-  return loadPrompt('worker').trim()
+/** The Worker's system prompt (plus the language rule). */
+export function workerSystemPrompt(language: Language = 'zh'): string {
+  return `${loadPrompt('worker').trim()}\n\n${languageRule(language)}`
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +293,12 @@ export function renderAssignmentMessage(options: AssignmentRenderOptions): strin
   lines.push(`assignment: ${assignment.id} started: ${timeShort(assignment.startedAt)}`)
   lines.push(`directory: ${directory}`)
   if (branch) lines.push(`branch: ${branch}`)
+  const repo = ticket.mandate.scope.startsWith('github:') ? ticket.mandate.scope.slice('github:'.length) : undefined
+  lines.push(
+    repo
+      ? `repository: ${repo}`
+      : 'repository: none — if this ticket asks you to create one, use superagent_github action=create_repository first (see the New repository section)',
+  )
   lines.push('requested outcome (acceptance criteria):')
   lines.push(`- deliver: ${oneLine(ticket.title, 200)}`)
   lines.push(

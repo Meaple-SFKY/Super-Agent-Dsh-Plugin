@@ -70,6 +70,8 @@ export interface SetupAccountGithub {
 export interface SetupState {
   ok: true
   stateDir: string
+  /** User-facing language for the bot (zh default). */
+  language: 'zh' | 'en'
   plugin: { status: string; detail: string | null }
   accounts: { telegram: SetupAccountTelegram; github: SetupAccountGithub }
   permissions: SetupPermission[]
@@ -88,6 +90,8 @@ export interface SetupConfigPatch {
   policy?: Record<string, unknown>
   executor?: Record<string, unknown>
   quiet?: Record<string, unknown>
+  /** User-facing language for the bot (zh default). */
+  language?: 'zh' | 'en'
 }
 
 /** The surface `src/app/api.ts` mounts; `SetupService` implements it. */
@@ -138,6 +142,8 @@ export interface SetupDeps {
   configEditor: () => ConfigEditorLike | undefined
   /** The Loader entry of this plugin (`ctx.fiber.entry`), read at commit time. */
   hostEntry: () => unknown
+  /** Current user-facing language (from the running config). */
+  language?: () => 'zh' | 'en'
   redact?: (text: string) => string
   timeoutMs?: number
   /** Test seam for the post-response commit. Defaults to an unref'ed timer. */
@@ -361,10 +367,12 @@ export class SetupService implements SetupApi {
     const repositories =
       githubCache.repositories && githubCache.repositories.length > 0 ? githubCache.repositories : configuredRepositories
     const restartRequired = this.deps.kv.get<boolean>(KV_RESTART) === true
+    const language = this.deps.language?.() ?? (config.language === 'en' ? 'en' : 'zh')
 
     const state: SetupState = {
       ok: true,
       stateDir: this.deps.stateDir,
+      language,
       plugin: this.deps.plugin(),
       accounts: {
         telegram: {
@@ -555,8 +563,15 @@ export class SetupService implements SetupApi {
         if (!isRecord(value)) throw new SetupError(400, 'invalid_config', `${key} must be a JSON object`)
         patch[key] = value
       }
+      const language = desired.language
+      if (language !== undefined) {
+        if (language !== 'zh' && language !== 'en') {
+          throw new SetupError(400, 'invalid_config', 'language must be zh or en')
+        }
+        patch.language = language
+      }
       if (Object.keys(patch).length === 0) {
-        throw new SetupError(400, 'invalid_config', 'config must contain sources, policy, executor or quiet')
+        throw new SetupError(400, 'invalid_config', 'config must contain sources, policy, executor, quiet or language')
       }
       this.assertSafePatch(patch)
       const base = this.deps.currentConfig() ?? {}

@@ -8,7 +8,9 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 import {
+  languageRule,
   loadPrompt,
+  normalizeLanguage,
   renderAssignmentMessage,
   renderCandidateMessage,
   renderDeliveryMessage,
@@ -46,6 +48,43 @@ describe('prompt files', () => {
     expect(routerSystemPrompt()).toContain('SuperAgent Router')
     expect(routerSystemPrompt()).toContain('Admission rules')
     expect(workerSystemPrompt()).toContain('never try to talk to the user directly')
+  })
+
+  it('injects the configured language rule into every role prompt', () => {
+    expect(routerSystemPrompt('zh')).toContain('始终使用简体中文')
+    expect(routerSystemPrompt('zh')).toContain('## 语言')
+    expect(routerSystemPrompt('en')).toContain('## Language')
+    expect(routerSystemPrompt('en')).toContain('in English')
+    expect(workerSystemPrompt('zh')).toContain('始终使用简体中文')
+    expect(workerSystemPrompt('en')).toContain('Always communicate with the user')
+    expect(languageRule('zh')).toBe(languageRule('zh'))
+    expect(languageRule('zh')).not.toBe(languageRule('en'))
+    expect(normalizeLanguage('en')).toBe('en')
+    expect(normalizeLanguage('fr')).toBe('zh')
+    expect(normalizeLanguage(undefined)).toBe('zh')
+  })
+
+  it('guides a worker to create a repository when the ticket has none', () => {
+    expect(workerSystemPrompt('en')).toContain('create_repository')
+    expect(workerSystemPrompt('en')).toContain('git init -b main')
+    expect(workerSystemPrompt('en')).toContain('git remote add origin')
+    expect(workerSystemPrompt('en')).toContain('git push -u origin main')
+    const ticket = makeTicket()
+    const none = renderAssignmentMessage({
+      ticket,
+      assignment: ticket.assignments[0]!,
+      directory: '/tmp/work/t_1',
+      triggers: [],
+    })
+    expect(none).toContain('repository: none')
+    ticket.mandate = { ...ticket.mandate, scope: 'github:owner/repo' }
+    const withRepo = renderAssignmentMessage({
+      ticket,
+      assignment: ticket.assignments[0]!,
+      directory: '/tmp/work/t_1',
+      triggers: [],
+    })
+    expect(withRepo).toContain('repository: owner/repo')
   })
 
   it('states the hard governance rules the runtime relies on', () => {

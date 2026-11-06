@@ -24,7 +24,12 @@ import type { KeyValueStore } from '../core/ports.js'
 import type { IsoTime, TicketId } from '../core/model.js'
 import type { AppLogger } from './support.js'
 import { errorMessage, nowIso, runSafely, sleep, withTimeout } from './support.js'
-import { routerSystemPrompt, workerSystemPrompt } from '../prompts/index.js'
+import {
+  normalizeLanguage,
+  routerSystemPrompt,
+  workerSystemPrompt,
+  type Language,
+} from '../prompts/index.js'
 
 // ---------------------------------------------------------------------------
 // Host service shapes (only what this module uses)
@@ -105,6 +110,8 @@ export interface SessionsOptions {
    * first turn fails with "has no provider/model".
    */
   defaultModel?: () => AgentOptions | undefined | Promise<AgentOptions | undefined>
+  /** User-facing language for role prompts (default zh). */
+  language?: Language
   /** Deadline for one create/resume call. */
   createTimeoutMs?: number
   /** Deadline for one whenIdle/dispose call during stop. */
@@ -492,7 +499,9 @@ export class Sessions {
         | undefined
       if (!systemPrompt?.section) return
       const resolved = prompt ? prompt() : undefined
-      const text = resolved?.text ?? (info.role === 'router' ? routerSystemPrompt() : workerSystemPrompt())
+      const language = normalizeLanguage(this.options.language)
+      const text =
+        resolved?.text ?? (info.role === 'router' ? routerSystemPrompt(language) : workerSystemPrompt(language))
       const base = systemPrompt.getSectionOrder ? systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX') : 0
       systemPrompt.section({
         name: resolved?.name ?? (info.role === 'router' ? 'superagent:router-role' : 'superagent:worker-role'),
@@ -506,7 +515,7 @@ export class Sessions {
   }
 
   private routerSystemPromptSection(): { name: string; text: string } {
-    return { name: 'superagent:router-role', text: routerSystemPrompt() }
+    return { name: 'superagent:router-role', text: routerSystemPrompt(normalizeLanguage(this.options.language)) }
   }
 
   // -- delivery ------------------------------------------------------------

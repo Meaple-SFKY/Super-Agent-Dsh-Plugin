@@ -63,6 +63,9 @@ interface FakeGithubBehaviour {
   createPullResponse?: (body: Record<string, unknown>) => { status: number; body: unknown }
   comments?: FakeCommentInput[]
   defaultBranch?: string
+  /** Login returned by GET /user (default octocat). */
+  userLogin?: string
+  createRepositoryResponse?: (body: Record<string, unknown>) => { status: number; body: unknown }
   checkRuns?: { status: number; body: unknown }
   workflowRuns?: { status: number; body: unknown }
 }
@@ -122,6 +125,32 @@ async function startFakeGithub(behaviour: FakeGithubBehaviour): Promise<FakeGith
         response.writeHead(status, { 'content-type': 'application/json' })
         response.end(JSON.stringify(value))
       }
+      const login = behaviour.userLogin ?? 'octocat'
+      if (request.method === 'GET' && path === '/user') {
+        json(200, { login, id: 1, name: login })
+        return
+      }
+      if (request.method === 'POST' && path === '/user/repos') {
+        const parsed = JSON.parse(body || '{}') as Record<string, unknown>
+        if (behaviour.createRepositoryResponse) {
+          const answer = behaviour.createRepositoryResponse(parsed)
+          json(answer.status, answer.body)
+          return
+        }
+        const name = String(parsed.name)
+        const fullName = `${login}/${name}`
+        json(201, {
+          full_name: fullName,
+          name,
+          private: parsed.private !== false,
+          html_url: `https://github.com/${fullName}`,
+          ssh_url: `git@github.com:${fullName}.git`,
+          clone_url: `https://github.com/${fullName}.git`,
+          default_branch: behaviour.defaultBranch ?? 'main',
+          owner: { login },
+        })
+        return
+      }
       const repoMatch = /^\/repos\/([^/]+)\/([^/]+)(.*)$/.exec(path)
       if (!repoMatch) {
         json(404, { message: 'Not Found' })
@@ -130,7 +159,16 @@ async function startFakeGithub(behaviour: FakeGithubBehaviour): Promise<FakeGith
       const repo = `${repoMatch[1]}/${repoMatch[2]}`
       const rest = repoMatch[3] ?? ''
       if (request.method === 'GET' && rest === '') {
-        json(200, { full_name: repo, name: repoMatch[2], owner: { login: repoMatch[1] }, default_branch: behaviour.defaultBranch ?? 'main' })
+        json(200, {
+          full_name: repo,
+          name: repoMatch[2],
+          private: true,
+          owner: { login: repoMatch[1] },
+          default_branch: behaviour.defaultBranch ?? 'main',
+          html_url: `https://github.com/${repo}`,
+          ssh_url: `git@github.com:${repo}.git`,
+          clone_url: `https://github.com/${repo}.git`,
+        })
         return
       }
       if (request.method === 'GET' && rest === '/pulls') {
@@ -517,5 +555,99 @@ describe('superagent_github tool', () => {
     })).value as Record<string, unknown>
     expect(noBody).toMatchObject({ ok: false, error: 'body_required' })
     expect(textOf({ content: [{ type: 'text', text: 'x' }] })).toBe('x')
+  })
+})
+
+describe('superagent_github create_repository', () => {
+  it('creates a private repository under the token owner and returns URLs', async () => {
+    const github = await startFakeGithub({ pulls: [], defaultBranch: 'main', userLogin: 'octocat' })
+    const harness = await makeWorker({})
+    setGithub(harness, { token: 'ghp_repo000000000000000000000000000', apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
+
+    const result = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'create_repository',
+      name: 'my-new-project',
+      description: '  experiments  ',
+    })).value as Record<string, unknown>
+
+    expect(result).toMatchObject({
+      ok: true,
+      action: 'create_repository',
+      repo: 'octocat/my-new-project',
+      fullName: 'octocat/my-new-project',
+      name: 'my-new-project',
+      private: true,
+      htmlUrl: 'https://github.com/octocat/my-new-project',
+      sshUrl: 'git@github.com:octocat/my-new-project.git',
+      defaultBranch: 'main',
+      created: true,
+    })
+    const post = github.requests.find(entry => entry.method === 'POST' && entry.path.endsWith('/user/repos'))
+    expect(post).toBeDefined()
+    const body = JSON.parse(post!.body ?? '{}') as { name?: string; private?: boolean; description?: string; auto_init?: boolean }
+    expect(body.name).toBe('my-new-project')
+    expect(body.private).toBe(true)
+    expect(body.description).toBe('experiments')
+    expect(github.requests.every(entry => entry.authorization === 'Bearer ghp_repo000000000000000000000000000')).toBe(true)
+    expect(JSON.stringify(result)).not.toContain('ghp_repo')
+  })
+
+  it('is idempotent: an existing repository is returned with created:false', async () => {
+    const github = await startFakeGithub({
+      pulls: [],
+      userLogin: 'octocat',
+      createRepositoryResponse: () => ({
+        status: 422,
+        body: { message: 'Repository creation failed.', errors: [{ message: 'name already exists on this account' }] },
+      }),
+    })
+    const harness = await makeWorker({})
+    setGithub(harness, { token: 'ghp_existing00000000000000000000000', apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
+
+    const result = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'create_repository',
+      name: 'already-there',
+      private: false,
+    })).value as Record<string, unknown>
+
+    expect(result.ok).toBe(true)
+    expect(result.created).toBe(false)
+    expect(result.repo).toBe('octocat/already-there')
+    expect(result.private).toBe(true) // reflects the existing repository returned by the helper
+    expect(JSON.stringify(result)).not.toContain('ghp_existing')
+  })
+
+  it('maps repository creation failures to structured, token-free errors', async () => {
+    const github = await startFakeGithub({
+      pulls: [],
+      createRepositoryResponse: () => ({ status: 403, body: { message: 'Resource not accessible by integration' } }),
+    })
+    const harness = await makeWorker({})
+    setGithub(harness, { token: 'ghp_repofail000000000000000000000000', apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
+
+    const result = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'create_repository',
+      name: 'nope',
+    })).value as Record<string, unknown>
+    expect(result.ok).toBe(false)
+    expect(result.error).toBe('github_forbidden_or_missing')
+    expect(JSON.stringify(result)).not.toContain('ghp_repofail')
+  })
+
+  it('validates the repository name', async () => {
+    const github = await startFakeGithub({ pulls: [] })
+    const harness = await makeWorker({})
+    setGithub(harness, { token: 'ghp_reponame000000000000000000000000', apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
+
+    const missing = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'create_repository',
+    })).value as Record<string, unknown>
+    expect(missing).toMatchObject({ ok: false, error: 'name_required' })
+    const invalid = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'create_repository',
+      name: 'has spaces',
+    })).value as Record<string, unknown>
+    expect(invalid).toMatchObject({ ok: false, error: 'invalid_name' })
+    expect(github.requests).toHaveLength(0)
   })
 })
