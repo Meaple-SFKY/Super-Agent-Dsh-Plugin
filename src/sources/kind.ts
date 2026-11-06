@@ -14,6 +14,7 @@ import type {
   ChannelAddress,
   IsoTime,
   OutboundMessage,
+  ReceiveDisposition,
   SendOutcome,
   SourceId,
   ThreadRef,
@@ -48,7 +49,7 @@ export interface SourceContext {
   /** Generate a collision-resistant id with the given prefix. */
   newId(prefix: string): string
   /** Offer one admitted event to the Engine. */
-  receive(trigger: Trigger): 'stored' | 'duplicate' | 'filtered'
+  receive(trigger: Trigger): ReceiveDisposition
   readonly logger: SourceLogger
   /** Report one health entry; the last state wins. */
   health(entry: SourceHealth): void
