@@ -39,6 +39,7 @@ import {
   GithubTokenError,
   abortError,
   createGithubTokenProvider,
+  hasAgentMarker,
   isAbortError,
   sleepWithSignal,
   type GithubCheckRun,
@@ -109,6 +110,14 @@ export interface GithubConfig {
   repositories?: string[]
   /** The agent's own login; fetched from `/user` when unset. */
   login?: string
+  /**
+   * Admit events authored by `login` itself. Default false, which is the safe
+   * choice for a dedicated agent account. Set true when the user's own personal
+   * PAT (same account) is used to drive the agent from GitHub; the Source still
+   * drops its own marked output (comments / PR bodies containing
+   * `<!-- superagent:`) so it cannot trigger itself in a loop.
+   */
+  allowSelf?: boolean
   /** Humans whose events are admitted. Empty means every human except `login`. */
   allowedLogins?: string[]
   /** Bots whose events are admitted (as inferred candidates). */
@@ -134,6 +143,7 @@ interface NormalizedGithubConfig {
   tokenFile?: string
   repositories: string[]
   login?: string
+  allowSelf: boolean
   allowedLogins: string[]
   botLogins: string[]
   observeIssues: boolean
@@ -172,6 +182,7 @@ export function normalizeGithubConfig(config: GithubConfig = {}): NormalizedGith
     ...(config.tokenFile?.trim() ? { tokenFile: config.tokenFile.trim() } : {}),
     repositories: [...new Set(repositories)],
     ...(config.login?.trim() ? { login: config.login.trim() } : {}),
+    allowSelf: config.allowSelf === true,
     allowedLogins: stringList(config.allowedLogins),
     botLogins: stringList(config.botLogins),
     observeIssues: config.observeIssues === true,
@@ -602,8 +613,9 @@ export class GithubSource implements Source {
         // deterministic id deduplicates a successful retry.
         if (newInWindow) receive(this.pullTrigger(repo, pull))
         // Reviews must be read even when unaddressed comments are switched off:
-        // an `@mention` inside a review is always admitted.
-        if (!this.isSelf(pull.user.login)) reviewCandidates.push(pull)
+        // an `@mention` inside a review is always admitted. With `allowSelf`,
+        // the user's own PRs are reviewed too (single-account setups).
+        if (this.config.allowSelf || !this.isSelf(pull.user.login)) reviewCandidates.push(pull)
       }
       for (const pull of reviewCandidates.slice(0, MAX_REVIEW_PULLS)) {
         const reviews = await api.listPullReviews(repo, pull.number, { signal })
@@ -728,6 +740,7 @@ export class GithubSource implements Source {
 
   private issueTrigger(repo: string, issue: GithubIssue): Trigger | undefined {
     if (!this.actorAllowed(issue.user.login, issue.user.type)) return undefined
+    if (this.isOwnOutput(issue.user.login, issue.body)) return undefined
     const mention = this.mentionsSelf(issue.body)
     if (!mention && !this.config.observeIssues) return undefined
     const thread = threadKeyFor(repo, issue.number)
@@ -755,6 +768,7 @@ export class GithubSource implements Source {
 
   private pullTrigger(repo: string, pull: GithubPullRequest): Trigger | undefined {
     if (!this.actorAllowed(pull.user.login, pull.user.type)) return undefined
+    if (this.isOwnOutput(pull.user.login, pull.body)) return undefined
     const mention = this.mentionsSelf(pull.body)
     if (!mention && !this.config.observePulls) return undefined
     const thread = threadKeyFor(repo, pull.number)
@@ -782,6 +796,7 @@ export class GithubSource implements Source {
 
   private commentTrigger(repo: string, comment: GithubComment, inline: boolean): Trigger | undefined {
     if (!this.actorAllowed(comment.user.login, comment.user.type)) return undefined
+    if (this.isOwnOutput(comment.user.login, comment.body)) return undefined
     const mention = this.mentionsSelf(comment.body)
     if (!mention && !this.config.observeComments) return undefined
     const number =
@@ -820,6 +835,7 @@ export class GithubSource implements Source {
 
   private reviewTrigger(repo: string, pull: GithubPullRequest, review: GithubReview): Trigger | undefined {
     if (!this.actorAllowed(review.user.login, review.user.type)) return undefined
+    if (this.isOwnOutput(review.user.login, review.body)) return undefined
     const mention = this.mentionsSelf(review.body)
     if (!mention && !this.config.observeComments) return undefined
     const thread = threadKeyFor(repo, pull.number)
@@ -882,11 +898,27 @@ export class GithubSource implements Source {
   }
 
   private actorAllowed(login: string, type: string | undefined): boolean {
-    if (this.isSelf(login)) return false
+    const self = this.isSelf(login)
+    // A dedicated agent account is never a work source unless explicitly asked:
+    // otherwise every action of the agent loops back as a new Trigger.
+    if (self && !this.config.allowSelf) return false
     const isBot = type === 'Bot' || login.endsWith('[bot]')
-    if (isBot) return this.config.botLogins.some(candidate => sameName(candidate, login))
+    if (isBot) {
+      // The user's own account may still be a bot (e.g. a bot PAT); allowSelf
+      // admits it, but other bots need an explicit botLogins entry.
+      return self || this.config.botLogins.some(candidate => sameName(candidate, login))
+    }
+    if (self) return true
     if (this.config.allowedLogins.length === 0) return true
     return this.config.allowedLogins.some(candidate => sameName(candidate, login))
+  }
+
+  /**
+   * The agent's own output (a comment or PR body carrying the hidden marker)
+   * must never become a Trigger, even when `allowSelf` admits the account.
+   */
+  private isOwnOutput(login: string, body: string | null | undefined): boolean {
+    return this.isSelf(login) && hasAgentMarker(body)
   }
 
   private actorOf(user: { login: string; type?: string }): { id: string; name: string; bot: boolean } {

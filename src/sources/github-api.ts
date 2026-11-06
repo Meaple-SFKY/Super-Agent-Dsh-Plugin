@@ -83,6 +83,28 @@ export function latestTimestamp(values: Array<string | null | undefined>): strin
 }
 
 // ---------------------------------------------------------------------------
+// Agent-output markers
+// ---------------------------------------------------------------------------
+
+/**
+ * Hidden marker prefix the SuperAgent adds to GitHub output it created itself.
+ * The Source uses it to drop its own comments / PR bodies when `allowSelf` is
+ * on, so a single-account setup cannot trigger itself in a loop.
+ */
+export const AGENT_MARKER_PREFIX = '<!-- superagent:'
+
+/** Marker appended to pull request bodies created through {@link GithubApi}. */
+export const AGENT_PR_MARKER = `${AGENT_MARKER_PREFIX}pr -->`
+
+/** Marker appended to comments created without an idempotency key. */
+export const AGENT_COMMENT_MARKER = `${AGENT_MARKER_PREFIX}comment -->`
+
+/** True when text carries the agent-output marker. */
+export function hasAgentMarker(text: string | null | undefined): boolean {
+  return typeof text === 'string' && text.includes(AGENT_MARKER_PREFIX)
+}
+
+// ---------------------------------------------------------------------------
 // Errors and token provider
 // ---------------------------------------------------------------------------
 
@@ -825,10 +847,12 @@ export class GithubApi {
     body: string,
     options: { signal?: AbortSignal; idempotencyKey?: string } = {},
   ): Promise<GithubComment> {
+    // Every agent comment carries the hidden marker, so `allowSelf` can filter
+    // our own output; an idempotency key additionally makes retries dedupe.
     const marker = options.idempotencyKey
-      ? `<!-- superagent:${options.idempotencyKey.replace(/[^A-Za-z0-9:_-]/g, '-')} -->`
-      : undefined
-    if (marker) {
+      ? `${AGENT_MARKER_PREFIX}${options.idempotencyKey.replace(/[^A-Za-z0-9:_-]/g, '-')} -->`
+      : AGENT_COMMENT_MARKER
+    if (options.idempotencyKey) {
       const recent = await this.paginate<GithubComment>(
         `/repos/${repoPath(repo)}/issues/${number}/comments?sort=created&direction=desc`,
         { ...(options.signal ? { signal: options.signal } : {}), maxPages: 1 },
@@ -838,7 +862,7 @@ export class GithubApi {
       )
       if (existing) return existing
     }
-    const text = marker ? `${body}\n\n${marker}` : body
+    const text = hasAgentMarker(body) ? body : `${body}\n\n${marker}`
     return this.must<GithubComment>(`/repos/${repoPath(repo)}/issues/${number}/comments`, {
       method: 'POST',
       body: { body: text },
@@ -850,13 +874,18 @@ export class GithubApi {
     repo: string,
     input: { title: string; head: string; base: string; body?: string; draft?: boolean; signal?: AbortSignal },
   ): Promise<GithubPullRequest> {
+    // Mark every PR the agent opens, so `allowSelf` never turns our own PR into
+    // a fresh Trigger (the marker is invisible in rendered Markdown).
+    const body = hasAgentMarker(input.body)
+      ? input.body
+      : `${input.body?.trim() ? `${input.body.trim()}\n\n` : ''}${AGENT_PR_MARKER}`
     return this.must<GithubPullRequest>(`/repos/${repoPath(repo)}/pulls`, {
       method: 'POST',
       body: {
         title: input.title,
         head: input.head,
         base: input.base,
-        ...(input.body !== undefined ? { body: input.body } : {}),
+        body,
         ...(input.draft !== undefined ? { draft: input.draft } : {}),
       },
       ...(input.signal ? { signal: input.signal } : {}),

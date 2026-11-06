@@ -528,6 +528,70 @@ describe('github source: filters', () => {
     expect(result.filtered).toBe(3)
   })
 
+  it('filters the login account by default (allowSelf=false), even for mentions', async () => {
+    const comments: GithubComment[] = [
+      makeComment(70, { body: '@agent please fix this', user: { login: 'agent', id: 9, type: 'User' } }),
+    ]
+    const fake = await startGithub(request => {
+      if (request.path === '/repos/o/r/issues/comments') {
+        const since = request.query.get('since') ?? '1970-01-01T00:00:00.000Z'
+        return { body: comments.filter(comment => Date.parse(comment.updated_at ?? '') >= Date.parse(since)) }
+      }
+      return emptyStreams(request)
+    })
+    const { ctx, triggers } = makeContext()
+    const source = createSource(baseConfig(fake.url, { observeComments: true }), ctx) as GithubSource
+
+    await source.pollOnce(signal())
+    comments.push(makeComment(71, {
+      body: '@agent please fix the build',
+      user: { login: 'agent', id: 9, type: 'User' },
+    }))
+    const result = await source.pollOnce(signal())
+
+    expect(result.errors).toEqual([])
+    expect(triggers).toHaveLength(0)
+    expect(result.filtered).toBeGreaterThanOrEqual(1)
+  })
+
+  it('admits the login account own comments when allowSelf is on, but drops marked agent output', async () => {
+    const comments: GithubComment[] = []
+    const fake = await startGithub(request => {
+      if (request.path === '/repos/o/r/issues/comments') {
+        const since = request.query.get('since') ?? '1970-01-01T00:00:00.000Z'
+        return { body: comments.filter(comment => Date.parse(comment.updated_at ?? '') >= Date.parse(since)) }
+      }
+      return emptyStreams(request)
+    })
+    const { ctx, triggers } = makeContext()
+    const source = createSource(
+      baseConfig(fake.url, { allowSelf: true, allowedLogins: ['alice'], observeComments: false }),
+      ctx,
+    ) as GithubSource
+    await source.pollOnce(signal())
+
+    comments.push(
+      // The user writing through their own account: a plain @mention is work.
+      makeComment(80, { body: '@agent please run the tests', user: { login: 'agent', id: 9, type: 'User' } }),
+      // The agent's own reply: carries the hidden marker and must never loop.
+      makeComment(81, {
+        body: 'done <!-- superagent:msg_42 --> @agent',
+        user: { login: 'agent', id: 9, type: 'User' },
+      }),
+      // Someone else quoting the marker is not the agent's output.
+      makeComment(82, { body: 'quoted <!-- superagent:msg_43 --> hi @agent', user: { login: 'alice', id: 1, type: 'User' } }),
+    )
+    const result = await source.pollOnce(signal())
+
+    expect(result.errors).toEqual([])
+    expect(triggers.map(trigger => trigger.id)).toEqual([
+      'github:comment:o/r:80:' + (comments[0]!.updated_at ?? ''),
+      'github:comment:o/r:82:' + (comments[2]!.updated_at ?? ''),
+    ])
+    expect(triggers.map(trigger => trigger.actor.id)).toEqual(['agent', 'alice'])
+    expect(triggers.every(trigger => trigger.addressed === 'mention')).toBe(true)
+  })
+
   it('admits an Issue only when addressed unless observeIssues is on', async () => {
     const issues: GithubIssue[] = []
     const fake = await startGithub(request => {
@@ -627,6 +691,45 @@ describe('github source: pull request lifecycle', () => {
     expect(opened).toHaveLength(1)
     expect(triggers).toHaveLength(1)
     expect(triggers[0]!.id).toBe('github:pull:o/r#60')
+  })
+
+  it('admits the login account own PRs when allowSelf is on, but drops marked agent PRs', async () => {
+    let pulls: GithubPullRequest[] = []
+    const opened: GithubPullInfo[] = []
+    const fake = await startGithub(request => {
+      if (request.path === '/repos/o/r/pulls') return { body: pulls }
+      return emptyStreams(request)
+    })
+    const { ctx, triggers } = makeContext()
+    const source = createSource(
+      baseConfig(fake.url, { allowSelf: true, callbacks: { pullOpened: pull => opened.push(pull) } }),
+      ctx,
+    ) as GithubSource
+    await source.pollOnce(signal())
+
+    pulls = [
+      makePull(90, {
+        body: '@agent please review this',
+        user: { login: 'agent', id: 9, type: 'User' },
+      }),
+      makePull(91, {
+        body: 'automated change <!-- superagent:pr -->',
+        user: { login: 'agent', id: 9, type: 'User' },
+      }),
+    ]
+    const second = await source.pollOnce(signal())
+
+    expect(second.errors).toEqual([])
+    // Both PRs are lifecycle-notified (binding may still be needed), but only
+    // the unmarked user PR becomes a Trigger.
+    expect(opened.map(pull => pull.number)).toEqual([90, 91])
+    expect(triggers).toHaveLength(1)
+    expect(triggers[0]).toMatchObject({ kind: 'pull', thread: { key: 'github:o/r#90' }, addressed: 'mention' })
+
+    const third = await source.pollOnce(signal())
+    expect(third.emitted).toBe(0)
+    expect(opened).toHaveLength(2)
+    expect(triggers).toHaveLength(1)
   })
 
   it('needs the observeComments switch for unaddressed reviews', async () => {
@@ -852,6 +955,30 @@ describe('github source: sending', () => {
 // ---------------------------------------------------------------------------
 
 describe('github api client', () => {
+  it('marks pull request bodies it creates exactly once', async () => {
+    const fake = await startGithub(request => {
+      if (request.method === 'POST' && request.path === '/repos/o/r/pulls') {
+        return { status: 201, body: makePull(99, { body: String(request.body.body ?? '') }) }
+      }
+      return undefined
+    })
+    const api = new GithubApi({ token: 'token', baseUrl: fake.url })
+
+    await api.createPullRequest('o/r', { title: 'fix', head: 'agent/t_1', base: 'main', body: 'fix the build' })
+    const first = fake.requestsTo('/repos/o/r/pulls').at(-1)!
+    expect(String(first.body.body)).toBe('fix the build\n\n<!-- superagent:pr -->')
+
+    // A body that already carries a marker is not marked twice.
+    await api.createPullRequest('o/r', {
+      title: 'fix 2',
+      head: 'agent/t_2',
+      base: 'main',
+      body: 'change <!-- superagent:custom -->',
+    })
+    const second = fake.requestsTo('/repos/o/r/pulls').at(-1)!
+    expect(String(second.body.body)).toBe('change <!-- superagent:custom -->')
+  })
+
   it('never leaks the token in errors', async () => {
     const fake = await startGithub(request => {
       if (request.path === '/repos/o/secret') {
