@@ -36,7 +36,7 @@
       telegram:
         enabled: true
         # Name of the environment variable that holds the @BotFather token.
-        # tokenFile: /Users/you/.config/superagent/telegram-token
+        # tokenFile: /Users/you/.dsh/state/superagent/secrets/telegram-token
         tokenEnv: SUPERAGENT_TELEGRAM_TOKEN
         # Telegram numeric user ids that may start work. Without an entry no
         # message can become a candidate.
@@ -48,7 +48,7 @@
       github:
         enabled: true
         tokenEnv: SUPERAGENT_GITHUB_TOKEN
-        # tokenFile: /Users/you/.config/superagent/github-token
+        # tokenFile: /Users/you/.dsh/state/superagent/secrets/github-token
         # Login of the account the token belongs to (used for @mentions).
         login: "<github login of the token owner>"
         repositories:
