@@ -307,17 +307,26 @@ node scripts/watchdog.mjs --state-dir "$HOME/.dsh/state/superagent" --dry-run
 
 ## 8. 卸载
 
-> 所有 token、SSH 私钥与密钥对都保存在 `<stateDir>/secrets/` 内；删除插件时执行 `./scripts/uninstall.sh --purge-state` 会连同这些凭据一起删除，不会在 `~/.config` 等位置留下副本。
+插件本身由 DSH Plugin Manager 移除；下面的脚本清理它留下的全部文件。
 
 ```sh
-# 1) 停看门狗（保留 state）
-./scripts/uninstall.sh
+# 1) 在 DSH 里 remove bundle（Settings → Plugins），或：
+dsh plugin --profile desktop remove dsh-superagent-personal
 
-# 2) 从 profile 移除 bundle
-dsh plugin --profile superagent remove dsh-superagent-personal
+# 2) 清理 LaunchAgent、profile 配置行、linked package、legacy 目录
+./scripts/uninstall.sh --profile desktop
 
-# 3) 确认后再删状态（数据库、Ticket 历史、worker 目录，不可恢复）
-./scripts/uninstall.sh --purge-state --state-dir "$HOME/.dsh/state/superagent"
+# 3) 确认后连 state 一起删（不可恢复）：
+./scripts/uninstall.sh --profile desktop --purge-state
 ```
 
-撤销 Telegram bot：@BotFather → `/deletebot`。撤销 GitHub PAT：GitHub → Settings → Developer settings → Fine-grained tokens → Revoke。密钥文件删除：`rm -rf ~/.dsh/state/superagent/secrets`。
+`--purge-state` 会删除：
+
+- `<stateDir>/`（SQLite、Ticket 历史、worker 目录、`downloads/`、`secrets/` 里的 Telegram/GitHub token 和 SSH 私钥）；
+- 该 stateDir 对应的 DSH Router/Worker sessions；
+- `~/.config/superagent`（旧版 token 位置，若存在）；
+- profile patch 里的 `dsh-superagent-personal` 配置行与 linked package 条目。
+
+唯一保留的是 DSH 自己的 plugin-manager 日志目录（`.plugin-manager/logs/`），属于 DSH 管理，不属于插件数据。撤销 Telegram bot：@BotFather → `/deletebot`；撤销 GitHub PAT：GitHub → Settings → Developer settings → Fine-grained tokens → Revoke。
+
+> 当前安装方式：从本仓库构建后用 Plugin Manager 安装（`link:`）。**npm/URL tarball 式在线安装暂不支持**——bundle 静态依赖宿主 DSH 的 `dsh-tools`/`dsh-llm`/`dsh-session`，tarball 安装会因 profile 无法解析这些包而降级；如果要做真正的在线安装，需要把这些 helper 一起打进产物（自包含构建），可以作为后续打包项。
