@@ -174,7 +174,9 @@ Tests 19 passed — verify-flow(5) + verify-plugin-boot(5) + verify-packaging(9)
 | 单条结果、无重复 | 修复后 CineNest #3 仅 1 条中文 result 评论，无 “…” 空消息、无 worker 重复评论 |
 | ready 生命周期 | 真实 ticket ready 后自动 `ended(completed)`，`/superagent/api/state` 的 active/attention 立即清空；同 Thread 后续人消息可按原 Mandate resume（core 测试覆盖） |
 | safe mode 通知 | 连续失败只发一条 ≤140 字中文提示（含 /resume 指引），完整错误链仅留在日志/health/panel.detail |
-| 面板 | 第二轮排版（16px/1.7、28px 卡片 padding、31px 页面标题）已在线；设置向导包含机器人语言、仓库多选、allowSelf、watchdog/权限说明。视觉细节仍需用户主观确认 |
+| 面板 | 第二轮排版（16px/1.7、28px 卡片 padding、31px 页面标题）+ 长详情折叠（2–3 行 clamp + 展开/收起 + title）已提交；设置向导包含机器人语言、仓库多选、allowSelf、watchdog/权限说明。桌面端页面需 Cmd+R/重启应用后加载新 client bundle，用户选择稍后确认 |
+| PR 能力 | 通过临时私有仓库实测：Worker 在 `agent/smoke` 分支提交并 push，调用 `superagent_github pull_request` 成功创建 PR #1，report ready 后 Ticket 自动 ended(completed)；验证后临时仓库已删除、测试 issue 关闭 |
+| 删除仓库 | 删除 `superagent-demo-1` 后，Source 在下一轮识别 404、自动移出 wildcard 集合并触发 discovery 刷新；health detail 收敛为单行摘要（无 URL/query/换行、≤160 字），不再反复报错 |
 | 已知限制 | GitHub issue close 不再影响 ended ticket（ready 是终态）；PR merge 后的 outcome backfill 需要后续独立语义；面板 UI 语言跟随 DSH，机器人语言独立 |
 
 完整证据：`git log --oneline`（功能分步提交）、`docs/002-setup-api.md`、`docs/dsh-api-notes.md`，以及 `./scripts/pnpmw check`（25 files / 373 tests）。
