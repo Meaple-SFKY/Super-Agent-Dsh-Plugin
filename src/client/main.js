@@ -234,6 +234,24 @@ function build(require) {
     'finish.restartNote': '部分设置需要插件重启后生效；向导会自动等待。',
     'finish.noTelegram': '未配置（跳过）',
     'finish.noGithub': '未配置（跳过）',
+    'permission.filesystem.title': '仅状态目录',
+    'permission.filesystem.detail': '只读写状态目录内的内容（SQLite、每个 Ticket 的工作目录、0600 密钥文件与心跳），不会访问其他文件夹。',
+    'permission.network.title': '出站 HTTPS',
+    'permission.network.detail': '仅访问 Telegram Bot API（api.telegram.org）与 GitHub REST API；不开放任何入站端口。',
+    'permission.screenRecording.title': '屏幕录制',
+    'permission.screenRecording.detail': 'SuperAgent 从不截屏、录制窗口或音频。',
+    'permission.accessibility.title': '辅助功能',
+    'permission.accessibility.detail': 'SuperAgent 不控制其他应用，也不模拟输入事件。',
+    'permission.fullDiskAccess.title': '完全磁盘访问',
+    'permission.fullDiskAccess.detail': '只访问状态目录；不需要系统范围的磁盘访问。',
+    'permission.telegramBot.title': 'Telegram 机器人 token',
+    'permission.telegramBot.detail': '在 @BotFather 创建 bot，并把 token 粘贴到设置向导。bot 不能主动发起会话：请先点 Start 或 @ 它一次。',
+    'permission.githubToken.title': 'GitHub 细粒度 token',
+    'permission.githubToken.detail': '需要 Contents、Issues、Pull requests 的读写权限（CI 另需 Checks、Actions 只读）；仓库在向导里勾选。',
+    'permission.watchdog.title': '后台看门狗（可选）',
+    'permission.watchdog.detail': '登录项 + LaunchAgent 在 DSH 崩溃后保活；默认关闭，可用 scripts/install-launchd.sh 手动安装。',
+    'permission.restart.title': '配置变更后需要重启插件',
+    'permission.restart.detail': '保存配置会重启插件（DSH 配置不是 volatile 的）；向导会轮询 setup/state 直到插件重新就绪。',
     'permissions.title': '权限与安全边界',
     'permissions.subtitle': 'SuperAgent 只做你明确允许的事；以下是它需要和不需要的系统权限。',
     'permissions.screen': '屏幕录制',
@@ -435,6 +453,24 @@ function build(require) {
     'finish.restartNote': 'Some settings apply after the plugin restarts; the wizard waits for it.',
     'finish.noTelegram': 'Not configured (skipped)',
     'finish.noGithub': 'Not configured (skipped)',
+    'permission.filesystem.title': 'State directory only',
+    'permission.filesystem.detail': 'SuperAgent reads and writes only inside the state directory (SQLite, per-ticket work dirs, 0600 secrets, heartbeat). It never touches other folders.',
+    'permission.network.title': 'Outbound HTTPS',
+    'permission.network.detail': 'Telegram Bot API (api.telegram.org) and the GitHub REST API only. No inbound port is opened.',
+    'permission.screenRecording.title': 'Screen Recording',
+    'permission.screenRecording.detail': 'SuperAgent never captures the screen, windows or audio.',
+    'permission.accessibility.title': 'Accessibility',
+    'permission.accessibility.detail': 'SuperAgent does not control other apps or synthesize input events.',
+    'permission.fullDiskAccess.title': 'Full Disk Access',
+    'permission.fullDiskAccess.detail': 'Only the state directory is accessed; system-wide disk access is unnecessary.',
+    'permission.telegramBot.title': 'Telegram bot token',
+    'permission.telegramBot.detail': 'Create a bot with @BotFather and paste its token in this wizard. A bot cannot start a chat: press Start or mention it once.',
+    'permission.githubToken.title': 'GitHub fine-grained token',
+    'permission.githubToken.detail': 'Needs Contents, Issues and Pull requests read/write (Checks and Actions read-only for CI). Repositories are selected in the wizard.',
+    'permission.watchdog.title': 'Background watchdog (optional)',
+    'permission.watchdog.detail': 'Login item + LaunchAgent keep DSH alive across crashes. Disabled by default; install manually with scripts/install-launchd.sh.',
+    'permission.restart.title': 'Restart required after setup changes',
+    'permission.restart.detail': 'Saving configuration restarts the plugin (non-volatile DSH config). The wizard polls setup/state until the plugin is ready again.',
     'permissions.title': 'Permissions and boundaries',
     'permissions.subtitle': 'SuperAgent does only what you allow. Here is what it needs — and what it does not.',
     'permissions.screen': 'Screen recording',
@@ -527,6 +563,43 @@ function build(require) {
   function setupLanguage(setup) {
     if (setup && typeof setup === 'object' && isLanguage(setup.language)) return setup.language
     return 'zh'
+  }
+
+  /**
+   * Runtime permission ids -> panel locale keys. The Host API returns static
+   * English copy; the panel follows the DSH locale instead. Aliases cover the
+   * documented ids as well as the older names, and unknown ids fall back to the
+   * API text verbatim.
+   */
+  const PERMISSION_KEYS = {
+    filesystem: 'permission.filesystem',
+    network: 'permission.network',
+    'macos-screen-recording': 'permission.screenRecording',
+    'macos-accessibility': 'permission.accessibility',
+    'macos-full-disk-access': 'permission.fullDiskAccess',
+    'telegram-bot': 'permission.telegramBot',
+    'telegram-token': 'permission.telegramBot',
+    'github-token': 'permission.githubToken',
+    watchdog: 'permission.watchdog',
+    restart: 'permission.restart',
+    'restart-required': 'permission.restart',
+  }
+
+  function permissionText(entry, t) {
+    const record = entry && typeof entry === 'object' ? entry : {}
+    const id = typeof record.id === 'string' ? record.id : ''
+    const key = PERMISSION_KEYS[id]
+    const apiTitle = typeof record.title === 'string' ? record.title : ''
+    const apiDetail = typeof record.detail === 'string' ? record.detail : ''
+    if (key === undefined) return { title: apiTitle || id, detail: apiDetail }
+    const titleKey = `${key}.title`
+    const detailKey = `${key}.detail`
+    const localizedTitle = t(titleKey)
+    const localizedDetail = t(detailKey)
+    return {
+      title: localizedTitle !== titleKey ? localizedTitle : apiTitle || id,
+      detail: localizedDetail !== detailKey ? localizedDetail : apiDetail,
+    }
   }
 
   function repoEntry(value) {
@@ -2507,7 +2580,8 @@ function build(require) {
     function stateLabel(state) {
       if (state === 'required') return t('permissions.required')
       if (state === 'optional') return t('permissions.optional')
-      return t('permissions.notRequired')
+      if (state === 'not-required') return t('permissions.notRequired')
+      return typeof state === 'string' && state.length > 0 ? state : t('common.noValue')
     }
 
     function stateTone(state) {
@@ -2587,21 +2661,22 @@ function build(require) {
         runtimeEntries.length === 0
           ? h(EmptyState, { icon: 'info', title: t('permissions.apiEmpty') })
           : h('div', { className: 'sa-list' },
-              runtimeEntries.map((entry, index) =>
-                h(
+              runtimeEntries.map((entry, index) => {
+                const text = permissionText(entry, t)
+                return h(
                   'div',
                   { className: 'sa-row', key: entry.id || index },
                   h(Dot, { tone: entry.state === 'required' ? 'warn' : entry.state === 'not-required' ? 'ok' : 'idle' }),
                   h(
                     'div',
                     { className: 'sa-rowmain' },
-                    h('div', { className: 'sa-rowtitle' }, entry.title || entry.id || t('common.noValue')),
-                    entry.detail ? h(ExpandableDetail, { t, text: entry.detail, clamp: 3, threshold: 160 }) : null,
+                    h('div', { className: 'sa-rowtitle' }, text.title || t('common.noValue')),
+                    text.detail ? h(ExpandableDetail, { t, text: text.detail, clamp: 3, threshold: 160 }) : null,
                   ),
                   h(Pill, { tone: stateTone(entry.state) }, stateLabel(entry.state)),
                   entry.restartRequired ? h(Pill, { tone: 'warn' }, t('common.restartRequired')) : null,
-                ),
-              ),
+                )
+              }),
             ),
       ),
       h(
@@ -2985,6 +3060,9 @@ function build(require) {
       buildConfig,
       parseUserIds,
       setupLanguage,
+      PERMISSION_KEYS,
+      permissionText,
+      dictionaries: DICTS,
       repoEntry,
       repositoryChoices,
       isSetupConfigured,

@@ -77,6 +77,9 @@ interface Internals {
   }
   parseUserIds: (value: string) => string[]
   setupLanguage: (setup: unknown) => string
+  PERMISSION_KEYS: Record<string, string>
+  permissionText: (entry: unknown, t: (key: string) => string) => { title: string; detail: string }
+  dictionaries: Record<'zh' | 'en', Record<string, string>>
   repoEntry: (value: unknown) => { fullName: string } | undefined
   isSetupConfigured: (setup: unknown) => boolean
   expectedAccounts: (wizard: Wizard) => { telegram: boolean; github: boolean }
@@ -560,6 +563,91 @@ describe('setup wizard state machine', () => {
     expect(
       internals.accountsMatch(setupState(), internals.expectedAccounts(baseWizard(module))),
     ).toBe(true)
+  })
+})
+
+describe('permissions localization', () => {
+  it('maps every runtime permission id to zh/en copy and falls back for unknown ids', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    const zh = (key: string) => internals.dictionaries.zh[key] ?? key
+    const en = (key: string) => internals.dictionaries.en[key] ?? key
+    const ids = [
+      'filesystem',
+      'network',
+      'macos-screen-recording',
+      'macos-accessibility',
+      'macos-full-disk-access',
+      'telegram-bot',
+      'github-token',
+      'watchdog',
+      'restart',
+    ]
+
+    for (const id of ids) {
+      const entry = { id, title: `EN title ${id}`, detail: `EN detail ${id}`, state: 'required', restartRequired: false }
+      const localizedZh = internals.permissionText(entry, zh)
+      expect(localizedZh.title, `${id} zh title`).not.toBe(entry.title)
+      expect(localizedZh.title, `${id} zh title should be Chinese`).toMatch(/[\u4e00-\u9fff]/)
+      expect(localizedZh.detail, `${id} zh detail`).not.toBe(entry.detail)
+      expect(localizedZh.detail, `${id} zh detail should be Chinese`).toMatch(/[\u4e00-\u9fff]/)
+
+      const key = internals.PERMISSION_KEYS[id]
+      const localizedEn = internals.permissionText(entry, en)
+      expect(localizedEn.title, `${id} en title`).toBe(internals.dictionaries.en[`${key}.title`])
+      expect(localizedEn.detail, `${id} en detail`).toBe(internals.dictionaries.en[`${key}.detail`])
+    }
+
+    // Documented/alias ids that runtime may return now or later.
+    for (const id of ['telegram-token', 'restart-required']) {
+      const fallback = internals.permissionText({ id, title: 'EN title', detail: 'EN detail' }, zh)
+      expect(fallback.title, id).not.toBe('EN title')
+    }
+
+    // Unknown ids keep the API text verbatim.
+    expect(internals.permissionText({ id: 'future-permission', title: 'Future title', detail: 'Future detail' }, zh)).toEqual({
+      title: 'Future title',
+      detail: 'Future detail',
+    })
+  })
+
+  it('renders runtime permissions in the panel locale, with state and restart labels localized', async () => {
+    const source = await readFile(join(root, 'src/client', 'main.js'), 'utf8')
+    const { entry } = loadClient(source)
+    const react = renderableReact()
+    const factory = entry.factory
+    if (factory === undefined) throw new Error('client module registered no factory')
+    const module = factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error(`unexpected require: ${specifier}`)
+    }) as FakeModule
+    const internals = internalsOf(module)
+    const zh = (key: string) => internals.dictionaries.zh[key] ?? key
+
+    react.reset()
+    const tree = JSON.stringify(
+      internals.views.PermissionsView({
+        t: zh,
+        permissions: {
+          data: {
+            ok: true,
+            permissions: [
+              { id: 'filesystem', title: 'State directory only', detail: 'English filesystem detail', state: 'required', restartRequired: false },
+              { id: 'future-permission', title: 'Future title', detail: 'Future detail', state: 'optional', restartRequired: true },
+            ],
+          },
+        },
+        error: '',
+        loading: false,
+        at: '',
+        onRefresh: () => undefined,
+      }),
+    )
+    expect(tree).toContain(internals.dictionaries.zh['permission.filesystem.title'])
+    expect(tree).not.toContain('State directory only')
+    expect(tree).toContain('Future title')
+    expect(tree).toContain(internals.dictionaries.zh['permissions.required'])
+    expect(tree).toContain(internals.dictionaries.zh['common.restartRequired'])
   })
 })
 
