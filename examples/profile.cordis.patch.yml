@@ -1,0 +1,84 @@
+# Machine configuration for the `dsh-superagent-personal` bundle.
+#
+# Copy this file over the profile's own patch layer, for example
+# `~/.dsh/profiles/<profile>/cordis.patch.yml`, and replace every
+# `<placeholder>`. The file is an ordinary Loader patch layer applied after the
+# bundle's `cordis.patch.yml`; rows with only an `id` override that row's
+# configuration (the whole `config` object is replaced, not deep-merged).
+#
+# Secrets never belong in this file, in the repository, or in chat. Put the
+# Telegram bot token and the GitHub token in environment variables (or in a
+# token file readable only by you) and name those variables with `tokenEnv` /
+# `tokenFile` below. `scripts/setup.mjs` only checks that they are set; it never
+# prints their values.
+#
+# A full example for a user named `you`, a Telegram account with the numeric id
+# 123456789 and the repository `you/agent-playground`:
+#
+#   stateDir: /Users/you/.dsh/state/superagent
+#   telegram: { enabled: true, tokenEnv: SUPERAGENT_TELEGRAM_TOKEN, allowedUserIds: ["123456789"] }
+#   github:   { enabled: true, tokenEnv: SUPERAGENT_GITHUB_TOKEN, login: you-agent, repositories: ["you/agent-playground"] }
+#
+# Keep `policy.mode: observe` for the first days: candidates are recorded and
+# shown in the panel and in `/status`, but nothing is sent back out. Switch to
+# `auto` only after the log shows the candidates you expected.
+- id: dsh-superagent-personal
+  config:
+    # false is the manual kill switch; the environment variable
+    # SUPERAGENT_DISABLED=1 does the same without editing this file.
+    enabled: true
+    # Absolute path. Holds the database, lock, worker directories and logs.
+    # Back it up before upgrades. Create it first; setup.mjs validates it.
+    stateDir: <absolute path, for example /Users/you/.dsh/state/superagent>
+    sources:
+      # Telegram is the main conversation surface. Send /status, /pause,
+      # /resume, /tickets, /stop <ticket>, /retry <ticket>, /help.
+      telegram:
+        enabled: true
+        # Name of the environment variable that holds the @BotFather token.
+        # tokenFile: /Users/you/.config/superagent/telegram-token
+        tokenEnv: SUPERAGENT_TELEGRAM_TOKEN
+        # Telegram numeric user ids that may start work. Without an entry no
+        # message can become a candidate.
+        allowedUserIds:
+          - "<your numeric Telegram user id>"
+        # Optional group chats to listen to (only @mentions are candidates).
+        # chats: ["-1001234567890"]
+      # GitHub issues, pull requests, comments and CI are the second Source.
+      github:
+        enabled: true
+        tokenEnv: SUPERAGENT_GITHUB_TOKEN
+        # tokenFile: /Users/you/.config/superagent/github-token
+        # Login of the account the token belongs to (used for @mentions).
+        login: "<github login of the token owner>"
+        repositories:
+          - "<owner>/<repository>"
+        # Optional switches for events that do not mention the agent.
+        # observeComments: true  # recommended: follow-ups on your PR/Issue threads
+        # observeCi: true        # recommended: CI results reach active tickets
+        # observeIssues: false
+        # observePulls: false
+    policy:
+      # off: only explicit requests. observe: record what would be accepted,
+      # send nothing (default, recommended for the first run). auto: also
+      # accept inferred candidates that match a rule below.
+      mode: observe
+      # Optional proactive rules; only used in `auto` mode. Each accept records
+      # the id of the rule that matched.
+      # rules:
+      #   - id: review
+      #     name: Review pull requests
+      #     enabled: true
+      #     instructions: Review new pull requests and report findings, do not push.
+    executor:
+      # Parallel Executor Sessions. Start with 1 on a laptop.
+      maxWorkers: 2
+      # Optional model override for Worker Sessions; omit to use the profile's
+      # default model.
+      # model: <provider>/<model>
+      # Optional shell command run in the new Ticket directory before the
+      # Worker starts. Receives DSH_SUPERAGENT_TICKET and DSH_SUPERAGENT_DIR.
+      # prepare: git worktree add "$DSH_SUPERAGENT_DIR" "agent/$DSH_SUPERAGENT_TICKET"
+    quiet:
+      # Upper bound of an attention message; longer text is truncated. Default 100.
+      # maxChars: 100
