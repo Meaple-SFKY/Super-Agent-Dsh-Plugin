@@ -116,6 +116,10 @@ export const Config: unknown = Schema.object({
         en: 'Optional extra logins treated as allowed askers.',
         zh: '可选：额外允许发起工作的 GitHub login。',
       }),
+      allowSelf: Schema.boolean().default(false).i18n({
+        en: 'Allow events from the token owner account itself. Enable when the agent runs as your own GitHub account; its own output is still filtered by the agent marker.',
+        zh: '允许 token 所属账号自己的事件触发。使用与 agent 相同的 GitHub 账号时开启；agent 自身输出仍按 marker 过滤。',
+      }),
       observeIssues: Schema.boolean().default(false).i18n({
         en: 'Treat new issues as candidates even without a mention.',
         zh: '即使没有 @ 也把新 Issue 视为候选。',

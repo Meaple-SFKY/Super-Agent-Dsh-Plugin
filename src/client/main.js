@@ -138,7 +138,7 @@ function build(require) {
     'setup.step.behavior': '行为',
     'setup.step.finish': '完成',
     'setup.reconfigure': '重新配置',
-    'setup.configuredNotice': '当前来源已配置。重新走一遍向导会覆盖 token 与仓库选择。',
+    'setup.configuredNotice': '当前来源已配置。重新走一遍向导会覆盖 token、仓库选择与 allowSelf 选项。',
     'setup.restartNote': '保存后插件会自动重启；向导会轮询直到重新就绪。',
     'telegram.title': '连接 Telegram',
     'telegram.desc': 'Telegram 是它的主界面：私聊下指令、接收需要你决策或验收的消息。',
@@ -179,6 +179,8 @@ function build(require) {
     'github.selectAll': '全选',
     'github.selectNone': '全不选',
     'github.selected': '已选 {count} 个',
+    'github.allowSelf': '我使用自己的 GitHub 账号（允许我自己的事件触发）',
+    'github.allowSelfHint': '默认关闭，避免 agent 自己的评论/PR 事件反过来触发新工作。大多数人用自己的账号当 agent 时需要打开；有专用机器账号时保持关闭（只处理别人的事件）。',
     'github.private': '私有',
     'github.pushed': '最近推送',
     'github.emptyRepos': '这个 token 看不到任何仓库；确认授权范围。',
@@ -329,7 +331,7 @@ function build(require) {
     'setup.step.behavior': 'Behavior',
     'setup.step.finish': 'Finish',
     'setup.reconfigure': 'Reconfigure',
-    'setup.configuredNotice': 'Sources are already configured. Re-running the wizard overwrites tokens and repository choices.',
+    'setup.configuredNotice': 'Sources are already configured. Re-running the wizard overwrites tokens, repository choices and the allowSelf option.',
     'setup.restartNote': 'Saving restarts the plugin; the wizard polls until it is ready again.',
     'telegram.title': 'Connect Telegram',
     'telegram.desc': 'Telegram is its main surface: send instructions in direct messages and receive anything that needs your decision or review.',
@@ -370,6 +372,8 @@ function build(require) {
     'github.selectAll': 'Select all',
     'github.selectNone': 'Select none',
     'github.selected': '{count} selected',
+    'github.allowSelf': 'I use my own GitHub account (let my own events trigger work)',
+    'github.allowSelfHint': 'Off by default so the agent’s own comments and pull requests cannot trigger more work. Most people running the agent as themselves should turn it on; keep it off with a dedicated machine account that should only react to other people.',
     'github.private': 'Private',
     'github.pushed': 'Last push',
     'github.emptyRepos': 'This token cannot see any repository; check its access scope.',
@@ -549,7 +553,7 @@ function build(require) {
       open: false,
       step: 0,
       telegram: { status: 'idle', token: '', botUsername: '', tokenFile: '', error: '', skipped: false },
-      github: { status: 'idle', token: '', login: '', tokenFile: '', repositories: [], selected: [], error: '', skipped: false },
+      github: { status: 'idle', token: '', login: '', tokenFile: '', repositories: [], selected: [], allowSelf: false, error: '', skipped: false },
       behavior: { allowedUserIds: '', mode: 'observe', maxWorkers: 2 },
       finish: { status: 'idle', error: '', elapsed: 0 },
     }
@@ -573,6 +577,7 @@ function build(require) {
         login: typeof github.login === 'string' ? github.login : '',
         repositories,
         selected: [...existing],
+        allowSelf: github.allowSelf === true,
       },
       behavior: {
         ...base.behavior,
@@ -640,6 +645,7 @@ function build(require) {
     const github = { enabled: githubEnabled }
     if (githubEnabled) {
       github.repositories = listOf(wizard.github.selected)
+      github.allowSelf = wizard.github.allowSelf === true
       if (wizard.github.login) github.login = wizard.github.login
       if (wizard.github.tokenFile) github.tokenFile = wizard.github.tokenFile
     }
@@ -2040,7 +2046,8 @@ function build(require) {
                   h('div', { className: 'sa-inline' },
                     h(Icon, { name: 'github', size: 14 }),
                     h('span', { className: 'sa-mono' }, github.login || t('github.fineGrained')),
-                    h(Pill, { tone: 'plain' }, t('github.selected', { count: selected.length }))),
+                    h(Pill, { tone: 'plain' }, t('github.selected', { count: selected.length })),
+                    github.allowSelf === true ? h(Pill, { tone: 'ok' }, 'allowSelf') : null),
                 ),
                 repositories.length === 0
                   ? h('div', { className: 'sa-note', style: { marginTop: 8 } }, t('github.emptyRepos'))
@@ -2090,6 +2097,22 @@ function build(require) {
                         ? h('div', { className: 'sa-hint', style: { marginTop: 6, color: 'var(--dsw-alias-state-warn-label)' } }, t('github.selectAtLeastOne'))
                         : null,
                     ),
+                h('div', { className: 'sa-divider' }),
+                h(
+                  'label',
+                  { className: 'sa-checkrow', style: { alignItems: 'flex-start', padding: '9px 8px' } },
+                  h('input', {
+                    type: 'checkbox',
+                    checked: github.allowSelf === true,
+                    onChange: event => patchGithub({ allowSelf: event.target.checked }),
+                  }),
+                  h(
+                    'span',
+                    { style: { minWidth: 0 } },
+                    h('span', { className: 'sa-checkrow-name', style: { whiteSpace: 'normal', lineHeight: 1.4 } }, t('github.allowSelf')),
+                    h('span', { className: 'sa-hint', style: { display: 'block', marginTop: 2 } }, t('github.allowSelfHint')),
+                  ),
+                ),
               )
             : h(
                 'div',
@@ -2225,7 +2248,8 @@ function build(require) {
         h(SummaryRow, { label: t('finish.github') },
           github.status === 'validated'
             ? h('span', { className: 'sa-inline' }, h(Icon, { name: 'github', size: 13 }), github.login || t('github.fineGrained'),
-                h(Pill, { tone: 'plain' }, t('github.selected', { count: listOf(github.selected).length })))
+                h(Pill, { tone: 'plain' }, t('github.selected', { count: listOf(github.selected).length })),
+                github.allowSelf === true ? h(Pill, { tone: 'ok' }, 'allowSelf') : null)
             : t('finish.noGithub')),
         h(SummaryRow, { label: t('finish.mode') }, behavior.mode),
         h(SummaryRow, { label: t('finish.workers') }, String(asNumber(behavior.maxWorkers, 2))),

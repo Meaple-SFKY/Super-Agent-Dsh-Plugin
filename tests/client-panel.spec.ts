@@ -42,6 +42,7 @@ interface Wizard {
     tokenFile: string
     repositories: Array<{ fullName: string; private?: boolean; pushedAt?: string }>
     selected: string[]
+    allowSelf: boolean
     error: string
     skipped: boolean
   }
@@ -67,7 +68,7 @@ interface Internals {
   buildConfig: (wizard: Wizard) => {
     sources: {
       telegram: { enabled: boolean; tokenFile?: string; allowedUserIds?: string[] }
-      github: { enabled: boolean; tokenFile?: string; repositories?: string[] }
+      github: { enabled: boolean; tokenFile?: string; repositories?: string[]; allowSelf?: boolean }
     }
     policy: { mode: string }
     executor: { maxWorkers: number }
@@ -354,7 +355,7 @@ describe('setup wizard state machine', () => {
       setupState({
         accounts: {
           telegram: { configured: true, enabled: true, botUsername: 'demo_bot' },
-          github: { configured: true, enabled: true, login: 'agent', repositories: ['acme/widgets'], count: 1 },
+          github: { configured: true, enabled: true, login: 'agent', repositories: ['acme/widgets'], count: 1, allowSelf: true },
         },
       }),
     )
@@ -362,6 +363,7 @@ describe('setup wizard state machine', () => {
     expect(configured.telegram.botUsername).toBe('demo_bot')
     expect(configured.github.status).toBe('validated')
     expect(configured.github.selected).toEqual(['acme/widgets'])
+    expect(configured.github.allowSelf).toBe(true)
     expect(internals.isSetupConfigured(setupState({ accounts: { telegram: { configured: true }, github: {} } }))).toBe(true)
     expect(internals.isSetupConfigured(setupState())).toBe(false)
   })
@@ -407,11 +409,23 @@ describe('setup wizard state machine', () => {
     expect(config.sources.github).toEqual({
       enabled: true,
       repositories: ['acme/widgets', 'acme/docs'],
+      allowSelf: false,
       login: 'agent-account',
       tokenFile: '/tmp/superagent/secrets/github-token',
     })
     expect(config.policy).toEqual({ mode: 'auto' })
     expect(config.executor).toEqual({ maxWorkers: 3 })
+  })
+
+  it('writes sources.github.allowSelf when the single-account option is on', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    const wizard = validatedWizard(module)
+    wizard.github = { ...wizard.github, allowSelf: true }
+    const config = internals.buildConfig(wizard)
+    expect(config.sources.github.allowSelf).toBe(true)
+    // A not-yet-validated source is sent as disabled and carries no options.
+    expect(internals.buildConfig(baseWizard(module)).sources.github).toEqual({ enabled: false })
   })
 
   it('disables skipped sources instead of sending half a configuration', async () => {

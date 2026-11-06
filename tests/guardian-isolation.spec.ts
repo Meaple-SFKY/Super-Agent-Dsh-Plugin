@@ -216,10 +216,12 @@ describe('guardian Config schema', () => {
     expect(resolved.sources.telegram.allowedUserIds).toEqual(['1'])
     expect(resolved.sources.github.enabled).toBe(false)
     expect(resolved.sources.github.repositories).toEqual([])
+    expect(resolved.sources.github.allowSelf).toBe(false)
     expect(resolved.policy.rules).toEqual([])
     expect(resolved.executor.maxWorkers).toBe(3)
     expect(resolved.quiet.minChars).toBe(100)
 
+    expect(Config({ sources: { github: { allowSelf: true } } }).sources.github.allowSelf).toBe(true)
     expect(() => Config({ policy: { mode: 'bogus' } })).toThrow()
 
     // Cordis validates through the Standard Schema entry point, not by calling

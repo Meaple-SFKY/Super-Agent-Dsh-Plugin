@@ -55,6 +55,10 @@ chmod 600 ~/.config/superagent/github-token
 ```
 
 5. 记下 token 属于哪个 GitHub 账号（`login`），填进配置的 `login`。不要用主账号的经典 token；专用账号或最小 scope 的 fine-grained PAT 更安全。
+6. **单账号 vs 专用账号**（决定 `sources.github.allowSelf`）：
+   - **专用 agent 账号**（推荐长期使用）：agent 用自己的机器账号评论/开 PR。`allowSelf` 保持 `false`，避免它自己的事件反过来触发新工作；它只响应别人的 @ 和事件。
+   - **单账号自用**（你就是 agent）：token 属于你日常使用的 GitHub 账号。多数个人用户需要打开 `allowSelf: true`，这样你自己发的 Issue/评论/PR 也能成为候选。agent 自己的输出仍会被写入的 marker 过滤，防止自激循环。
+   - 面板向导的 GitHub 步骤有一个「我使用自己的 GitHub 账号（允许我自己的事件触发）」复选框，勾选即写入 `sources.github.allowSelf: true`；默认不勾（安全）。
 
 > 环境变量方式（`SUPERAGENT_TELEGRAM_TOKEN` / `SUPERAGENT_GITHUB_TOKEN`）也可用，但 macOS 桌面版从 Dock/Spotlight 启动时通常**不继承** shell 环境变量。长期运行优先用 `tokenFile`，或把变量写进启动 DSH 的 LaunchAgent。`scripts/setup.mjs` 只检查“有没有”，从不打印值。
 
@@ -103,7 +107,7 @@ dsh plugin --profile "$PROFILE" add "link:$PWD"
 装好 bundle 并重启 DSH 后，打开左侧栏 **Superagent → 设置**，按向导三步完成，**不需要手改 YAML**：
 
 1. **Telegram**：粘贴 @BotFather 的 token → 校验 → 显示 bot 用户名和 Start 链接（bot 不能主动发起会话，需你先点 Start）。
-2. **GitHub**：粘贴 fine-grained PAT → 校验 → 勾选要监听的仓库。
+2. **GitHub**：粘贴 fine-grained PAT → 校验 → 勾选要监听的仓库；如果你就是 agent 账号，勾选「我使用自己的 GitHub 账号（允许我自己的事件触发）」（写入 `allowSelf`）。
 3. **行为**：填允许的 Telegram user id、选择 `observe`（先观察，推荐）或 `auto`、设置并行 Worker 数。
 4. **完成**：保存后插件自动重启；向导轮询到 `plugin.status=ready` 即完成。
 
@@ -205,6 +209,7 @@ node scripts/watchdog.mjs --state-dir "$HOME/.dsh/state/superagent" --dry-run
 | `sources.github.tokenEnv` / `tokenFile` | — | 二选一 |
 | `sources.github.repositories` | `[]` | `owner/name` 列表 |
 | `sources.github.login` | — | token 所属账号，用于识别 @ |
+| `sources.github.allowSelf` | `false` | 允许 token 所属账号自己的 Issue/PR/评论触发工作。用自己账号当 agent 时打开；专用机器账号保持关闭（agent 自身输出仍按 marker 过滤） |
 | `sources.github.observe*` | `false` | 是否也收未 @ 的 Issue/PR/评论/CI；建议 `observeComments`、`observeCi` 设为 `true`，否则已订阅线程的后续讨论/CI 结果收不到 |
 | `policy.mode` | `observe` | `off` 只接明确请求；`observe` 只记录；`auto` 接推断候选 |
 | `policy.rules` | `[]` | `auto` 下的主动规则（id/name/enabled/instructions） |
@@ -257,6 +262,9 @@ node scripts/watchdog.mjs --state-dir "$HOME/.dsh/state/superagent" --dry-run
 | 向导里 GitHub 校验失败但 token 正确 | fine-grained PAT 未勾选 Contents/Issues/PRs 权限，或未授权目标仓库；改权限后生成新 token 再试 |
 | 向导保存后一直“插件重启中” | 60 秒内未回到 ready：看 DSH 日志与 `<stateDir>/superagent-degraded.json` 的 detail；配置已保存，修好后重新保存或重启 DSH |
 | 设置页显示“设置接口暂时不可用” | 插件正在重启/降级，或 runtime 的 setup API 未就绪；等插件 ready 后刷新 |
+
+| 自己发的 Issue/评论不触发工作 | 单账号自用时 `sources.github.allowSelf` 仍是 `false`；在向导 GitHub 步骤勾选「我使用自己的 GitHub 账号」，或手动设 `allowSelf: true`。若只有 bot 的事件没反应，检查 `observe*` 开关与 `login` |
+| agent 被自己的评论反复触发 | 专用账号场景误开了 `allowSelf`；关掉它，并确认事件来自 agent marker 的输出会被过滤 |
 
 ## 8. 卸载
 
