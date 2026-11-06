@@ -487,6 +487,10 @@ export class GithubSource implements Source {
   private autoRepositoryLastError: string | undefined
   /** Explicit-list repositories already warned about a 404, so we warn once. */
   private readonly warnedGoneRepositories = new Set<string>()
+  /** Invitations already accepted (or tolerated as gone), to avoid re-PATCHing. */
+  private readonly acceptedInvitations = new Set<number>()
+  /** Whether the start-up scan of pending invitations has run. */
+  private invitationsChecked = false
 
   constructor(config: GithubConfig, ctx: SourceContext) {
     this.ctx = ctx
@@ -591,6 +595,10 @@ export class GithubSource implements Source {
       this.login = user.login
     }
     const errors: string[] = []
+    // Start-up scan: accept pending invitations addressed to the bot account so
+    // an operator-invited repository can be discovered in the same round.
+    const accepted = await this.acceptPendingInvitations(api, signal)
+    if (accepted > 0) this.requestDiscoveryRefresh()
     // Resolve `repositories: ['*']` before the round; a failure with no cached
     // list is reported as a read error and retried on the next poll.
     try {
@@ -739,6 +747,13 @@ export class GithubSource implements Source {
         repositories: repositories.length,
         truncated: page.truncated,
       })
+      // After every discovery refresh, drain invitations and refresh once more
+      // so a repository the bot was just invited into enters the poll set now.
+      const accepted = await this.acceptPendingInvitations(api, signal, { force: true })
+      if (accepted > 0 && this.autoRepositories) {
+        this.requestDiscoveryRefresh()
+        await this.refreshAutoRepositories(api, signal)
+      }
     } catch (error) {
       if (signal.aborted || isAbortError(error)) throw error
       this.autoRepositoryFailures += 1
@@ -752,6 +767,84 @@ export class GithubSource implements Source {
       }
       throw error
     }
+  }
+
+  /** Make the next discovery pass run immediately (e.g. after joining a repo). */
+  private requestDiscoveryRefresh(): void {
+    if (this.autoRepositories) {
+      this.autoRepositories = { repositories: this.autoRepositories.repositories, resolvedAt: 0 }
+    }
+  }
+
+  /**
+   * Accept the pending repository invitations of the bot account. Stateless
+   * per call; failures are logged (warn) and never block polling. Returns the
+   * number of invitations this call moved to the accepted state.
+   *
+   * Runs once at start-up and after every successful discovery refresh (these
+   * are the moments an operator's invite should become a watched repository).
+   */
+  private async acceptPendingInvitations(
+    api: GithubApi,
+    signal: AbortSignal,
+    options: { force?: boolean } = {},
+  ): Promise<number> {
+    if (this.invitationsChecked && !options.force) return 0
+    this.invitationsChecked = true
+    let accepted = 0
+    let page: GithubPage<{ id: number; repository?: { full_name?: string } }>
+    try {
+      page = await api.listRepositoryInvitations({ signal, maxPages: 2, perPage: 100 })
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) throw error
+      // 404 = this token/API does not expose invitations; not worth a warning
+      // on every poll.
+      if (error instanceof GithubApiError && error.status === 404) {
+        this.ctx.logger.debug('github: repository invitations are not available for this token')
+        return 0
+      }
+      this.ctx.logger.warn('github: could not list repository invitations', { error: describeError(error) })
+      return 0
+    }
+    for (const invitation of page.items) {
+      if (signal.aborted) throw abortError()
+      if (!invitation || typeof invitation.id !== 'number' || this.acceptedInvitations.has(invitation.id)) continue
+      const repository = invitation.repository?.full_name
+      try {
+        const result = await api.acceptRepositoryInvitation(invitation.id, { signal })
+        this.acceptedInvitations.add(invitation.id)
+        accepted += 1
+        if (result.status === 204) {
+          this.ctx.logger.info('github: accepted repository invitation', {
+            invitationId: invitation.id,
+            ...(repository ? { repo: repository } : {}),
+          })
+        } else {
+          this.ctx.logger.debug('github: repository invitation already accepted or gone', {
+            invitationId: invitation.id,
+            ...(repository ? { repo: repository } : {}),
+          })
+        }
+      } catch (error) {
+        if (signal.aborted || isAbortError(error)) throw error
+        // 422 = already a collaborator / invitation consumed; same end state.
+        if (error instanceof GithubApiError && error.status === 422) {
+          this.acceptedInvitations.add(invitation.id)
+          accepted += 1
+          this.ctx.logger.debug('github: repository invitation already accepted or gone', {
+            invitationId: invitation.id,
+            ...(repository ? { repo: repository } : {}),
+          })
+          continue
+        }
+        this.ctx.logger.warn('github: could not accept repository invitation', {
+          invitationId: invitation.id,
+          ...(repository ? { repo: repository } : {}),
+          error: describeError(error),
+        })
+      }
+    }
+    return accepted
   }
 
   /**

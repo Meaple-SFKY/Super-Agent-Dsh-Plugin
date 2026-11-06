@@ -66,6 +66,7 @@ interface FakeGithubBehaviour {
   /** Login returned by GET /user (default octocat). */
   userLogin?: string
   createRepositoryResponse?: (body: Record<string, unknown>) => { status: number; body: unknown }
+  inviteResponse?: (username: string, body: Record<string, unknown>) => { status: number; body?: unknown }
   checkRuns?: { status: number; body: unknown }
   workflowRuns?: { status: number; body: unknown }
 }
@@ -158,6 +159,23 @@ async function startFakeGithub(behaviour: FakeGithubBehaviour): Promise<FakeGith
       }
       const repo = `${repoMatch[1]}/${repoMatch[2]}`
       const rest = repoMatch[3] ?? ''
+      const collaboratorMatch = /^\/collaborators\/([^/]+)$/.exec(rest)
+      if (request.method === 'PUT' && collaboratorMatch) {
+        const username = collaboratorMatch[1]!
+        const parsed = JSON.parse(body || '{}') as Record<string, unknown>
+        if (behaviour.inviteResponse) {
+          const answer = behaviour.inviteResponse(username, parsed)
+          if (answer.body === undefined) {
+            response.writeHead(answer.status)
+            response.end()
+            return
+          }
+          json(answer.status, answer.body)
+          return
+        }
+        json(201, { id: 1, permission: parsed.permission ?? 'admin', invitee: { login: username } })
+        return
+      }
       if (request.method === 'GET' && rest === '') {
         json(200, {
           full_name: repo,
@@ -632,6 +650,96 @@ describe('superagent_github create_repository', () => {
     expect(result.ok).toBe(false)
     expect(result.error).toBe('github_forbidden_or_missing')
     expect(JSON.stringify(result)).not.toContain('ghp_repofail')
+  })
+
+  it('invites requested collaborators as admin after creating the repository', async () => {
+    const github = await startFakeGithub({ pulls: [], defaultBranch: 'main', userLogin: 'octocat' })
+    const harness = await makeWorker({})
+    const token = 'ghp_invite000000000000000000000000'
+    setGithub(harness, { token, apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
+
+    const result = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'create_repository',
+      name: 'team-project',
+      collaborators: ['alice', '@bob', 'alice'],
+    })).value as Record<string, unknown>
+
+    expect(result).toMatchObject({
+      ok: true,
+      created: true,
+      repo: 'octocat/team-project',
+      collaborators: [
+        { login: 'alice', status: 'invited' },
+        { login: 'bob', status: 'invited' },
+      ],
+    })
+    expect(result.warnings).toBeUndefined()
+    const puts = github.requests.filter(entry => entry.method === 'PUT' && entry.path.includes('/collaborators/'))
+    expect(puts.map(entry => entry.path.split('/collaborators/')[1])).toEqual(['alice', 'bob'])
+    for (const put of puts) {
+      const body = JSON.parse(put.body ?? '{}') as { permission?: string }
+      expect(body.permission).toBe('admin')
+      expect(put.authorization).toBe(`Bearer ${token}`)
+    }
+    expect(JSON.stringify(result)).not.toContain(token)
+  })
+
+  it('uses the configured collaborators by default and sends no invitation when none are configured', async () => {
+    const github = await startFakeGithub({ pulls: [], userLogin: 'octocat' })
+    const harness = await makeWorker({})
+    const token = 'ghp_default00000000000000000000000'
+    setGithub(harness, {
+      token,
+      apiBaseUrl: github.baseUrl,
+      timeoutMs: 2_000,
+      collaborators: ['dana'],
+    })
+
+    const withDefault = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'create_repository',
+      name: 'configured-project',
+    })).value as Record<string, unknown>
+    expect(withDefault.collaborators).toEqual([{ login: 'dana', status: 'invited' }])
+
+    setGithub(harness, { token, apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
+    const before = github.requests.filter(entry => entry.method === 'PUT').length
+    const withoutAny = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'create_repository',
+      name: 'solo-project',
+    })).value as Record<string, unknown>
+    expect(withoutAny.ok).toBe(true)
+    expect(withoutAny.collaborators).toBeUndefined()
+    expect(github.requests.filter(entry => entry.method === 'PUT')).toHaveLength(before)
+  })
+
+  it('keeps the repository when an invitation fails and reports a warning', async () => {
+    const github = await startFakeGithub({
+      pulls: [],
+      userLogin: 'octocat',
+      inviteResponse: username =>
+        username === 'blocked'
+          ? { status: 403, body: { message: 'Resource not accessible by integration' } }
+          : { status: 201, body: { id: 1, invitee: { login: username } } },
+    })
+    const harness = await makeWorker({})
+    const token = 'ghp_invitefail00000000000000000000'
+    setGithub(harness, { token, apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
+
+    const result = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'create_repository',
+      name: 'half-invited',
+      collaborators: ['good', 'blocked'],
+    })).value as Record<string, unknown>
+
+    expect(result.ok).toBe(true)
+    expect(result.created).toBe(true)
+    expect(result.collaborators).toEqual([
+      { login: 'good', status: 'invited' },
+      { login: 'blocked', status: 'failed' },
+    ])
+    expect(result.warnings).toHaveLength(1)
+    expect(String((result.warnings as string[])[0])).toContain('could not invite blocked')
+    expect(JSON.stringify(result)).not.toContain(token)
   })
 
   it('validates the repository name', async () => {

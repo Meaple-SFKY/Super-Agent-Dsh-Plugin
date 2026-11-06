@@ -216,6 +216,17 @@ export interface GithubRepo {
   clone_url?: string
 }
 
+/** A repository invitation as the REST API returns it (pending only). */
+export interface GithubInvitation {
+  id: number
+  repository?: { full_name?: string; private?: boolean; html_url?: string }
+  invitee?: { login?: string }
+  inviter?: { login?: string }
+  permissions?: string
+  created_at?: string
+  expired?: boolean
+}
+
 export interface GithubIssue {
   number: number
   title: string
@@ -326,6 +337,9 @@ export interface GithubResult<T> {
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
+
+/** Permissions the repository collaborator API accepts. */
+export type GithubCollaboratorPermission = 'pull' | 'triage' | 'push' | 'maintain' | 'admin'
 
 export interface GithubApiOptions {
   /** Literal token or an async provider such as {@link createGithubTokenProvider}. */
@@ -702,6 +716,46 @@ export class GithubApi {
       '/user/repos?sort=pushed&direction=desc&affiliation=owner,collaborator,organization_member',
       { ...options, maxPages: options.maxPages ?? 2 },
     )
+  }
+
+  /** Invite a user as a repository collaborator (PUT; 204 = already collaborator). */
+  async addCollaborator(
+    repo: string,
+    username: string,
+    permission: GithubCollaboratorPermission = 'admin',
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{ status: number; alreadyCollaborator: boolean }> {
+    const result = await this.json<unknown>(
+      `/repos/${repoPath(repo)}/collaborators/${encodeURIComponent(username)}`,
+      {
+        method: 'PUT',
+        body: { permission },
+        ...(options.signal ? { signal: options.signal } : {}),
+      },
+    )
+    return { status: result.status, alreadyCollaborator: result.status === 204 }
+  }
+
+  /** Pending repository invitations for the authenticated user. */
+  async listRepositoryInvitations(
+    options: { signal?: AbortSignal; maxPages?: number; perPage?: number } = {},
+  ): Promise<GithubPage<GithubInvitation>> {
+    return this.paginate<GithubInvitation>('/user/repository_invitations', {
+      ...options,
+      maxPages: options.maxPages ?? 2,
+    })
+  }
+
+  /** Accept one repository invitation (PATCH; 204 on success). */
+  async acceptRepositoryInvitation(
+    invitationId: number,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{ status: number }> {
+    const result = await this.json<unknown>(`/user/repository_invitations/${invitationId}`, {
+      method: 'PATCH',
+      ...(options.signal ? { signal: options.signal } : {}),
+    })
+    return { status: result.status }
   }
 
   /** Create a repository under the authenticated user's account. */
@@ -1117,5 +1171,144 @@ export async function createGithubRepository(
     const existing = await api.getRepo(`${user.login}/${name}`)
     if (!existing) throw error
     return mapCreatedRepository(existing, false)
+  }
+}
+
+/** Result of {@link addGithubCollaborator}. */
+export interface AddGithubCollaboratorResult {
+  ok: true
+  repo: string
+  login: string
+  permission: GithubCollaboratorPermission
+  /** True when the user already had access (HTTP 204 or 422). */
+  alreadyCollaborator: boolean
+}
+
+const COLLABORATOR_PERMISSIONS: readonly GithubCollaboratorPermission[] = [
+  'pull',
+  'triage',
+  'push',
+  'maintain',
+  'admin',
+]
+
+/**
+ * Invite a GitHub user as a collaborator of `owner/repo`, statelessly.
+ *
+ * Idempotent: a 204 answer (already a collaborator) and GitHub's 422
+ * "already a collaborator / invitation pending" both return success with
+ * `alreadyCollaborator: true`. Every other failure is a readable, token-free
+ * {@link GithubApiError}.
+ */
+export async function addGithubCollaborator(
+  token: string,
+  repo: string,
+  username: string,
+  permission: GithubCollaboratorPermission = 'admin',
+  options: SetupHelperOptions = {},
+): Promise<AddGithubCollaboratorResult> {
+  const login = username.trim().replace(/^@/, '')
+  if (!login || !/^[A-Za-z0-9-]+$/.test(login)) {
+    throw new GithubApiError({
+      status: 422,
+      method: 'PUT',
+      path: `/repos/${repo}/collaborators`,
+      details: 'invalid GitHub username',
+    })
+  }
+  if (!COLLABORATOR_PERMISSIONS.includes(permission)) {
+    throw new GithubApiError({
+      status: 422,
+      method: 'PUT',
+      path: `/repos/${repo}/collaborators/${login}`,
+      details: `unsupported collaborator permission: ${permission}`,
+    })
+  }
+  const api = setupApi(token, options)
+  try {
+    const result = await api.addCollaborator(repo, login, permission)
+    return { ok: true, repo, login, permission, alreadyCollaborator: result.alreadyCollaborator }
+  } catch (error) {
+    // Already a collaborator or a pending invitation is the desired state.
+    if (error instanceof GithubApiError && error.status === 422) {
+      return { ok: true, repo, login, permission, alreadyCollaborator: true }
+    }
+    throw error
+  }
+}
+
+/** One pending repository invitation, flattened for the runtime/wizard. */
+export interface GithubRepositoryInvitation {
+  id: number
+  /** `owner/name` of the repository the invitation points at. */
+  repository: string
+  private: boolean
+  htmlUrl: string
+  /** GitHub returns `admin`, `write`, `read`, ... */
+  permission: string
+  inviter: string | null
+  createdAt: string | null
+}
+
+/** Result of {@link acceptRepositoryInvitation}; 404/422 are tolerated. */
+export interface GithubAcceptedInvitation {
+  ok: true
+  invitationId: number
+  /** `accepted` on 204; `already-accepted-or-gone` on 404/422. */
+  status: 'accepted' | 'already-accepted-or-gone'
+}
+
+/**
+ * List the pending repository invitations of the authenticated user (the bot
+ * account). Stateless, token-free errors; at most 200 invitations.
+ */
+export async function listRepositoryInvitations(
+  token: string,
+  options: SetupHelperOptions = {},
+): Promise<GithubRepositoryInvitation[]> {
+  const api = setupApi(token, options)
+  const page = await api.listRepositoryInvitations({ maxPages: 2, perPage: 100 })
+  return page.items
+    .map(invitation => ({
+      id: invitation.id,
+      repository: invitation.repository?.full_name ?? '',
+      private: invitation.repository?.private === true,
+      htmlUrl: invitation.repository?.html_url ?? '',
+      permission: invitation.permissions ?? 'read',
+      inviter: invitation.inviter?.login ?? null,
+      createdAt: invitation.created_at ?? null,
+    }))
+    .filter(invitation => invitation.repository.length > 0)
+}
+
+/**
+ * Accept one pending repository invitation (e.g. the operator invited the bot
+ * account into an existing repository). 404 and 422 are tolerated: the
+ * invitation is already accepted, revoked or expired, which is the same
+ * end state for automation.
+ */
+export async function acceptRepositoryInvitation(
+  token: string,
+  invitationId: number,
+  options: SetupHelperOptions = {},
+): Promise<GithubAcceptedInvitation> {
+  const id = Number(invitationId)
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    throw new GithubApiError({
+      status: 422,
+      method: 'PATCH',
+      path: `/user/repository_invitations/${String(invitationId)}`,
+      details: 'invalid invitation id',
+    })
+  }
+  const api = setupApi(token, options)
+  try {
+    const result = await api.acceptRepositoryInvitation(id)
+    return { ok: true, invitationId: id, status: result.status === 204 ? 'accepted' : 'already-accepted-or-gone' }
+  } catch (error) {
+    if (error instanceof GithubApiError && error.status === 422) {
+      return { ok: true, invitationId: id, status: 'already-accepted-or-gone' }
+    }
+    throw error
   }
 }

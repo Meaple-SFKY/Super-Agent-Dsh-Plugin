@@ -25,9 +25,12 @@ import {
   GithubApi,
   GithubApiError,
   GithubTokenValidationError,
+  addGithubCollaborator,
+  acceptRepositoryInvitation,
   createGithubRepository,
   createGithubTokenProvider,
   listGithubRepositories,
+  listRepositoryInvitations,
   validateGithubToken,
   type GithubCheckRun,
   type GithubComment,
@@ -1169,6 +1172,149 @@ describe('github health detail sanitizing', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Repository invitations (bot account auto-accept)
+// ---------------------------------------------------------------------------
+
+describe('github source: repository invitations', () => {
+  it('accepts pending invitations at start and discovers the newly joined repository', async () => {
+    let accepted = false
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repository_invitations') {
+        return {
+          body: accepted
+            ? []
+            : [
+                {
+                  id: 7,
+                  repository: { full_name: 'operator/bot-repo', private: true, html_url: 'https://github.com/operator/bot-repo' },
+                  inviter: { login: 'operator' },
+                  permissions: 'admin',
+                },
+              ],
+        }
+      }
+      if (request.method === 'PATCH' && request.path === '/user/repository_invitations/7') {
+        accepted = true
+        return { status: 204 }
+      }
+      if (request.path === '/user/repos') {
+        return {
+          body: accepted
+            ? [{ id: 1, full_name: 'operator/bot-repo', name: 'bot-repo', owner: { login: 'operator' }, default_branch: 'main' }]
+            : [],
+        }
+      }
+      const match = /^\/repos\/([^/]+\/[^/]+)\//.exec(request.path)
+      if (match && match[1] === 'operator/bot-repo') return emptyStreams(request, 'operator/bot-repo')
+      return undefined
+    })
+    const { ctx, kv, loggerWarnings } = makeContext('github')
+    const source = createSource(baseConfig(fake.url, { repositories: ['*'] }), ctx) as GithubSource
+
+    const first = await source.pollOnce(signal())
+    expect(first.errors).toEqual([])
+    expect(first.repos).toBe(1)
+    expect(kv.get('github:cursors:operator/bot-repo')).toBeDefined()
+    expect(fake.requests.filter(request => request.method === 'PATCH')).toHaveLength(1)
+    expect(loggerWarnings).toEqual([])
+
+    // The accepted invitation is remembered: a second poll does not PATCH it again.
+    const second = await source.pollOnce(signal())
+    expect(second.errors).toEqual([])
+    expect(fake.requests.filter(request => request.method === 'PATCH')).toHaveLength(1)
+  })
+
+  it('treats 404/422 while accepting as already handled and still refreshes discovery', async () => {
+    for (const status of [404, 422]) {
+      let touched = false
+      const fake = await startGithub(request => {
+        if (request.path === '/user/repository_invitations') {
+          return {
+            body: [
+              {
+                id: 8,
+                repository: { full_name: 'operator/joined', private: true, html_url: 'https://github.com/operator/joined' },
+                permissions: 'write',
+              },
+            ],
+          }
+        }
+        if (request.method === 'PATCH' && request.path === '/user/repository_invitations/8') {
+          touched = true
+          return status === 404
+            ? { status: 404, body: { message: 'Not Found' } }
+            : { status: 422, body: { message: 'Validation Failed' } }
+        }
+        if (request.path === '/user/repos') {
+          return {
+            body: touched
+              ? [{ id: 2, full_name: 'operator/joined', name: 'joined', owner: { login: 'operator' }, default_branch: 'main' }]
+              : [],
+          }
+        }
+        const match = /^\/repos\/([^/]+\/[^/]+)\//.exec(request.path)
+        if (match && match[1] === 'operator/joined') return emptyStreams(request, 'operator/joined')
+        return undefined
+      })
+      const { ctx, kv, loggerWarnings } = makeContext('github')
+      const source = createSource(baseConfig(fake.url, { repositories: ['*'] }), ctx) as GithubSource
+
+      const result = await source.pollOnce(signal())
+      expect(result.errors).toEqual([])
+      expect(result.repos).toBe(1)
+      expect(kv.get('github:cursors:operator/joined')).toBeDefined()
+      expect(fake.requests.filter(request => request.method === 'PATCH')).toHaveLength(1)
+      expect(loggerWarnings).toEqual([])
+    }
+  })
+
+  it('logs a failed invitation acceptance as a warning without blocking polling', async () => {
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repository_invitations') {
+        return {
+          body: [
+            {
+              id: 9,
+              repository: { full_name: 'operator/refused', private: true, html_url: 'https://github.com/operator/refused' },
+              permissions: 'admin',
+            },
+          ],
+        }
+      }
+      if (request.method === 'PATCH') {
+        return { status: 403, body: { message: 'Resource not accessible by integration' } }
+      }
+      if (request.path === '/user/repos') return { body: [] }
+      return undefined
+    })
+    const { ctx, loggerWarnings } = makeContext('github')
+    const source = createSource(baseConfig(fake.url, { repositories: ['*'] }), ctx) as GithubSource
+
+    const result = await source.pollOnce(signal())
+    expect(result.errors).toEqual([])
+    expect(result.repos).toBe(0)
+    expect(loggerWarnings.length).toBeGreaterThanOrEqual(1)
+    expect(String((loggerWarnings[0]!.error as string) ?? '')).toMatch(/403|Resource not accessible/)
+    expect(JSON.stringify(loggerWarnings)).not.toContain('test-token-not-a-secret')
+  })
+
+  it('tolerates a missing invitations endpoint (404) without warnings', async () => {
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repository_invitations') return { status: 404, body: { message: 'Not Found' } }
+      return emptyStreams(request)
+    })
+    const { ctx, loggerWarnings } = makeContext('github')
+    const source = createSource(baseConfig(fake.url), ctx) as GithubSource
+
+    const result = await source.pollOnce(signal())
+    expect(result.errors).toEqual([])
+    expect(result.repos).toBe(1)
+    // An endpoint the token cannot use is a debug detail, not a health warning.
+    expect(loggerWarnings).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Sending and allowlists
 // ---------------------------------------------------------------------------
 
@@ -1604,6 +1750,190 @@ describe('github setup helpers (stateless token validation and repository discov
     expect((error as GithubApiError).status).toBe(401)
     expect(String(error)).toContain('Bad credentials')
     expect(String(error)).not.toContain(TOKEN)
+  })
+
+  it('invites a collaborator with the requested permission', async () => {
+    const fake = await startGithub(request => {
+      if (request.method === 'PUT' && request.path === '/repos/agent/demo/collaborators/alice') {
+        return { status: 201, body: { id: 5, invitee: { login: 'alice' }, permission: 'admin' } }
+      }
+      return undefined
+    })
+
+    const result = await addGithubCollaborator(
+      TOKEN,
+      'agent/demo',
+      '@alice',
+      'admin',
+      { apiBaseUrl: fake.url, timeoutMs: 1_000 },
+    )
+
+    expect(result).toEqual({
+      ok: true,
+      repo: 'agent/demo',
+      login: 'alice',
+      permission: 'admin',
+      alreadyCollaborator: false,
+    })
+    const put = fake.requestsTo('/repos/agent/demo/collaborators/alice')[0]!
+    expect(put.method).toBe('PUT')
+    expect(put.body).toEqual({ permission: 'admin' })
+    expect(String(put.headers.authorization)).toContain(TOKEN)
+  })
+
+  it('treats 204 and 422 as an existing collaborator', async () => {
+    for (const status of [204, 422]) {
+      const fake = await startGithub(request => {
+        if (request.method === 'PUT' && request.path === '/repos/agent/demo/collaborators/bob') {
+          return status === 204 ? { status: 204 } : { status: 422, body: { message: 'Validation Failed' } }
+        }
+        return undefined
+      })
+      const result = await addGithubCollaborator(TOKEN, 'agent/demo', 'bob', 'push', {
+        apiBaseUrl: fake.url,
+        timeoutMs: 1_000,
+      })
+      expect(result.alreadyCollaborator).toBe(true)
+      expect(result.permission).toBe('push')
+    }
+  })
+
+  it('reports a forbidden collaborator invite without leaking the token', async () => {
+    const fake = await startGithub(request => {
+      if (request.method === 'PUT' && /\/collaborators\//.test(request.path)) {
+        return { status: 403, body: { message: 'Resource not accessible by integration' } }
+      }
+      return undefined
+    })
+    let error: unknown
+    try {
+      await addGithubCollaborator(TOKEN, 'agent/demo', 'carol', 'admin', { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+      expect.unreachable()
+    } catch (caught) {
+      error = caught
+    }
+    expect(error).toBeInstanceOf(GithubApiError)
+    expect((error as GithubApiError).status).toBe(403)
+    expect(String(error)).not.toContain(TOKEN)
+  })
+
+  it('rejects an invalid collaborator login without calling the API', async () => {
+    const fake = await startGithub(() => undefined)
+    await expect(
+      addGithubCollaborator(TOKEN, 'agent/demo', 'not a login'),
+    ).rejects.toThrow(/invalid GitHub username/)
+    expect(fake.requests).toHaveLength(0)
+  })
+
+  it('lists pending repository invitations with pagination', async () => {
+    const fake = await startGithub(request => {
+      if (request.path !== '/user/repository_invitations') return undefined
+      const page = Number(request.query.get('page') ?? '1')
+      if (page === 1) {
+        return {
+          body: [
+            {
+              id: 11,
+              repository: { full_name: 'operator/bot-invite', private: true, html_url: 'https://github.com/operator/bot-invite' },
+              inviter: { login: 'operator' },
+              permissions: 'admin',
+              created_at: '2026-01-01T00:00:00Z',
+            },
+            {
+              id: 12,
+              repository: { full_name: 'operator/other', private: false, html_url: 'https://github.com/operator/other' },
+              inviter: { login: 'operator' },
+              permissions: 'write',
+              created_at: '2026-01-02T00:00:00Z',
+            },
+          ],
+          headers: { link: `<${fake.url}/user/repository_invitations?per_page=100&page=2>; rel="next"` },
+        }
+      }
+      return {
+        body: [
+          {
+            id: 13,
+            repository: { full_name: 'operator/late', private: true, html_url: 'https://github.com/operator/late' },
+            permissions: 'push',
+            created_at: '2026-01-03T00:00:00Z',
+          },
+        ],
+      }
+    })
+
+    const invitations = await listRepositoryInvitations(TOKEN, { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+
+    expect(invitations).toHaveLength(3)
+    expect(invitations[0]).toEqual({
+      id: 11,
+      repository: 'operator/bot-invite',
+      private: true,
+      htmlUrl: 'https://github.com/operator/bot-invite',
+      permission: 'admin',
+      inviter: 'operator',
+      createdAt: '2026-01-01T00:00:00Z',
+    })
+    expect(invitations[2]).toMatchObject({ id: 13, repository: 'operator/late', inviter: null, permission: 'push' })
+    expect(JSON.stringify(invitations)).not.toContain(TOKEN)
+  })
+
+  it('accepts a repository invitation (204)', async () => {
+    const fake = await startGithub(request => {
+      if (request.method === 'PATCH' && request.path === '/user/repository_invitations/11') {
+        return { status: 204 }
+      }
+      return undefined
+    })
+
+    const result = await acceptRepositoryInvitation(TOKEN, 11, { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+
+    expect(result).toEqual({ ok: true, invitationId: 11, status: 'accepted' })
+    const patch = fake.requestsTo('/user/repository_invitations/11')[0]!
+    expect(patch.method).toBe('PATCH')
+    expect(String(patch.headers.authorization)).toContain(TOKEN)
+  })
+
+  it('tolerates 404 and 422 when accepting an invitation', async () => {
+    for (const status of [404, 422]) {
+      const fake = await startGithub(request => {
+        if (request.method === 'PATCH' && request.path === '/user/repository_invitations/12') {
+          return status === 404
+            ? { status: 404, body: { message: 'Not Found' } }
+            : { status: 422, body: { message: 'Validation Failed' } }
+        }
+        return undefined
+      })
+      const result = await acceptRepositoryInvitation(TOKEN, 12, { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+      expect(result).toEqual({ ok: true, invitationId: 12, status: 'already-accepted-or-gone' })
+    }
+  })
+
+  it('reports invitation failures without leaking the token and validates ids', async () => {
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repository_invitations') {
+        return { status: 401, body: { message: 'Bad credentials' } }
+      }
+      if (request.method === 'PATCH') {
+        return { status: 403, body: { message: 'Resource not accessible by integration' } }
+      }
+      return undefined
+    })
+
+    await expect(listRepositoryInvitations(TOKEN, { apiBaseUrl: fake.url, timeoutMs: 1_000 })).rejects.toThrow(
+      /Bad credentials/,
+    )
+    let error: unknown
+    try {
+      await acceptRepositoryInvitation(TOKEN, 13, { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+      expect.unreachable()
+    } catch (caught) {
+      error = caught
+    }
+    expect(error).toBeInstanceOf(GithubApiError)
+    expect((error as GithubApiError).status).toBe(403)
+    expect(String(error)).not.toContain(TOKEN)
+    await expect(acceptRepositoryInvitation(TOKEN, 0)).rejects.toThrow(/invalid invitation id/)
   })
 
   it('reports a 403 while listing repositories readably without leaking the token', async () => {

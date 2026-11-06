@@ -29,6 +29,12 @@ export interface GithubToolOptions {
   timeoutMs?: number
   /** Injected fetch (tests). */
   fetchImpl?: typeof fetch
+  /**
+   * GitHub logins automatically invited (permission: admin) when
+   * `superagent_github action=create_repository` creates a repository.
+   * Overridable per call with the tool's `collaborators` argument.
+   */
+  collaborators?: string[]
 }
 
 export interface ToolDeps {

@@ -30,6 +30,7 @@ import {
   renderJson,
   resolveRepository,
   workerCallContext,
+  type GithubToolOptions,
   type ToolDeps,
   type WorkerCallContext,
 } from './shared.js'
@@ -115,6 +116,19 @@ interface GithubModule {
     fetchImpl?: typeof fetch
   }) => GithubApi
   createGithubTokenProvider: (options?: { tokenFile?: string; tokenEnv?: string; defaultEnv?: string }) => () => Promise<string>
+  addGithubCollaborator?: (
+    token: string,
+    repo: string,
+    username: string,
+    permission?: 'pull' | 'triage' | 'push' | 'maintain' | 'admin',
+    options?: { apiBaseUrl?: string; timeoutMs?: number },
+  ) => Promise<{
+    ok: true
+    repo: string
+    login: string
+    permission: string
+    alreadyCollaborator: boolean
+  }>
 }
 
 let githubModulePromise: Promise<GithubModule | undefined> | undefined
@@ -151,6 +165,63 @@ function mapGithubError(error: unknown): { ok: false; error: string; detail?: st
   if (status === 403 || status === 404) return failure('github_forbidden_or_missing', message)
   if (status === 422) return failure('github_rejected', message)
   return failure('github_api_error', message)
+}
+
+type CollaboratorStatus = 'invited' | 'already' | 'failed'
+
+interface InvitationOutcome {
+  collaborators: Array<{ login: string; status: CollaboratorStatus }>
+  warnings: string[]
+}
+
+/**
+ * Invite every configured collaborator as admin, one by one. Failures never
+ * fail repository creation: they become warnings on the tool result.
+ */
+async function inviteCollaborators(
+  module: GithubModule,
+  token: string,
+  repo: string,
+  requested: string[],
+  options: GithubToolOptions,
+): Promise<InvitationOutcome> {
+  const seen = new Set<string>()
+  const logins: string[] = []
+  for (const value of requested) {
+    const login = value.trim().replace(/^@/, '')
+    if (!login) continue
+    const key = login.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    logins.push(login)
+  }
+  const outcome: InvitationOutcome = { collaborators: [], warnings: [] }
+  if (logins.length === 0) return outcome
+  if (!module.addGithubCollaborator) {
+    outcome.warnings.push('collaborator invitations are unavailable in this build; update the SuperAgent bundle')
+    for (const login of logins) outcome.collaborators.push({ login, status: 'failed' })
+    return outcome
+  }
+  for (const login of logins) {
+    if (!/^[A-Za-z0-9-]+$/.test(login)) {
+      outcome.collaborators.push({ login, status: 'failed' })
+      outcome.warnings.push(`ignored invalid collaborator login: ${login}`)
+      continue
+    }
+    try {
+      const added = await module.addGithubCollaborator(token, repo, login, 'admin', {
+        ...(options.apiBaseUrl ? { apiBaseUrl: options.apiBaseUrl } : {}),
+        ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
+      })
+      outcome.collaborators.push({ login, status: added.alreadyCollaborator ? 'already' : 'invited' })
+    } catch (error) {
+      const mapped = mapGithubError(error)
+      outcome.collaborators.push({ login, status: 'failed' })
+      const detail = mapped.detail ? ` (${mapped.detail})` : ''
+      outcome.warnings.push(`could not invite ${login}: ${mapped.error}${detail}`)
+    }
+  }
+  return outcome
 }
 
 function secretFileFor(deps: ToolDeps, call: WorkerCallContext, name: string): string | undefined {
@@ -339,6 +410,12 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
         type: 'boolean',
         description: 'create_repository: create with an initial README/default branch (default false; the worker pushes main itself)',
       },
+      collaborators: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'create_repository: GitHub logins to invite as admin collaborators (default: the sources.github.collaborators configuration)',
+      },
       repo: { type: 'string', description: 'owner/name; defaults to the repository inferred from the ticket' },
       head: { type: 'string', description: 'pull_request: source branch (default agent/<ticketId>)' },
       base: { type: 'string', description: 'pull_request: target branch (default: repository default branch)' },
@@ -388,6 +465,12 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
               ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
             },
           )
+          // Invite collaborators after the repository exists. A failed invite
+          // is a warning only: the repository was created and must stay usable.
+          const requested: string[] = Array.isArray(args.collaborators)
+            ? args.collaborators.map((value: unknown) => String(value))
+            : (options.collaborators ?? [])
+          const invitations = await inviteCollaborators(module, tokenResult.token, created.fullName, requested, options)
           return {
             ok: true,
             action: 'create_repository',
@@ -400,6 +483,8 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
             cloneUrl: created.cloneUrl,
             defaultBranch: created.defaultBranch,
             created: created.created,
+            ...(invitations.collaborators.length > 0 ? { collaborators: invitations.collaborators } : {}),
+            ...(invitations.warnings.length > 0 ? { warnings: invitations.warnings } : {}),
           }
         } catch (error) {
           return mapGithubError(error)
