@@ -158,3 +158,23 @@ Tests 19 passed — verify-flow(5) + verify-plugin-boot(5) + verify-packaging(9)
 | 提交与推送 | ✅ `main` 已推送到 `github.com/Meaple-SFKY/Super-Agent-Dsh-Plugin` |
 
 待完成（需要操作者）：写入 Telegram bot token、GitHub PAT（`~/.config/superagent/`，600）、填写 allowedUserIds/repositories/login，启用 sources 并重启插件；之后按 §7 复核 `/status`、真实消息链路与 watchdog 安装。
+
+## 9. 真机验收记录（2026-11-06 19:00–19:20，Lead）
+
+中文语言、新仓库与生命周期修复后的真实环境验收：
+
+| 场景 | 结果 |
+| --- | --- |
+| 安装/重载 | 多次 `plugin_manager set_plugin` 重启插件均恢复 `ready`，sources ready，无 degraded 文件 |
+| 一键设置 API | `POST setup/telegram` / `POST setup/github` 校验并原子写入 `<stateDir>/secrets/*`（0600/0700）；`PUT setup/config` 经 DSH `configEditor` 持久化并在线重启生效（`language: zh`、`repositories: ["*"]`、`allowSelf: true`） |
+| 单账号 GitHub | `allowSelf: true` 下，自己的 issue/comment 能触发；agent 自己的评论/PR 带隐藏 marker，不会自激 |
+| 自动发现仓库 | 新建仓库后 GitHub 来源从 16 → 17 repo(s) (auto)，无需改配置 |
+| Telegram 新建仓库 | 用户在 Telegram 发起「新建私有仓库 superagent-demo-1…」：Router 接单 → Worker 调 `create_repository` → `git init` → SSH push `main` → 中文 result `已完成，请验收：私有仓库已建并推送 main：https://github.com/Meaple-SFKY/superagent-demo-1` |
+| 中文优先 | worker 报告/结果评论为中文；`/status` 命令回复已本地化；可通过设置向导切换到 English |
+| 单条结果、无重复 | 修复后 CineNest #3 仅 1 条中文 result 评论，无 “…” 空消息、无 worker 重复评论 |
+| ready 生命周期 | 真实 ticket ready 后自动 `ended(completed)`，`/superagent/api/state` 的 active/attention 立即清空；同 Thread 后续人消息可按原 Mandate resume（core 测试覆盖） |
+| safe mode 通知 | 连续失败只发一条 ≤140 字中文提示（含 /resume 指引），完整错误链仅留在日志/health/panel.detail |
+| 面板 | 第二轮排版（16px/1.7、28px 卡片 padding、31px 页面标题）已在线；设置向导包含机器人语言、仓库多选、allowSelf、watchdog/权限说明。视觉细节仍需用户主观确认 |
+| 已知限制 | GitHub issue close 不再影响 ended ticket（ready 是终态）；PR merge 后的 outcome backfill 需要后续独立语义；面板 UI 语言跟随 DSH，机器人语言独立 |
+
+完整证据：`git log --oneline`（功能分步提交）、`docs/002-setup-api.md`、`docs/dsh-api-notes.md`，以及 `./scripts/pnpmw check`（25 files / 373 tests）。

@@ -42,7 +42,10 @@ tests/              单元、适配器、集成、恢复测试
 
 已实现并在本机安装（DSH Desktop 0.2.2-rc.1，profile `desktop`）：
 
-- 插件 `dsh-superagent-personal` 已安装并 `ready`，管理 API、面板入口、心跳、看门狗脚本均已验证；
+- 插件 `dsh-superagent-personal` 已安装并 `ready`，管理 API、面板、心跳、看门狗脚本均已验证；
+- 中文优先（设置里可切 English）：Telegram 对话、Worker 报告、结果/决策/失败通知、`/status` 等都是中文；
+- 支持在 Telegram 里让 agent 新建 GitHub 仓库并开发；`repositories: ["*"]` 会自动发现新仓库；
+- 面板内置设置向导（Telegram/GitHub token 校验、仓库多选、语言、allowSelf、权限说明）；
 - Telegram / GitHub 两个来源已实现并通过假服务 E2E，等待操作者提供 bot token 与 fine-grained PAT 后启用；
 - 全量检查：`./scripts/pnpmw check`（22 个测试文件 / 279 个测试 + 构建）；失败隔离、崩溃恢复、安静打扰均有独立 QA 测试覆盖，见 [docs/verification.md](docs/verification.md)；
 - 安装与账号步骤见 [SETUP.md](SETUP.md)，架构见 [docs/000-architecture.md](docs/000-architecture.md)。
