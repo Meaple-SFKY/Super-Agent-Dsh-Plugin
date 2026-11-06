@@ -1,9 +1,10 @@
 /**
- * The real Superagent engine plugin.
+ * The real Superagent engine plugin entry.
  *
- * Loaded dynamically from `index.ts`, so a failure here degrades the plugin
- * instead of breaking the DSH host. `start()` must be safe to call once and
- * return a handle whose `stop()` releases every resource it created.
+ * Loaded dynamically from `index.ts` (the guardian), so a failure here
+ * degrades the plugin instead of breaking the DSH host. `start()` composes the
+ * runtime, waits for it to be *ready or degraded* and returns a handle whose
+ * `stop()` releases every resource it created.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -26,24 +27,47 @@ export interface EngineConfig {
       tokenEnv?: string
       tokenFile?: string
       allowedUserIds?: string[]
+      chats?: string[]
     }
     github?: {
       enabled?: boolean
       tokenEnv?: string
       tokenFile?: string
       repositories?: string[]
+      login?: string
+      allowedLogins?: string[]
     }
   }
+  policy?: { mode?: 'off' | 'observe' | 'auto'; rules?: Array<{ id: string; name: string; enabled?: boolean; instructions: string }> }
+  executor?: { model?: string; maxWorkers?: number; prepare?: string }
+  quiet?: { minChars?: number; quietHours?: { from: string; to: string } }
   [key: string]: unknown
 }
 
-/** Start the application; implementation lands with M1–M3. */
-export async function start(_ctx: Context, _config: unknown): Promise<EngineHandle> {
-  // The runtime is assembled by `src/app/runtime.ts`; this placeholder keeps
-  // the bundle loadable while the engine and sources are built.
+/**
+ * Start the application.
+ *
+ * A runtime that cannot reach `ready` (missing DSH services, invalid state
+ * directory, unreadable store, ...) is stopped and reported as a thrown error,
+ * so the guardian records `degraded` instead of a false `ready`. Component
+ * failures after startup are handled by the runtime itself (health + safe mode)
+ * and never throw out of this function. The error text is redacted and never
+ * contains credentials.
+ */
+export async function start(ctx: Context, config: unknown): Promise<EngineHandle> {
+  const { startRuntime, redactDetail } = await import('./app/runtime.js')
+  const handle = await startRuntime(ctx, config)
+  if (handle.runtime.status !== 'ready') {
+    const status = handle.runtime.status
+    const detail = handle.runtime.detail
+    // Release the store, the state-directory lock, timers and any live agent
+    // before surfacing the failure: the guardian must not leave resources behind.
+    await handle.stop()
+    throw new Error(
+      `SuperAgent runtime did not start (${status})${detail ? `: ${redactDetail(detail)}` : ''}`,
+    )
+  }
   return {
-    async stop(): Promise<void> {
-      // Nothing allocated yet.
-    },
+    stop: () => handle.stop(),
   }
 }
