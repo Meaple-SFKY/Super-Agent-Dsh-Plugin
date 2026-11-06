@@ -303,7 +303,7 @@ function build(require) {
     'permission.githubToken.title': 'GitHub 细粒度 token',
     'permission.githubToken.detail': '需要 Contents、Issues、Pull requests 的读写权限（CI 另需 Checks、Actions 只读）；仓库在向导里勾选。',
     'permission.watchdog.title': '后台看门狗（可选）',
-    'permission.watchdog.detail': '登录项 + LaunchAgent 在 DSH 崩溃后保活；默认关闭，可用 scripts/install-launchd.sh 手动安装。',
+    'permission.watchdog.detail': '登录项 + LaunchAgent 在 DSH 崩溃后保活；默认关闭，可用上方一键开关开启。',
     'permission.restart.title': '配置变更后需要重启插件',
     'permission.restart.detail': '保存配置会重启插件（DSH 配置不是 volatile 的）；向导会轮询 setup/state 直到插件重新就绪。',
     'permissions.title': '权限与安全边界',
@@ -323,7 +323,8 @@ function build(require) {
     'permissions.watchdog': '看门狗（可选）',
     'permissions.watchdogDetail': '登录自启并在 DSH 崩溃后重启它。默认不安装；不装也能用，只是进程退出后不会自动恢复。',
     'permissions.watchdogOff': '默认关闭',
-    'permissions.watchdogCommands': '手动安装与检查',
+    'permissions.watchdogCommands': '手动命令（当前安装）',
+    'permissions.watchdogCommandsUnavailable': '当前安装未包含可执行脚本；请使用上方一键开关，或从安装目录的 scripts/ 手动执行。',
     'watchdog.status.running': '已安装并运行',
     'watchdog.status.installed-idle': '已安装但未运行',
     'watchdog.status.not-installed': '未安装',
@@ -335,7 +336,7 @@ function build(require) {
     'watchdog.enable': '开启看门狗',
     'watchdog.disable': '关闭看门狗',
     'watchdog.working': '处理中…',
-    'watchdog.unavailable': '运行时暂未提供看门狗控制接口；可使用下方手动命令。',
+    'watchdog.unavailable': '运行时暂未提供看门狗控制接口；可使用上方一键开关，或从安装目录的 scripts/ 手动执行。',
     'watchdog.actionDone': '已更新看门狗状态',
     'watchdog.actionFailed': '看门狗操作失败',
     'watchdog.enabledDone': '看门狗已开启',
@@ -591,7 +592,7 @@ function build(require) {
     'permission.githubToken.title': 'GitHub fine-grained token',
     'permission.githubToken.detail': 'Needs Contents, Issues and Pull requests read/write (Checks and Actions read-only for CI). Repositories are selected in the wizard.',
     'permission.watchdog.title': 'Background watchdog (optional)',
-    'permission.watchdog.detail': 'Login item + LaunchAgent keep DSH alive across crashes. Disabled by default; install manually with scripts/install-launchd.sh.',
+    'permission.watchdog.detail': 'Login item + LaunchAgent keep DSH alive across crashes. Disabled by default; enable it with the one-click switch above.',
     'permission.restart.title': 'Restart required after setup changes',
     'permission.restart.detail': 'Saving configuration restarts the plugin (non-volatile DSH config). The wizard polls setup/state until the plugin is ready again.',
     'permissions.title': 'Permissions and boundaries',
@@ -611,7 +612,8 @@ function build(require) {
     'permissions.watchdog': 'Watchdog (optional)',
     'permissions.watchdogDetail': 'Starts at login and restarts DSH after a crash. Off by default; without it the process simply stays down until you reopen it.',
     'permissions.watchdogOff': 'Off by default',
-    'permissions.watchdogCommands': 'Install and check manually',
+    'permissions.watchdogCommands': 'Manual commands (this install)',
+    'permissions.watchdogCommandsUnavailable': 'This install does not ship the scripts; use the one-click switch above, or run them from the scripts/ directory of the install.',
     'watchdog.status.running': 'Installed and running',
     'watchdog.status.installed-idle': 'Installed, not running',
     'watchdog.status.not-installed': 'Not installed',
@@ -623,7 +625,7 @@ function build(require) {
     'watchdog.enable': 'Turn watchdog on',
     'watchdog.disable': 'Turn watchdog off',
     'watchdog.working': 'Working…',
-    'watchdog.unavailable': 'The runtime does not expose watchdog control yet; use the manual commands below.',
+    'watchdog.unavailable': 'The runtime does not expose watchdog control yet; use the one-click switch above, or run the scripts from the install directory.',
     'watchdog.actionDone': 'Watchdog state updated',
     'watchdog.actionFailed': 'Watchdog action failed',
     'watchdog.enabledDone': 'Watchdog turned on',
@@ -790,6 +792,14 @@ function build(require) {
     const running = typeof record.running === 'boolean' ? record.running : undefined
     const hasEnabled = typeof record.enabled === 'boolean'
     const known = hasEnabled || installed !== undefined || running !== undefined
+    const rawCommands = record.manualCommands
+    const manualCommands =
+      rawCommands && typeof rawCommands === 'object' &&
+      typeof rawCommands.dryRun === 'string' &&
+      typeof rawCommands.install === 'string' &&
+      typeof rawCommands.uninstall === 'string'
+        ? { dryRun: rawCommands.dryRun, install: rawCommands.install, uninstall: rawCommands.uninstall }
+        : undefined
     return {
       available: known,
       // setup/state reports installed/running without a separate enabled flag.
@@ -797,6 +807,8 @@ function build(require) {
       installed,
       running,
       detail: asText(record.detail) || asText(record.error),
+      ...(manualCommands === undefined ? {} : { manualCommands }),
+      ...(typeof record.scriptsDir === 'string' && record.scriptsDir.length > 0 ? { scriptsDir: record.scriptsDir } : {}),
     }
   }
 
@@ -3252,19 +3264,23 @@ function build(require) {
             ? h('span', { className: 'sa-hint' }, t('watchdog.unavailable'))
             : null,
         ),
-        h('div', { className: 'sa-section-title', style: { marginTop: 16 } }, t('permissions.watchdogCommands')),
-        h(CodeBlock, {
-          copyText: 'node scripts/watchdog.mjs --state-dir ~/.dsh/state/superagent --dry-run',
-          copyLabel: t('common.copy'),
-        }, 'node scripts/watchdog.mjs --state-dir ~/.dsh/state/superagent --dry-run'),
-        h(CodeBlock, {
-          copyText: './scripts/install-launchd.sh --state-dir ~/.dsh/state/superagent',
-          copyLabel: t('common.copy'),
-        }, './scripts/install-launchd.sh --state-dir ~/.dsh/state/superagent'),
-        h(CodeBlock, {
-          copyText: './scripts/uninstall.sh',
-          copyLabel: t('common.copy'),
-        }, './scripts/uninstall.sh'),
+        watchdog && watchdog.manualCommands
+          ? [
+              h('div', { className: 'sa-section-title', style: { marginTop: 16 } }, t('permissions.watchdogCommands')),
+              h(CodeBlock, {
+                copyText: watchdog.manualCommands.dryRun,
+                copyLabel: t('common.copy'),
+              }, watchdog.manualCommands.dryRun),
+              h(CodeBlock, {
+                copyText: watchdog.manualCommands.install,
+                copyLabel: t('common.copy'),
+              }, watchdog.manualCommands.install),
+              h(CodeBlock, {
+                copyText: watchdog.manualCommands.uninstall,
+                copyLabel: t('common.copy'),
+              }, watchdog.manualCommands.uninstall),
+            ]
+          : h('div', { className: 'sa-note', style: { marginTop: 12 } }, t('permissions.watchdogCommandsUnavailable')),
       ),
       h(
         Card,

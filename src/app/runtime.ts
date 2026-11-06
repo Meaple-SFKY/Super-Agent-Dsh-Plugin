@@ -537,7 +537,7 @@ export interface RuntimeOverrides {
   /** Test seam: bounded child-process runner for the watchdog endpoints. */
   runProcess?: (file: string, args: string[], timeoutMs: number) => Promise<ProcessResult>
   /** Test seam: repo-script resolver for the watchdog endpoints. */
-  scriptPath?: (name: 'install-launchd.sh' | 'uninstall.sh') => string | undefined
+  scriptPath?: (name: 'watchdog.mjs' | 'install-launchd.sh' | 'uninstall.sh') => string | undefined
   /** Test seam: LaunchAgent plist path used for the installed check. */
   watchdogPlistPath?: () => string
 }
@@ -1572,7 +1572,7 @@ export class Runtime {
   }
 
   /** Resolve a repo script from the package root (source `src/app` or bundled `lib`). */
-  private resolveBundleScript(name: 'install-launchd.sh' | 'uninstall.sh'): string | undefined {
+  private resolveBundleScript(name: 'watchdog.mjs' | 'install-launchd.sh' | 'uninstall.sh'): string | undefined {
     const candidates = [
       new URL(`../../scripts/${name}`, import.meta.url),
       new URL(`../scripts/${name}`, import.meta.url),

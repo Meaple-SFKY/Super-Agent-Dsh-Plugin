@@ -1016,8 +1016,10 @@ describe('setup watchdog toggle (task-36)', () => {
     const plistPath = join(stateDir, 'watchdog.plist')
     const scriptPath = join(stateDir, 'install-launchd.sh')
     const uninstallPath = join(stateDir, 'uninstall.sh')
+    const watchdogPath = join(stateDir, 'watchdog.mjs')
     writeFileSync(scriptPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
     writeFileSync(uninstallPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    writeFileSync(watchdogPath, '// watchdog\n', { mode: 0o644 })
     const calls: string[][] = []
     const host = createFakeHost()
     const runtime = new Runtime(
@@ -1034,7 +1036,8 @@ describe('setup watchdog toggle (task-36)', () => {
         store: createMemoryStore(),
         sources: [],
         skipLock: true,
-        scriptPath: name => (name === 'install-launchd.sh' ? scriptPath : uninstallPath),
+        scriptPath: name =>
+          name === 'install-launchd.sh' ? scriptPath : name === 'watchdog.mjs' ? watchdogPath : uninstallPath,
         watchdogPlistPath: () => plistPath,
         runProcess: async (file, args) => {
           calls.push([file, ...args])
@@ -1056,7 +1059,15 @@ describe('setup watchdog toggle (task-36)', () => {
       const idle = new FakeResponse()
       await route!.handler(new FakeRequest({ method: 'GET', headers: { [API_HEADER]: '1' } }), idle)
       expect(idle.statusCode).toBe(200)
-      expect(idle.json<{ installed: boolean; running: boolean }>()).toMatchObject({ installed: false, running: false })
+      expect(idle.json<{ installed: boolean; running: boolean; manualCommands: unknown }>()).toMatchObject({
+        installed: false,
+        running: false,
+        manualCommands: {
+          dryRun: `node '${watchdogPath}' --state-dir '${stateDir}' --dry-run`,
+          install: `sh '${scriptPath}' --state-dir '${stateDir}'`,
+          uninstall: `sh '${uninstallPath}' --state-dir '${stateDir}'`,
+        },
+      })
 
       const invalid = new FakeResponse()
       const invalidReq = new FakeRequest({ method: 'POST', headers: { [API_HEADER]: '1' } })

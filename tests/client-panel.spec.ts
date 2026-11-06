@@ -96,6 +96,8 @@ interface Internals {
     installed?: boolean
     running?: boolean
     detail: string
+    scriptsDir?: string
+    manualCommands?: { dryRun: string; install: string; uninstall: string }
   }
   watchdogStatus: (view: unknown) => string
   buildConfig: (wizard: Wizard) => {
@@ -951,15 +953,33 @@ describe('watchdog control', () => {
     expect(internals.watchdogStatus(internals.normalizeWatchdog({ enabled: true, installed: false }))).toBe('enabled-missing')
     expect(internals.watchdogStatus(internals.normalizeWatchdog(undefined))).toBe('unknown')
     expect(internals.watchdogStatus(internals.normalizeWatchdog({}))).toBe('unknown')
+
+    const withCommands = internals.normalizeWatchdog({
+      installed: true,
+      running: true,
+      scriptsDir: '/bundle/scripts',
+      manualCommands: { dryRun: 'node /bundle/scripts/watchdog.mjs', install: 'sh /bundle/scripts/install-launchd.sh', uninstall: 'sh /bundle/scripts/uninstall.sh' },
+    })
+    expect(withCommands.manualCommands).toEqual({
+      dryRun: 'node /bundle/scripts/watchdog.mjs',
+      install: 'sh /bundle/scripts/install-launchd.sh',
+      uninstall: 'sh /bundle/scripts/uninstall.sh',
+    })
+    expect(withCommands.scriptsDir).toBe('/bundle/scripts')
+    expect(internals.normalizeWatchdog({ installed: true, running: true }).manualCommands).toBeUndefined()
   })
 
-  it('offers a one-click watchdog switch and falls back to manual commands', async () => {
+  it('offers a one-click watchdog switch and renders only absolute bundled commands', async () => {
     const source = await readFile(join(root, 'src', 'client', 'main.js'), 'utf8')
     expect(source).toContain('setupWatchdog')
     expect(source).toContain("${API}/setup/watchdog")
     expect(source).toContain('watchdogBusy')
     expect(source).toContain('watchdog.unavailable')
     expect(source).toContain('permissions.watchdogCommands')
+    expect(source).toContain('watchdog.manualCommands')
+    expect(source).toContain('permissions.watchdogCommandsUnavailable')
+    expect(source).not.toContain('node scripts/watchdog.mjs')
+    expect(source).not.toContain('./scripts/install-launchd.sh')
 
     const { entry } = loadClient(source)
     const react = renderableReact()

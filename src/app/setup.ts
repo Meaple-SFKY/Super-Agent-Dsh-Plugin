@@ -78,6 +78,15 @@ export interface SetupAccountGithub {
 }
 
 /** Watchdog LaunchAgent status. */
+export type WatchdogScriptName = 'watchdog.mjs' | 'install-launchd.sh' | 'uninstall.sh'
+
+/** Commands for installs that ship the repository scripts (absolute, copy-safe). */
+export interface SetupWatchdogCommands {
+  dryRun: string
+  install: string
+  uninstall: string
+}
+
 export interface SetupWatchdogState {
   installed: boolean
   running: boolean
@@ -85,6 +94,10 @@ export interface SetupWatchdogState {
   plistPath: string
   stateDir: string
   detail?: string
+  /** Directory that contains the bundled scripts, when this install has them. */
+  scriptsDir?: string
+  /** Absolute manual commands; absent when the build does not ship the scripts. */
+  manualCommands?: SetupWatchdogCommands
 }
 
 /** Result of one bounded child-process run (never thrown). */
@@ -225,8 +238,8 @@ export interface SetupDeps {
   validateModel?: (provider: string, model: string, reasoningEffort?: string) => Promise<string | undefined>
   /** Bounded child-process runner for the watchdog scripts (tests inject a fake). */
   runProcess?: (file: string, args: string[], timeoutMs: number) => Promise<ProcessResult>
-  /** Resolve a repo script (install-launchd.sh / uninstall.sh) to an absolute path. */
-  scriptPath?: (name: 'install-launchd.sh' | 'uninstall.sh') => string | undefined
+  /** Resolve a bundled script (watchdog.mjs / install-launchd.sh / uninstall.sh). */
+  scriptPath?: (name: WatchdogScriptName) => string | undefined
   /** Test seam: override the LaunchAgent label / plist path. */
   watchdogLabel?: () => string
   watchdogPlistPath?: () => string
@@ -554,6 +567,23 @@ export class SetupService implements SetupApi {
   }
 
   /** Read the LaunchAgent state (cached briefly; `force` bypasses the cache). */
+  private watchdogCommands(): { scriptsDir?: string; manualCommands?: SetupWatchdogCommands } {
+    const install = this.deps.scriptPath?.('install-launchd.sh')
+    const uninstall = this.deps.scriptPath?.('uninstall.sh')
+    const watchdog = this.deps.scriptPath?.('watchdog.mjs')
+    if (!install || !uninstall || !watchdog) return {}
+    const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
+    const stateDir = quote(this.deps.stateDir)
+    return {
+      scriptsDir: dirname(install),
+      manualCommands: {
+        dryRun: `node ${quote(watchdog)} --state-dir ${stateDir} --dry-run`,
+        install: `sh ${quote(install)} --state-dir ${stateDir}`,
+        uninstall: `sh ${quote(uninstall)} --state-dir ${stateDir}`,
+      },
+    }
+  }
+
   async probeWatchdog(force = false): Promise<SetupWatchdogState> {
     const cached = this.watchdogCache
     if (!force && cached && Date.now() - cached.at < 10_000) return cached.value
@@ -573,12 +603,15 @@ export class SetupService implements SetupApi {
     } catch {
       running = false
     }
+    const commands = this.watchdogCommands()
     const value: SetupWatchdogState = {
       installed,
       running,
       label,
       plistPath,
       stateDir: this.deps.stateDir,
+      ...(commands.scriptsDir === undefined ? {} : { scriptsDir: commands.scriptsDir }),
+      ...(commands.manualCommands === undefined ? {} : { manualCommands: commands.manualCommands }),
       ...(installed
         ? { detail: running ? 'installed and running' : 'installed but not loaded' }
         : { detail: 'not installed (login item disabled)' }),
