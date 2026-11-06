@@ -915,6 +915,31 @@ describe('telegram source: outgoing files', () => {
     expect(loggerWarnings).toEqual([])
   })
 
+  it('keeps CJK file names and their extension in the uploaded document', async () => {
+    const dir = tempDir('telegram-attach-cjk')
+    const workDir = join(dir, 'work', 't_2')
+    mkdirSync(workDir, { recursive: true })
+    const report = join(workDir, 'performance_report.md')
+    writeFileSync(report, '# report')
+    const fake = await startTelegram()
+    const { ctx } = makeContext('telegram', { stateDir: dir })
+    const source = createSource(baseConfig(fake.url), ctx) as TelegramSource
+
+    const outcome = await source.send({
+      id: 'files-cjk',
+      purpose: 'notice',
+      channel: { source: 'telegram', thread: 'telegram:dm:42', to: '42' },
+      text: 'report attached',
+      attachments: [{ kind: 'document', path: report, name: '排序算法性能分析报告.md' }],
+      at: nowIso(),
+    })
+
+    expect(outcome).toBe('sent')
+    const raw = fake.callsOf('sendDocument')[0]!.raw as string
+    expect(raw).toContain('排序算法性能分析报告.md')
+    expect(raw).not.toContain('filename="md"')
+  })
+
   it('keeps the text message when an attachment upload fails', async () => {
     const dir = tempDir('telegram-attach-fail')
     const photo = join(dir, 'fail.png')

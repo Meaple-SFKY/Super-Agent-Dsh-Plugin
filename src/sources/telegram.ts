@@ -316,11 +316,25 @@ interface MediaAttachment {
   size: number
 }
 
-/** Keep only basename-safe characters; the download path is built from it. */
+/**
+ * Keep the file's own name (including CJK) while removing path separators and
+ * characters that are invalid in a filename. The previous ASCII-only filter
+ * turned "排序算法性能分析报告.md" into ".md", which Telegram then displayed as a
+ * file called "md" with no openable app association.
+ */
 function safeFileName(name: string): string {
-  const base = name.split(/[\\/]/).pop() ?? 'file'
-  const cleaned = base.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '')
-  return (cleaned || 'file').slice(0, 80)
+  const base = (name.split(/[\\/]/).pop() ?? '').trim()
+  const cleaned = base
+    .replace(/[\u0000-\u001F\u007F]/g, '_')
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/\s+/g, '_')
+    .trim()
+  const withoutLeadingDots = cleaned.replace(/^\.+/, '')
+  const candidate = withoutLeadingDots.length === 0 ? `file${cleaned}` : cleaned
+  const match = /(\.[A-Za-z0-9]{1,10})$/.exec(candidate)
+  const extension = match?.[1] ?? ''
+  const stem = extension.length > 0 ? candidate.slice(0, -extension.length) : candidate
+  return `${stem.slice(0, 110)}${extension}` || 'file'
 }
 
 /** Topic (forum thread) id encoded in a group Thread key, if any. */
