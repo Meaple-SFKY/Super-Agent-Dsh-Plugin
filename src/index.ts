@@ -68,6 +68,14 @@ export const Config: unknown = Schema.object({
     en: 'Primary language the bot uses when it talks to you (not the panel UI language).',
     zh: '机器人对你说话、汇报时使用的语言（不是面板 UI 语言）。',
   }),
+  router: Schema.object({
+    provider: Schema.string().default(''),
+    model: Schema.string().default(''),
+    reasoningEffort: Schema.string().default(''),
+  }).default({}).i18n({
+    en: 'Model for the long-lived Router session; empty fields follow the DSH default model.',
+    zh: '常驻 Router Session 使用的模型；留空沿用 DSH 默认模型。',
+  }),
   sources: Schema.object({
     telegram: Schema.object({
       enabled: Schema.boolean().default(false).i18n({
@@ -89,6 +97,18 @@ export const Config: unknown = Schema.object({
       chats: Schema.array(Schema.string()).default([]).i18n({
         en: 'Optional Telegram group chat ids to listen to (mentions only).',
         zh: '可选：要监听的 Telegram 群 chat id（只处理 @）。',
+      }),
+      richText: Schema.boolean().default(true).i18n({
+        en: 'Render rich text (Telegram HTML) for outgoing messages; off sends plain text.',
+        zh: '对外消息使用富文本（Telegram HTML）；关闭则发送纯文本。',
+      }),
+      files: Schema.boolean().default(true).i18n({
+        en: 'Allow sending and receiving files (documents/photos); downloads never feed the model directly.',
+        zh: '允许收发文件（文档/图片）；下载的文件会落盘供 Worker 读取。',
+      }),
+      keyboards: Schema.boolean().default(true).i18n({
+        en: 'Allow inline keyboards/buttons on outgoing messages; button presses only become Triggers when observeCallbacks is on.',
+        zh: '允许对外消息附带内联按钮/键盘；只有在 observeCallbacks 开启时按钮点击才会成为候选。',
       }),
       pollSeconds: Schema.number().default(60).i18n({
         en: 'Polling interval in seconds.',
@@ -171,6 +191,10 @@ export const Config: unknown = Schema.object({
     model: Schema.string().default('').i18n({
       en: 'Optional Worker model id; empty uses the profile default.',
       zh: '可选：Worker 模型 id；留空使用 profile 默认模型。',
+    }),
+    reasoningEffort: Schema.string().default('').i18n({
+      en: 'Optional reasoning effort for the Worker model; empty uses the model default.',
+      zh: '可选：Worker 模型的 reasoning effort；留空使用模型默认值。',
     }),
     provider: Schema.string().default('').i18n({
       en: 'Optional Worker model provider.',

@@ -212,9 +212,14 @@ describe('guardian Config schema', () => {
     })
     expect(resolved.stateDir).toBe('/tmp/superagent')
     expect(resolved.language).toBe('zh')
+    expect(resolved.router).toEqual({ provider: '', model: '', reasoningEffort: '' })
+    expect(resolved.executor.reasoningEffort).toBe('')
     expect(resolved.policy.mode).toBe('auto')
     expect(resolved.sources.telegram.enabled).toBe(true)
     expect(resolved.sources.telegram.allowedUserIds).toEqual(['1'])
+    expect(resolved.sources.telegram.richText).toBe(true)
+    expect(resolved.sources.telegram.files).toBe(true)
+    expect(resolved.sources.telegram.keyboards).toBe(true)
     expect(resolved.sources.github.enabled).toBe(false)
     expect(resolved.sources.github.repositories).toEqual([])
     expect(resolved.sources.github.allowSelf).toBe(false)
@@ -228,6 +233,18 @@ describe('guardian Config schema', () => {
 
     expect(Config({ sources: { github: { allowSelf: true } } }).sources.github.allowSelf).toBe(true)
     expect(Config({ language: 'en' }).language).toBe('en')
+    const telegram = Config({ sources: { telegram: { richText: false, files: false, keyboards: false } } })
+    expect(telegram.sources.telegram.richText).toBe(false)
+    expect(telegram.sources.telegram.files).toBe(false)
+    expect(telegram.sources.telegram.keyboards).toBe(false)
+    const withModels = Config({
+      router: { provider: 'opencode', model: 'deepseek/deepseek-v4.1-flash', reasoningEffort: 'high' },
+      executor: { provider: 'other', model: 'm1', reasoningEffort: 'low' },
+    })
+    expect(withModels.router).toEqual({ provider: 'opencode', model: 'deepseek/deepseek-v4.1-flash', reasoningEffort: 'high' })
+    expect(withModels.executor.provider).toBe('other')
+    expect(withModels.executor.model).toBe('m1')
+    expect(withModels.executor.reasoningEffort).toBe('low')
     const dedicated = Config({
       sources: { github: { login: 'acme-superagent', allowedLogins: ['alice'], collaborators: ['alice'] } },
       executor: { gitSshKeyFile: '/home/me/.ssh/superagent_bot', gitName: 'Superagent Bot', gitEmail: 'bot@example.com' },

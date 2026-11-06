@@ -73,6 +73,7 @@ describe('cordis.patch.yml', () => {
       '@deepseek-ai/dsh-tool-subagent-control',
       '@deepseek-ai/dsh-tool-subagent',
       '@deepseek-ai/dsh-tool-todo',
+      '@deepseek-ai/dsh-tool-goal',
       '@deepseek-ai/dsh-tool-web',
     ]) {
       expect(worker, `worker preset is missing ${required}`).toContain(required)
@@ -82,6 +83,8 @@ describe('cordis.patch.yml', () => {
     expect(worker).toContain('waitTimeoutMs: 5000')
     expect(worker).toContain('maxWaitTimeoutMs: 5000')
     expect(worker).toContain('agentPreset: standard')
+    expect(worker).toMatch(/readImage: true/)
+    expect(worker).not.toContain('@deepseek-ai/dsh-experimental-agent-team')
   })
 
   it('keeps the router preset read-only and scheduling-only', async () => {
@@ -101,6 +104,9 @@ describe('cordis.patch.yml', () => {
     expect(router).not.toContain('@deepseek-ai/dsh-tool-todo')
     expect(router).not.toContain('@deepseek-ai/dsh-tool-subagent')
     expect(router).not.toContain('@deepseek-ai/dsh-persona')
+    expect(router).toMatch(/readImage: true/)
+    expect(router).not.toContain('@deepseek-ai/dsh-tool-goal')
+    expect(router).not.toContain('@deepseek-ai/dsh-tool-web')
   })
 })
 
@@ -204,6 +210,20 @@ describe('install and operations scripts', () => {
     expect(watchdog).toContain('backoff')
     expect(watchdog).not.toContain('TELEGRAM_TOKEN')
     expect(watchdog).not.toContain('GITHUB_TOKEN')
+  })
+
+  it('ships the capability matrix and Telegram capability switches', async () => {
+    const docs = await readText('docs/003-capabilities.md')
+    for (const section of ['Goal', 'read_image', 'Workflow', 'Agent Team', 'Telegram', 'GitHub']) {
+      expect(docs, `003 should mention ${section}`).toContain(section)
+    }
+    const config = await readText('src/index.ts')
+    expect(config).toContain('richText')
+    expect(config).toContain('files')
+    expect(config).toContain('keyboards')
+    const client = await readText('src/client/main.js')
+    expect(client).toContain('telegram.capabilities')
+    expect(client).toContain('telegram.richTextHint')
   })
 
   it('documents setup, verification, observe mode and uninstall', async () => {

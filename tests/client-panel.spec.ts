@@ -32,6 +32,9 @@ interface Wizard {
     token: string
     botUsername: string
     tokenFile: string
+    richText: boolean
+    files: boolean
+    keyboards: boolean
     error: string
     skipped: boolean
   }
@@ -55,7 +58,14 @@ interface Wizard {
     error: string
     skipped: boolean
   }
-  behavior: { allowedUserIds: string; mode: string; maxWorkers: number; language: string }
+  behavior: {
+    allowedUserIds: string
+    mode: string
+    maxWorkers: number
+    language: string
+    routerModel: string
+    workerModel: string
+  }
   finish: { status: string; error: string; elapsed: number }
 }
 
@@ -75,10 +85,31 @@ interface Internals {
   stepLabels: (t: (key: string) => string) => string[]
   stepStates: (wizard: Wizard) => string[]
   canAdvance: (step: number, wizard: Wizard) => boolean
+  buildModelProviders: (payload: unknown) => Array<{ id: string; name: string; models: Array<{ value: string; label: string }> }>
+  encodeModelSelection: (selection: unknown) => string
+  decodeModelSelection: (value: string) => { provider: string; model: string; reasoningEffort?: string } | undefined
+  modelSelectionLabel: (selection: unknown, providers: unknown) => string
+  normalizeModelSelection: (value: unknown) => { provider: string; model: string; reasoningEffort?: string } | undefined
+  normalizeWatchdog: (value: unknown) => {
+    available: boolean
+    enabled: boolean
+    installed?: boolean
+    running?: boolean
+    detail: string
+  }
+  watchdogStatus: (view: unknown) => string
   buildConfig: (wizard: Wizard) => {
     language: string
+    router?: { provider: string; model: string; reasoningEffort?: string }
     sources: {
-      telegram: { enabled: boolean; tokenFile?: string; allowedUserIds?: string[] }
+      telegram: {
+        enabled: boolean
+        tokenFile?: string
+        allowedUserIds?: string[]
+        richText?: boolean
+        files?: boolean
+        keyboards?: boolean
+      }
       github: {
         enabled: boolean
         tokenFile?: string
@@ -90,7 +121,15 @@ interface Internals {
       }
     }
     policy: { mode: string }
-    executor: { maxWorkers: number; gitSshKeyFile?: string; gitName?: string; gitEmail?: string }
+    executor: {
+      maxWorkers: number
+      gitSshKeyFile?: string
+      gitName?: string
+      gitEmail?: string
+      provider?: string
+      model?: string
+      reasoningEffort?: string
+    }
   }
   parseList: (value: string) => string[]
   parseUserIds: (value: string) => string[]
@@ -274,7 +313,7 @@ function validatedWizard(module: FakeModule): Wizard {
     repositories: [{ fullName: 'acme/widgets' }, { fullName: 'acme/docs' }],
     selected: ['acme/widgets', 'acme/docs'],
   }
-  wizard.behavior = { allowedUserIds: '123, 456 123', mode: 'auto', maxWorkers: 3, language: 'zh' }
+  wizard.behavior = { allowedUserIds: '123, 456 123', mode: 'auto', maxWorkers: 3, language: 'zh', routerModel: '', workerModel: '' }
   return wizard
 }
 
@@ -324,6 +363,7 @@ describe('src/client/main.js', () => {
       '${API}/setup/telegram',
       '${API}/setup/github',
       '${API}/setup/github/ssh-key',
+      '${API}/setup/models',
       '${API}/setup/config',
       '${API}/setup/permissions',
     ]) {
@@ -393,6 +433,12 @@ describe('src/client/main.js', () => {
     expect(source).toContain('sa-checklist')
     expect(source).toContain('github.automationTitle')
     expect(source).toContain('github.manualTitle')
+    expect(source).toContain('setupModels')
+    expect(source).toContain('behavior.routerModel')
+    expect(source).toContain('behavior.workerModel')
+    expect(source).toContain('ModelSelect')
+    expect(source).toContain('telegram.capabilities')
+    expect(source).toContain('telegram.richTextHint')
     expect(source).toContain('sshKeyRestarting')
     expect(source).toContain('waitForSetupReady')
     expect(source).toContain('github.keyExisting')
@@ -479,6 +525,11 @@ describe('setup wizard state machine', () => {
     expect(wizard.behavior.mode).toBe('observe')
     expect(wizard.behavior.maxWorkers).toBe(2)
     expect(wizard.behavior.language).toBe('zh')
+    expect(wizard.behavior.routerModel).toBe('')
+    expect(wizard.behavior.workerModel).toBe('')
+    expect(wizard.telegram.richText).toBe(true)
+    expect(wizard.telegram.files).toBe(true)
+    expect(wizard.telegram.keyboards).toBe(true)
     expect(wizard.github.operator).toBe('')
     expect(wizard.github.personalToken).toBe('')
     expect(wizard.github.sshKeyFile).toBe('')
@@ -496,8 +547,20 @@ describe('setup wizard state machine', () => {
     const configured = internals.wizardFromSetup(
       setupState({
         language: 'en',
+        models: {
+          router: { provider: 'opencode', model: 'deepseek/deepseek-v4.1-flash', reasoningEffort: 'high' },
+          worker: { provider: 'opencode', model: 'deepseek/deepseek-v4.1-flash' },
+          default: { provider: 'opencode', model: 'deepseek/deepseek-v4.1-flash' },
+        },
         accounts: {
-          telegram: { configured: true, enabled: true, botUsername: 'demo_bot' },
+          telegram: {
+            configured: true,
+            enabled: true,
+            botUsername: 'demo_bot',
+            richText: false,
+            files: false,
+            keyboards: true,
+          },
           github: {
             configured: true,
             enabled: true,
@@ -520,6 +583,9 @@ describe('setup wizard state machine', () => {
     )
     expect(configured.telegram.status).toBe('validated')
     expect(configured.telegram.botUsername).toBe('demo_bot')
+    expect(configured.telegram.richText).toBe(false)
+    expect(configured.telegram.files).toBe(false)
+    expect(configured.telegram.keyboards).toBe(true)
     expect(configured.github.status).toBe('validated')
     expect(configured.github.selected).toEqual(['acme/widgets'])
     expect(configured.github.allowSelf).toBe(false)
@@ -528,9 +594,86 @@ describe('setup wizard state machine', () => {
     expect(configured.github.sshKeyFile).toBe('/home/me/.ssh/superagent_bot')
     expect(configured.github.sshKeyGenerated).toBe(true)
     expect(configured.github.sshKeyPublic).toBe('ssh-ed25519 AAAA-TEST user@example')
+    expect(internals.decodeModelSelection(configured.behavior.routerModel)).toEqual({
+      provider: 'opencode',
+      model: 'deepseek/deepseek-v4.1-flash',
+      reasoningEffort: 'high',
+    })
+    expect(internals.decodeModelSelection(configured.behavior.workerModel)).toEqual({
+      provider: 'opencode',
+      model: 'deepseek/deepseek-v4.1-flash',
+    })
     expect(internals.isSetupConfigured(setupState({ accounts: { telegram: { configured: true }, github: {} } }))).toBe(true)
     expect(internals.isSetupConfigured(setupState())).toBe(false)
     expect(internals.wizardFromSetup(setupState()).behavior.language).toBe('zh')
+  })
+
+  it('builds provider-grouped model options and round-trips selections', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    const groups = internals.buildModelProviders({
+      providers: [
+        {
+          id: 'opencode',
+          name: 'OpenCode',
+          models: [
+            { id: 'deepseek/deepseek-v4.1-flash', name: 'V4.1 Flash', description: 'fast', defaultReasoningEffort: 'high' },
+            'plain-model',
+          ],
+        },
+        { id: 'other', name: 'Other', models: [{ id: 'm1', name: 'M1' }] },
+        { id: '', models: [{ id: 'ignored' }] },
+      ],
+    })
+    expect(groups.map(group => group.id)).toEqual(['opencode', 'other'])
+    const first = groups[0]!
+    expect(first.models).toHaveLength(2)
+    expect(first.models[0]).toMatchObject({ provider: 'opencode', model: 'deepseek/deepseek-v4.1-flash', label: 'V4.1 Flash', description: 'fast' })
+    expect(first.models[1]).toMatchObject({ provider: 'opencode', model: 'plain-model', label: 'plain-model' })
+    expect(internals.buildModelProviders({ providers: [null, { models: [] }] })).toEqual([])
+    expect(internals.buildModelProviders(undefined)).toEqual([])
+
+    const selection = { provider: 'opencode', model: 'deepseek/deepseek-v4.1-flash', reasoningEffort: 'high' }
+    const encoded = internals.encodeModelSelection(selection)
+    expect(internals.decodeModelSelection(encoded)).toEqual(selection)
+    expect(internals.decodeModelSelection('')).toBeUndefined()
+    expect(internals.encodeModelSelection({ provider: '', model: 'x' })).toBe('')
+    expect(internals.modelSelectionLabel(selection, groups)).toBe('OpenCode / V4.1 Flash')
+    expect(internals.modelSelectionLabel(undefined, groups)).toBe('')
+  })
+
+  it('saves router/worker model selections and omits the DSH default', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    const wizard = validatedWizard(module)
+    const router = { provider: 'opencode', model: 'deepseek/deepseek-v4.1-flash', reasoningEffort: 'high' }
+    const worker = { provider: 'other', model: 'm1' }
+    wizard.behavior = {
+      ...wizard.behavior,
+      routerModel: internals.encodeModelSelection(router),
+      workerModel: internals.encodeModelSelection(worker),
+    }
+    const config = internals.buildConfig(wizard)
+    expect(config.router).toEqual(router)
+    expect(config.executor.provider).toBe('other')
+    expect(config.executor.model).toBe('m1')
+    expect(config.executor.maxWorkers).toBe(wizard.behavior.maxWorkers)
+    expect(config.executor.reasoningEffort).toBeUndefined()
+
+    const defaults = internals.buildConfig(baseWizard(module))
+    expect(defaults.router).toBeUndefined()
+    expect(defaults.executor.provider).toBeUndefined()
+    expect(defaults.executor.model).toBeUndefined()
+  })
+
+  it('hydrates models from setup/state and falls back to a legacy executor model', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    const legacy = internals.wizardFromSetup(setupState({ executor: { provider: 'opencode', model: 'legacy-model' } }))
+    expect(internals.decodeModelSelection(legacy.behavior.workerModel)).toEqual({ provider: 'opencode', model: 'legacy-model' })
+    const missing = internals.wizardFromSetup(setupState())
+    expect(missing.behavior.routerModel).toBe('')
+    expect(missing.behavior.workerModel).toBe('')
   })
 
   it('gates each step on its verification result', async () => {
@@ -552,9 +695,9 @@ describe('setup wizard state machine', () => {
     wizard.github = { ...wizard.github, operator: 'alice' }
 
     wizard.telegram = { ...wizard.telegram, skipped: false, status: 'validated' }
-    wizard.behavior = { allowedUserIds: '', mode: 'observe', maxWorkers: 2, language: 'zh' }
+    wizard.behavior = { allowedUserIds: '', mode: 'observe', maxWorkers: 2, language: 'zh', routerModel: '', workerModel: '' }
     expect(internals.canAdvance(2, wizard)).toBe(false)
-    wizard.behavior = { allowedUserIds: '123,456', mode: 'auto', maxWorkers: 3, language: 'zh' }
+    wizard.behavior = { allowedUserIds: '123,456', mode: 'auto', maxWorkers: 3, language: 'zh', routerModel: '', workerModel: '' }
     expect(internals.canAdvance(2, wizard)).toBe(true)
     wizard.behavior = { ...wizard.behavior, mode: 'bogus' }
     expect(internals.canAdvance(2, wizard)).toBe(false)
@@ -575,6 +718,9 @@ describe('setup wizard state machine', () => {
     expect(config.sources.telegram).toEqual({
       enabled: true,
       allowedUserIds: ['123', '456'],
+      richText: true,
+      files: true,
+      keyboards: true,
       tokenFile: '/tmp/superagent/secrets/telegram-token',
     })
     expect(config.sources.github).toEqual({
@@ -649,7 +795,7 @@ describe('setup wizard state machine', () => {
     const wizard = baseWizard(module)
     wizard.telegram = { ...wizard.telegram, skipped: true }
     wizard.github = { ...wizard.github, skipped: true }
-    wizard.behavior = { allowedUserIds: '', mode: 'observe', maxWorkers: 2, language: 'zh' }
+    wizard.behavior = { allowedUserIds: '', mode: 'observe', maxWorkers: 2, language: 'zh', routerModel: '', workerModel: '' }
     const config = internals.buildConfig(wizard)
     expect(config.sources.telegram).toEqual({ enabled: false })
     expect(config.sources.github).toEqual({ enabled: false })
@@ -782,6 +928,95 @@ describe('permissions localization', () => {
     expect(tree).toContain('Future title')
     expect(tree).toContain(internals.dictionaries.zh['permissions.required'])
     expect(tree).toContain(internals.dictionaries.zh['common.restartRequired'])
+  })
+})
+
+describe('watchdog control', () => {
+  it('normalizes runtime watchdog state and maps it to a status label', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+
+    expect(internals.normalizeWatchdog(true)).toMatchObject({ available: true, enabled: true })
+    expect(internals.normalizeWatchdog(false)).toMatchObject({ available: true, enabled: false })
+
+    const running = internals.normalizeWatchdog({ enabled: true, installed: true, running: true })
+    expect(running).toMatchObject({ available: true, enabled: true, installed: true, running: true })
+    expect(internals.watchdogStatus(running)).toBe('running')
+
+    const idle = internals.normalizeWatchdog({ enabled: true, installed: true, running: false, detail: 'stopped' })
+    expect(internals.watchdogStatus(idle)).toBe('installed-idle')
+    expect(idle.detail).toBe('stopped')
+
+    expect(internals.watchdogStatus(internals.normalizeWatchdog({ enabled: false, installed: false }))).toBe('not-installed')
+    expect(internals.watchdogStatus(internals.normalizeWatchdog({ enabled: true, installed: false }))).toBe('enabled-missing')
+    expect(internals.watchdogStatus(internals.normalizeWatchdog(undefined))).toBe('unknown')
+    expect(internals.watchdogStatus(internals.normalizeWatchdog({}))).toBe('unknown')
+  })
+
+  it('offers a one-click watchdog switch and falls back to manual commands', async () => {
+    const source = await readFile(join(root, 'src', 'client', 'main.js'), 'utf8')
+    expect(source).toContain('setupWatchdog')
+    expect(source).toContain("${API}/setup/watchdog")
+    expect(source).toContain('watchdogBusy')
+    expect(source).toContain('watchdog.unavailable')
+    expect(source).toContain('permissions.watchdogCommands')
+
+    const { entry } = loadClient(source)
+    const react = renderableReact()
+    const factory = entry.factory
+    if (factory === undefined) throw new Error('client module registered no factory')
+    const module = factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error(`unexpected require: ${specifier}`)
+    }) as FakeModule
+    const internals = internalsOf(module)
+    const t = (key: string) => key
+
+    react.reset()
+    const runningTree = JSON.stringify(
+      internals.views.PermissionsView({
+        t,
+        permissions: { data: { ok: true, permissions: [] }, error: '', loading: false, at: '' },
+        watchdog: { available: true, enabled: true, installed: true, running: true, detail: '' },
+        watchdogBusy: false,
+        watchdogNote: null,
+        onRefresh: () => undefined,
+        onToggleWatchdog: () => undefined,
+      }),
+    )
+    expect(runningTree).toContain('watchdog.status.running')
+    expect(runningTree).toContain('watchdog.disable')
+    expect(runningTree).not.toContain('watchdog.unavailable')
+
+    react.reset()
+    const busyTree = JSON.stringify(
+      internals.views.PermissionsView({
+        t,
+        permissions: { data: { ok: true, permissions: [] }, error: '', loading: false, at: '' },
+        watchdog: { available: true, enabled: false, installed: false, running: false, detail: '' },
+        watchdogBusy: true,
+        watchdogNote: { ok: false, text: 'permission denied' },
+        onRefresh: () => undefined,
+        onToggleWatchdog: () => undefined,
+      }),
+    )
+    expect(busyTree).toContain('watchdog.working')
+    expect(busyTree).toContain('watchdog.actionFailed')
+    expect(busyTree).toContain('permission denied')
+
+    react.reset()
+    const unavailableTree = JSON.stringify(
+      internals.views.PermissionsView({
+        t,
+        permissions: { data: { ok: true, permissions: [] }, error: '', loading: false, at: '' },
+        watchdog: { available: false, enabled: false, installed: undefined, running: undefined, detail: '' },
+        watchdogBusy: false,
+        watchdogNote: null,
+        onRefresh: () => undefined,
+        onToggleWatchdog: () => undefined,
+      }),
+    )
+    expect(unavailableTree).toContain('watchdog.unavailable')
   })
 })
 

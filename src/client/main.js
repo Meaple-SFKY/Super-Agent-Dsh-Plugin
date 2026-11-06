@@ -60,6 +60,8 @@ function build(require) {
     setupTelegram: `${API}/setup/telegram`,
     setupGithub: `${API}/setup/github`,
     setupGithubSshKey: `${API}/setup/github/ssh-key`,
+    setupModels: `${API}/setup/models`,
+    setupWatchdog: `${API}/setup/watchdog`,
     setupConfig: `${API}/setup/config`,
     setupPermissions: `${API}/setup/permissions`,
     permissions: `${API}/permissions`,
@@ -162,6 +164,14 @@ function build(require) {
     'telegram.skip': '先跳过 Telegram',
     'telegram.skipped': '已跳过 Telegram，本次不会启用该来源。',
     'telegram.error': '校验失败',
+    'telegram.capabilities': 'Telegram 能力',
+    'telegram.capabilitiesHint': '默认全部开启；关闭某项只影响机器人，不影响 bot 账号本身。',
+    'telegram.richText': '富文本消息（HTML）',
+    'telegram.richTextHint': '用 Telegram HTML 渲染加粗/链接；关闭则发送纯文本。',
+    'telegram.files': '收发文件',
+    'telegram.filesHint': '允许接收文档/图片并落盘给 Worker 读取，也允许发送文件。',
+    'telegram.keyboards': '内联按钮',
+    'telegram.keyboardsHint': '允许消息附带按钮；点击是否变成候选由 observeCallbacks 决定。',
     'telegram.botfather': '打开 @BotFather',
     'telegram.noOauth': 'Telegram 没有可用的 OAuth：必须由你创建 bot 并粘贴 token。',
     'github.title': '连接 GitHub',
@@ -232,6 +242,12 @@ function build(require) {
     'behavior.desc': '决定谁能让它干活，以及它有多主动。之后可以在设置里随时修改。',
     'behavior.allowedUsers': '允许的 Telegram user id',
     'behavior.allowedUsersHint': '多个用逗号分隔；只接受数字 id。可给 @userinfobot 发消息获取。',
+    'behavior.models': '模型选择',
+    'behavior.routerModel': 'Router 模型',
+    'behavior.workerModel': 'Worker 模型',
+    'behavior.modelHint': '默认跟随 DSH 当前模型；只在需要区分 Router/Worker 时选择。',
+    'behavior.modelDefault': '沿用 DSH 默认模型',
+    'behavior.modelsError': '无法加载 DSH 模型列表，其他设置仍可保存。',
     'behavior.mode': '接受模式',
     'behavior.modeObserve': 'observe · 先观察',
     'behavior.modeObserveHint': '记录“本来会接”的工作但不执行，适合头几天校准。',
@@ -256,6 +272,8 @@ function build(require) {
     'finish.mode': '接受模式',
     'finish.workers': 'Worker 数',
     'finish.gitIdentity': 'Bot 身份',
+    'finish.routerModel': 'Router 模型',
+    'finish.workerModel': 'Worker 模型',
     'finish.save': '保存并启用',
     'finish.saving': '正在保存…',
     'finish.restarting': '插件重启中，正在等待就绪…',
@@ -306,6 +324,22 @@ function build(require) {
     'permissions.watchdogDetail': '登录自启并在 DSH 崩溃后重启它。默认不安装；不装也能用，只是进程退出后不会自动恢复。',
     'permissions.watchdogOff': '默认关闭',
     'permissions.watchdogCommands': '手动安装与检查',
+    'watchdog.status.running': '已安装并运行',
+    'watchdog.status.installed-idle': '已安装但未运行',
+    'watchdog.status.not-installed': '未安装',
+    'watchdog.status.enabled-missing': '已开启但未检测到安装',
+    'watchdog.status.unknown': '状态未知',
+    'watchdog.behaviourTitle': '开关',
+    'watchdog.enabledHint': '看门狗已开启：DSH 退出后会被自动拉起。',
+    'watchdog.disabledHint': '看门狗已关闭：DSH 退出后 SuperAgent 不会运行，直到你手动打开。',
+    'watchdog.enable': '开启看门狗',
+    'watchdog.disable': '关闭看门狗',
+    'watchdog.working': '处理中…',
+    'watchdog.unavailable': '运行时暂未提供看门狗控制接口；可使用下方手动命令。',
+    'watchdog.actionDone': '已更新看门狗状态',
+    'watchdog.actionFailed': '看门狗操作失败',
+    'watchdog.enabledDone': '看门狗已开启',
+    'watchdog.disabledDone': '看门狗已关闭',
     'permissions.restart': '生效方式',
     'permissions.restartDetail': '保存配置后插件会自动重启；不需要重启整个 DSH。个别系统级改动（例如更换 stateDir）需要重启 DSH。',
     'permissions.none': '不需要',
@@ -418,6 +452,14 @@ function build(require) {
     'telegram.skip': 'Skip Telegram for now',
     'telegram.skipped': 'Telegram skipped; this source stays disabled.',
     'telegram.error': 'Validation failed',
+    'telegram.capabilities': 'Telegram capabilities',
+    'telegram.capabilitiesHint': 'All on by default; turning one off only affects the bot, not the account.',
+    'telegram.richText': 'Rich text (HTML)',
+    'telegram.richTextHint': 'Render bold/links as Telegram HTML; off sends plain text.',
+    'telegram.files': 'Send and receive files',
+    'telegram.filesHint': 'Download documents/photos for Workers to read, and allow sending files.',
+    'telegram.keyboards': 'Inline keyboards',
+    'telegram.keyboardsHint': 'Allow buttons on messages; whether a press becomes a candidate depends on observeCallbacks.',
     'telegram.botfather': 'Open @BotFather',
     'telegram.noOauth': 'Telegram has no OAuth for bots: you create the bot and paste its token.',
     'github.title': 'Connect GitHub',
@@ -488,6 +530,12 @@ function build(require) {
     'behavior.desc': 'Decide who may give it work and how proactive it is. You can change these later in Setup.',
     'behavior.allowedUsers': 'Allowed Telegram user ids',
     'behavior.allowedUsersHint': 'Comma-separated numeric ids. Ask @userinfobot for yours.',
+    'behavior.models': 'Models',
+    'behavior.routerModel': 'Router model',
+    'behavior.workerModel': 'Worker model',
+    'behavior.modelHint': 'Follows the current DSH model by default; choose only when Router and Worker need different models.',
+    'behavior.modelDefault': 'Follow the DSH default model',
+    'behavior.modelsError': 'Could not load the DSH model list; other settings can still be saved.',
     'behavior.mode': 'Accept mode',
     'behavior.modeObserve': 'observe · watch first',
     'behavior.modeObserveHint': 'Records what it would accept but runs nothing. Good for the first days.',
@@ -512,6 +560,8 @@ function build(require) {
     'finish.mode': 'Accept mode',
     'finish.workers': 'Workers',
     'finish.gitIdentity': 'Bot identity',
+    'finish.routerModel': 'Router model',
+    'finish.workerModel': 'Worker model',
     'finish.save': 'Save and enable',
     'finish.saving': 'Saving…',
     'finish.restarting': 'Restarting the plugin; waiting for it to be ready…',
@@ -562,6 +612,22 @@ function build(require) {
     'permissions.watchdogDetail': 'Starts at login and restarts DSH after a crash. Off by default; without it the process simply stays down until you reopen it.',
     'permissions.watchdogOff': 'Off by default',
     'permissions.watchdogCommands': 'Install and check manually',
+    'watchdog.status.running': 'Installed and running',
+    'watchdog.status.installed-idle': 'Installed, not running',
+    'watchdog.status.not-installed': 'Not installed',
+    'watchdog.status.enabled-missing': 'Enabled but not detected',
+    'watchdog.status.unknown': 'Status unknown',
+    'watchdog.behaviourTitle': 'Switch',
+    'watchdog.enabledHint': 'The watchdog is on: it brings DSH back up after it exits.',
+    'watchdog.disabledHint': 'The watchdog is off: SuperAgent stays down when DSH exits until you open it manually.',
+    'watchdog.enable': 'Turn watchdog on',
+    'watchdog.disable': 'Turn watchdog off',
+    'watchdog.working': 'Working…',
+    'watchdog.unavailable': 'The runtime does not expose watchdog control yet; use the manual commands below.',
+    'watchdog.actionDone': 'Watchdog state updated',
+    'watchdog.actionFailed': 'Watchdog action failed',
+    'watchdog.enabledDone': 'Watchdog turned on',
+    'watchdog.disabledDone': 'Watchdog turned off',
     'permissions.restart': 'When changes apply',
     'permissions.restartDetail': 'Saving configuration restarts the plugin automatically; DSH itself stays up. A few system-level changes (such as stateDir) need a DSH restart.',
     'permissions.none': 'Not needed',
@@ -642,6 +708,103 @@ function build(require) {
   function setupLanguage(setup) {
     if (setup && typeof setup === 'object' && isLanguage(setup.language)) return setup.language
     return 'zh'
+  }
+
+  function normalizeModelSelection(value) {
+    if (value === null || typeof value !== 'object') return undefined
+    const provider = asText(value.provider)
+    const model = asText(value.model)
+    if (provider.length === 0 || model.length === 0) return undefined
+    const reasoningEffort = asText(value.reasoningEffort)
+    return reasoningEffort.length > 0 ? { provider, model, reasoningEffort } : { provider, model }
+  }
+
+  function encodeModelSelection(selection) {
+    const normalized = normalizeModelSelection(selection)
+    if (normalized === undefined) return ''
+    return [normalized.provider, normalized.model, normalized.reasoningEffort || ''].join('\u0000')
+  }
+
+  function decodeModelSelection(value) {
+    if (typeof value !== 'string' || value.length === 0) return undefined
+    const parts = value.split('\u0000')
+    if (parts.length < 2) return undefined
+    return normalizeModelSelection({ provider: parts[0], model: parts[1], reasoningEffort: parts[2] })
+  }
+
+  /** Flatten `GET setup/models` groups for the select; malformed input is empty. */
+  function buildModelProviders(payload) {
+    const providers = payload && typeof payload === 'object' && Array.isArray(payload.providers) ? payload.providers : []
+    const groups = []
+    for (const entry of providers) {
+      if (entry === null || typeof entry !== 'object') continue
+      const providerId = asText(entry.id) || asText(entry.provider) || asText(entry.name)
+      if (providerId.length === 0) continue
+      const providerName = asText(entry.name) || asText(entry.title) || providerId
+      const models = []
+      for (const raw of listOf(entry.models)) {
+        const model = typeof raw === 'string' ? raw : asText(raw && (raw.id || raw.model || raw.name))
+        if (model.length === 0) continue
+        const label = typeof raw === 'object' ? asText(raw && (raw.name || raw.title || raw.id)) : ''
+        const description = typeof raw === 'object' ? asText(raw && (raw.description || raw.desc)) : ''
+        const efforts = typeof raw === 'object' ? listOf(raw && raw.reasoningEfforts) : []
+        const effort = typeof raw === 'object'
+          ? asText(raw && (raw.defaultReasoningEffort || raw.reasoningEffort)) ||
+            (efforts.length > 0 && typeof efforts[0] === 'string' ? efforts[0] : '')
+          : ''
+        models.push({
+          provider: providerId,
+          model,
+          label: label.length > 0 ? label : model,
+          description,
+          value: encodeModelSelection({ provider: providerId, model, reasoningEffort: effort }),
+        })
+      }
+      if (models.length > 0) groups.push({ id: providerId, name: providerName, models })
+    }
+    return groups
+  }
+
+  function modelSelectionLabel(selection, providers) {
+    const normalized = normalizeModelSelection(selection)
+    if (normalized === undefined) return ''
+    const provider = listOf(providers).find(group => group.id === normalized.provider)
+    const model = provider && provider.models.find(item => item.model === normalized.model)
+    const modelLabel = model ? model.label : normalized.model
+    return `${provider ? provider.name : normalized.provider} / ${modelLabel}`
+  }
+
+  /**
+   * Normalize the runtime watchdog state. The Host may return a boolean, an
+   * object with installed/running/enabled, or nothing at all (feature absent).
+   */
+  function normalizeWatchdog(value) {
+    if (typeof value === 'boolean') {
+      return { available: true, enabled: value, installed: undefined, running: undefined, detail: '' }
+    }
+    if (value === null || typeof value !== 'object') {
+      return { available: false, enabled: false, installed: undefined, running: undefined, detail: '' }
+    }
+    const record = value
+    const installed = typeof record.installed === 'boolean' ? record.installed : undefined
+    const running = typeof record.running === 'boolean' ? record.running : undefined
+    const hasEnabled = typeof record.enabled === 'boolean'
+    const known = hasEnabled || installed !== undefined || running !== undefined
+    return {
+      available: known,
+      // setup/state reports installed/running without a separate enabled flag.
+      enabled: hasEnabled ? record.enabled === true : installed === true || running === true,
+      installed,
+      running,
+      detail: asText(record.detail) || asText(record.error),
+    }
+  }
+
+  function watchdogStatus(view) {
+    if (!view || view.available !== true) return 'unknown'
+    if (view.installed === true) return view.running === true ? 'running' : 'installed-idle'
+    if (view.enabled === true) return 'enabled-missing'
+    return 'not-installed'
   }
 
   /**
@@ -730,11 +893,23 @@ function build(require) {
     return {
       open: false,
       step: 0,
-      telegram: { status: 'idle', token: '', botUsername: '', tokenFile: '', error: '', skipped: false },
+      telegram: { status: 'idle', token: '', botUsername: '', tokenFile: '', richText: true, files: true, keyboards: true, error: '', skipped: false },
       github: { status: 'idle', token: '', login: '', tokenFile: '', repositories: [], selected: [], allowSelf: false, operator: '', personalToken: '', sshKeyFile: '', sshKeyPublic: '', sshKeyGenerated: false, sshKeyExisting: false, sshKeyGenerating: false, sshKeyRestarting: false, sshKeyError: '', error: '', skipped: false },
-      behavior: { allowedUserIds: '', mode: 'observe', maxWorkers: 2, language: 'zh' },
+      behavior: { allowedUserIds: '', mode: 'observe', maxWorkers: 2, language: 'zh', routerModel: '', workerModel: '' },
       finish: { status: 'idle', error: '', elapsed: 0 },
     }
+  }
+
+  /** Router/worker model recorded in setup/state (`models.*`), with legacy executor fallback. */
+  function modelState(setup, role) {
+    const models = setup && typeof setup === 'object' && setup.models && typeof setup.models === 'object' ? setup.models : {}
+    const direct = normalizeModelSelection(models[role])
+    if (direct !== undefined) return direct
+    if (role === 'worker') {
+      const executor = setup && typeof setup === 'object' && setup.executor && typeof setup.executor === 'object' ? setup.executor : {}
+      return normalizeModelSelection(executor)
+    }
+    return undefined
   }
 
   function wizardFromSetup(setup) {
@@ -749,6 +924,9 @@ function build(require) {
         ...base.telegram,
         status: telegram.configured === true ? 'validated' : 'idle',
         botUsername: typeof telegram.botUsername === 'string' ? telegram.botUsername : '',
+        richText: telegram.richText !== false,
+        files: telegram.files !== false,
+        keyboards: telegram.keyboards !== false,
       },
       github: {
         ...base.github,
@@ -772,6 +950,8 @@ function build(require) {
         mode: 'observe',
         maxWorkers: 2,
         language: setupLanguage(setup),
+        routerModel: encodeModelSelection(modelState(setup, 'router')),
+        workerModel: encodeModelSelection(modelState(setup, 'worker')),
       },
     }
   }
@@ -835,6 +1015,9 @@ function build(require) {
     const telegram = { enabled: telegramEnabled }
     if (telegramEnabled) {
       telegram.allowedUserIds = parseUserIds(wizard.behavior.allowedUserIds)
+      telegram.richText = wizard.telegram.richText !== false
+      telegram.files = wizard.telegram.files !== false
+      telegram.keyboards = wizard.telegram.keyboards !== false
       if (wizard.telegram.tokenFile) telegram.tokenFile = wizard.telegram.tokenFile
     }
     const github = { enabled: githubEnabled }
@@ -854,12 +1037,21 @@ function build(require) {
     const executor = { maxWorkers: asNumber(wizard.behavior.maxWorkers, 2) }
     const gitSshKeyFile = asText(wizard.github.sshKeyFile).trim()
     if (gitSshKeyFile) executor.gitSshKeyFile = gitSshKeyFile
-    return {
+    const worker = decodeModelSelection(wizard.behavior.workerModel)
+    if (worker !== undefined) {
+      executor.provider = worker.provider
+      executor.model = worker.model
+      if (worker.reasoningEffort) executor.reasoningEffort = worker.reasoningEffort
+    }
+    const config = {
       language: isLanguage(wizard.behavior.language) ? wizard.behavior.language : 'zh',
       sources: { telegram, github },
       policy: { mode: wizard.behavior.mode },
       executor,
     }
+    const router = decodeModelSelection(wizard.behavior.routerModel)
+    if (router !== undefined) config.router = router
+    return config
   }
 
   function repositoryChoices(setup) {
@@ -1524,6 +1716,33 @@ function build(require) {
     })
   }
 
+  function ModelSelect(props) {
+    const providers = listOf(props.providers)
+    return h(
+      'select',
+      {
+        className: 'sa-select',
+        value: props.value || '',
+        'aria-label': props.label,
+        onChange: event => props.onChange(event.target.value),
+      },
+      h('option', { value: '' }, props.placeholder),
+      providers.map(provider =>
+        h(
+          'optgroup',
+          { key: provider.id, label: provider.name },
+          provider.models.map(model =>
+            h(
+              'option',
+              { key: model.value, value: model.value, title: model.description || undefined },
+              model.description ? `${model.label} — ${model.description}` : model.label,
+            ),
+          ),
+        ),
+      ),
+    )
+  }
+
   function TextArea(props) {
     return h('textarea', {
       id: props.id,
@@ -2146,7 +2365,7 @@ function build(require) {
   // -- setup wizard -----------------------------------------------------------
 
   function SetupView(props) {
-    const { t, wizard, setup, busy, saving, onSetWizard, onValidateTelegram, onValidateGithub, onSave, onSkipTelegram, onSkipGithub, onGenerateSshKey } = props
+    const { t, wizard, setup, busy, saving, models, onSetWizard, onValidateTelegram, onValidateGithub, onSave, onSkipTelegram, onSkipGithub, onGenerateSshKey } = props
     const [revealed, setRevealed] = React.useState(false)
     const [repoQuery, setRepoQuery] = React.useState('')
     const [advancedOpen, setAdvancedOpen] = React.useState(false)
@@ -2283,6 +2502,30 @@ function build(require) {
                   ),
                 ),
               ),
+          h('div', { className: 'sa-divider' }),
+          h('div', { className: 'sa-section-title' }, t('telegram.capabilities')),
+          h('div', { className: 'sa-hint', style: { marginBottom: 8 } }, t('telegram.capabilitiesHint')),
+          [
+            ['richText', 'telegram.richText', 'telegram.richTextHint'],
+            ['files', 'telegram.files', 'telegram.filesHint'],
+            ['keyboards', 'telegram.keyboards', 'telegram.keyboardsHint'],
+          ].map(([key, labelKey, hintKey]) =>
+            h(
+              'label',
+              { className: 'sa-checkrow', key, style: { alignItems: 'flex-start', padding: '9px 8px' } },
+              h('input', {
+                type: 'checkbox',
+                checked: telegram[key] !== false,
+                onChange: event => patchTelegram({ [key]: event.target.checked }),
+              }),
+              h(
+                'span',
+                { style: { minWidth: 0 } },
+                h('span', { className: 'sa-checkrow-name', style: { whiteSpace: 'normal', lineHeight: 1.4 } }, t(labelKey)),
+                h('span', { className: 'sa-hint', style: { display: 'block', marginTop: 2 } }, t(hintKey)),
+              ),
+            ),
+          ),
         ),
       )
     }
@@ -2607,6 +2850,9 @@ function build(require) {
     function behaviorStep() {
       const error = behaviorError(wizard, t)
       const workers = asNumber(behavior.maxWorkers, 2)
+      const modelProviders = buildModelProviders(models && models.data)
+      const modelsError = models && models.error ? models.error : ''
+      const modelsLoading = models && models.loading === true && modelProviders.length === 0
       return h(
         'div',
         { className: 'sa-fade' },
@@ -2647,6 +2893,38 @@ function build(require) {
             }),
           ),
           h('div', { className: 'sa-hint', style: { marginTop: 8 } }, t('behavior.languageHint')),
+          h('div', { className: 'sa-divider' }),
+          h('div', { className: 'sa-section-title' }, t('behavior.models')),
+          modelsError && modelProviders.length === 0
+            ? h(Alert, { tone: 'warn', title: t('behavior.modelsError') }, modelsError)
+            : modelsLoading
+              ? h('div', { className: 'sa-hint' }, t('common.loading'))
+              : h(
+                  'div',
+                  { className: 'sa-grid sa-grid--two', style: { gap: 12 } },
+                  h(
+                    Field,
+                    { label: t('behavior.routerModel'), hint: t('behavior.modelHint') },
+                    h(ModelSelect, {
+                      providers: modelProviders,
+                      value: behavior.routerModel,
+                      label: t('behavior.routerModel'),
+                      placeholder: t('behavior.modelDefault'),
+                      onChange: value => patchBehavior({ routerModel: value }),
+                    }),
+                  ),
+                  h(
+                    Field,
+                    { label: t('behavior.workerModel'), hint: t('behavior.modelHint') },
+                    h(ModelSelect, {
+                      providers: modelProviders,
+                      value: behavior.workerModel,
+                      label: t('behavior.workerModel'),
+                      placeholder: t('behavior.modelDefault'),
+                      onChange: value => patchBehavior({ workerModel: value }),
+                    }),
+                  ),
+                ),
           h('div', { className: 'sa-divider' }),
           h('div', { className: 'sa-section-title' }, t('behavior.mode')),
           h(
@@ -2709,6 +2987,18 @@ function build(require) {
                 github.operator ? h(Pill, { tone: 'plain' }, `@${github.operator}`) : null)
             : t('finish.noGithub')),
         h(SummaryRow, { label: t('behavior.language') }, t(`language.${behavior.language === 'en' ? 'en' : 'zh'}`)),
+        h(
+          SummaryRow,
+          { label: t('finish.routerModel') },
+          modelSelectionLabel(decodeModelSelection(behavior.routerModel), buildModelProviders(models && models.data)) ||
+            t('behavior.modelDefault'),
+        ),
+        h(
+          SummaryRow,
+          { label: t('finish.workerModel') },
+          modelSelectionLabel(decodeModelSelection(behavior.workerModel), buildModelProviders(models && models.data)) ||
+            t('behavior.modelDefault'),
+        ),
         github.status === 'validated'
           ? h(
               SummaryRow,
@@ -2844,7 +3134,7 @@ function build(require) {
   // -- permissions ------------------------------------------------------------
 
   function PermissionsView(props) {
-    const { t, permissions, onRefresh } = props
+    const { t, permissions, watchdog, watchdogBusy, watchdogNote, onRefresh, onToggleWatchdog } = props
     const payload = permissions.data
     const runtimeEntries =
       payload && Array.isArray(payload.permissions)
@@ -2928,10 +3218,41 @@ function build(require) {
         h(CardHead, {
           icon: 'clock',
           title: t('permissions.watchdog'),
-          action: h(Pill, { tone: 'plain' }, t('permissions.watchdogOff')),
+          action: h(
+            Pill,
+            { tone: watchdogStatus(watchdog) === 'running' ? 'ok' : watchdogStatus(watchdog) === 'installed-idle' ? 'warn' : 'plain' },
+            t(`watchdog.status.${watchdogStatus(watchdog)}`),
+          ),
         }),
         h('div', { className: 'sa-note' }, t('permissions.watchdogDetail')),
-        h('div', { className: 'sa-section-title', style: { marginTop: 12 } }, t('permissions.watchdogCommands')),
+        h('div', { className: 'sa-section-title', style: { marginTop: 12 } }, t('watchdog.behaviourTitle')),
+        h('div', { className: 'sa-note' }, watchdog && watchdog.enabled ? t('watchdog.enabledHint') : t('watchdog.disabledHint')),
+        watchdogNote
+          ? h(Alert, { tone: watchdogNote.ok ? 'ok' : 'error', title: watchdogNote.ok ? t('watchdog.actionDone') : t('watchdog.actionFailed') }, watchdogNote.text || '')
+          : null,
+        h(
+          'div',
+          { className: 'sa-inline', style: { marginTop: 10 } },
+          h(
+            Button,
+            {
+              variant: watchdog && watchdog.enabled ? 'danger' : 'primary',
+              icon: watchdogBusy ? undefined : watchdog && watchdog.enabled ? 'pause' : 'play',
+              disabled: watchdogBusy === true || !watchdog || watchdog.available !== true,
+              onClick: watchdog ? () => onToggleWatchdog(watchdog.enabled !== true) : undefined,
+            },
+            watchdogBusy ? h(Spinner, null) : null,
+            watchdogBusy
+              ? t('watchdog.working')
+              : watchdog && watchdog.enabled
+                ? t('watchdog.disable')
+                : t('watchdog.enable'),
+          ),
+          watchdog && watchdog.available !== true
+            ? h('span', { className: 'sa-hint' }, t('watchdog.unavailable'))
+            : null,
+        ),
+        h('div', { className: 'sa-section-title', style: { marginTop: 16 } }, t('permissions.watchdogCommands')),
         h(CodeBlock, {
           copyText: 'node scripts/watchdog.mjs --state-dir ~/.dsh/state/superagent --dry-run',
           copyLabel: t('common.copy'),
@@ -2988,6 +3309,9 @@ function build(require) {
     const [wizard, setWizard] = React.useState(defaultWizard)
     const [busy, setBusy] = React.useState('')
     const [note, setNote] = React.useState(null)
+    const [watchdogOverride, setWatchdogOverride] = React.useState(undefined)
+    const [watchdogBusy, setWatchdogBusy] = React.useState(false)
+    const [watchdogNote, setWatchdogNote] = React.useState(null)
     const aliveRef = React.useRef(true)
     const wizardRef = React.useRef(wizard)
     wizardRef.current = wizard
@@ -3002,6 +3326,8 @@ function build(require) {
     const dashboard = usePolling(() => api.get(API_PATHS.state), STATE_POLL_MS)
     const setup = usePolling(() => api.get(API_PATHS.setupState), SETUP_POLL_MS)
     const permissions = usePolling(() => api.get(API_PATHS.setupPermissions), 30000)
+    const models = usePolling(() => api.get(API_PATHS.setupModels), 60000)
+    const watchdogPoll = usePolling(() => api.get(API_PATHS.setupWatchdog), 30000)
 
     const hydrated = React.useRef(false)
     React.useEffect(() => {
@@ -3024,6 +3350,8 @@ function build(require) {
       void dashboard.refresh()
       void setup.refresh()
       void permissions.refresh()
+      void models.refresh()
+      void watchdogPoll.refresh()
     }
 
     function actionText(action) {
@@ -3049,6 +3377,36 @@ function build(require) {
       const data = setup.snapshot.data
       setWizard(wizardFromSetup(data && typeof data === 'object' ? data : {}))
       setView('setup')
+      void models.refresh()
+    }
+
+    async function toggleWatchdog(enabled) {
+      if (watchdogBusy) return
+      setWatchdogBusy(true)
+      setWatchdogNote(null)
+      const result = await api.post(API_PATHS.setupWatchdog, { enabled })
+      if (!aliveRef.current) return
+      setWatchdogBusy(false)
+      if (!result.ok) {
+        setWatchdogNote({ ok: false, text: result.error || t('common.error') })
+        return
+      }
+      const data = result.data && typeof result.data === 'object' ? result.data : {}
+      const currentRaw = setup.snapshot.data && setup.snapshot.data.watchdog
+      const current = normalizeWatchdog(
+        watchdogOverride !== undefined ? watchdogOverride : currentRaw !== undefined ? currentRaw : watchdogPoll.snapshot.data,
+      )
+      setWatchdogOverride(
+        normalizeWatchdog({
+          enabled: typeof data.enabled === 'boolean' ? data.enabled : enabled,
+          installed: typeof data.installed === 'boolean' ? data.installed : current.installed,
+          running: typeof data.running === 'boolean' ? data.running : current.running,
+          ...(typeof data.detail === 'string' ? { detail: data.detail } : {}),
+        }),
+      )
+      setWatchdogNote({ ok: true, text: t(enabled ? 'watchdog.enabledDone' : 'watchdog.disabledDone') })
+      void watchdogPoll.refresh()
+      void setup.refresh()
     }
 
     function openDashboard() {
@@ -3252,6 +3610,10 @@ function build(require) {
       setWizard(wizardFromSetup(setup.snapshot.data || {}))
     }
 
+    const setupWatchdogRaw = setup.snapshot.data && setup.snapshot.data.watchdog
+    const watchdog = normalizeWatchdog(
+      watchdogOverride !== undefined ? watchdogOverride : setupWatchdogRaw !== undefined ? setupWatchdogRaw : watchdogPoll.snapshot.data,
+    )
     const plugin = (setup.snapshot.data && setup.snapshot.data.plugin) || (dashboard.snapshot.data && dashboard.snapshot.data.plugin) || {}
     const pluginStatus = plugin.status || (dashboard.snapshot.loading || setup.snapshot.loading ? 'starting' : 'stopped')
     const paused = dashboard.snapshot.data !== undefined && dashboard.snapshot.data.paused === true
@@ -3270,6 +3632,7 @@ function build(require) {
         t,
         wizard,
         setup: setup.snapshot,
+        models: models.snapshot,
         busy,
         saving,
         onSetWizard: setWizard,
@@ -3283,7 +3646,15 @@ function build(require) {
         onReconfigure: reconfigure,
       })
     } else if (view === 'permissions') {
-      content = h(PermissionsView, { t, permissions: permissions.snapshot, onRefresh: () => void permissions.refresh() })
+      content = h(PermissionsView, {
+        t,
+        permissions: permissions.snapshot,
+        watchdog,
+        watchdogBusy,
+        watchdogNote,
+        onRefresh: () => void permissions.refresh(),
+        onToggleWatchdog: enabled => void toggleWatchdog(enabled),
+      })
     } else {
       content = h(OverviewView, {
         t,
@@ -3436,6 +3807,13 @@ function build(require) {
       canAdvance,
       behaviorError,
       buildConfig,
+      buildModelProviders,
+      normalizeWatchdog,
+      watchdogStatus,
+      encodeModelSelection,
+      decodeModelSelection,
+      modelSelectionLabel,
+      normalizeModelSelection,
       parseList,
       parseUserIds,
       setupLanguage,
