@@ -94,6 +94,8 @@ function build(require) {
     'common.show': '显示',
     'common.hide': '隐藏',
     'common.copy': '复制',
+    'common.expand': '展开详情',
+    'common.collapse': '收起详情',
     'common.restarting': '插件重启中…',
     'common.noValue': '—',
     'status.ready': '运行中',
@@ -293,6 +295,8 @@ function build(require) {
     'common.show': 'Show',
     'common.hide': 'Hide',
     'common.copy': 'Copy',
+    'common.expand': 'Show details',
+    'common.collapse': 'Show less',
     'common.restarting': 'Restarting the plugin…',
     'common.noValue': '—',
     'status.ready': 'Running',
@@ -855,6 +859,7 @@ function build(require) {
   box-shadow: var(--dsw-elevation-soft);
   padding: 28px;
   min-width: 0;
+  overflow: hidden;
 }
 .sa-card--flat { box-shadow: none; background: var(--dsw-alias-bg-layer-2); }
 .sa-card--hero { padding: 32px; display: flex; align-items: center; gap: 26px; flex-wrap: wrap; }
@@ -895,7 +900,7 @@ function build(require) {
 .sa-row--stack { align-items: flex-start; }
 .sa-rowmain { min-width: 0; flex: 1 1 auto; }
 .sa-rowtitle { font-size: 15px; font-weight: 550; line-height: 1.7; overflow: hidden; text-overflow: ellipsis; }
-.sa-rowmeta { margin-top: 4px; font-size: 14px; color: var(--dsw-alias-label-secondary); line-height: 1.7; overflow: hidden; text-overflow: ellipsis; }
+.sa-rowmeta { margin-top: 4px; font-size: 14px; color: var(--dsw-alias-label-secondary); line-height: 1.7; overflow: hidden; text-overflow: ellipsis; overflow-wrap: anywhere; }
 .sa-rowmeta--wrap { white-space: normal; word-break: break-word; }
 .sa-rowactions { margin-left: auto; display: flex; gap: 10px; flex: 0 0 auto; }
 .sa-dot { width: 10px; height: 10px; border-radius: 50%; flex: 0 0 auto; background: var(--dsw-alias-label-tertiary); }
@@ -960,6 +965,7 @@ function build(require) {
   display: flex; align-items: flex-start; gap: 14px; padding: 14px 16px;
   border-radius: var(--dsw-radius-md); font-size: 14px; line-height: 1.7;
   border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-2);
+  overflow-wrap: anywhere; max-height: 260px; overflow: auto;
 }
 .sa-alert--error { color: var(--dsw-alias-state-error-primary); border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 30%, transparent); background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 7%, transparent); }
 .sa-alert--warn { color: var(--dsw-alias-state-warn-label); border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 30%, transparent); background: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 7%, transparent); }
@@ -1020,6 +1026,19 @@ function build(require) {
   border-radius: 6px; border: 1px solid var(--dsw-alias-border-l1);
   color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-layer-2);
 }
+.sa-detailwrap { min-width: 0; max-width: 100%; }
+.sa-detail {
+  font-size: 14px; color: var(--dsw-alias-label-secondary); line-height: 1.7;
+  overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap; max-width: 100%;
+}
+.sa-detail--clamp { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; }
+.sa-detail--hero { font-size: 15px; margin-top: 8px; }
+.sa-detaillink {
+  appearance: none; border: 0; background: transparent; color: var(--dsw-alias-link);
+  font: inherit; font-size: 13px; line-height: 1.5; padding: 3px 0 0; cursor: pointer;
+}
+.sa-detaillink:hover { text-decoration: underline; }
+.sa-detaillink:focus-visible { outline: 2px solid var(--dsw-focus-ring-color); outline-offset: 1px; border-radius: 3px; }
 .sa-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
 .sa-code {
   margin: 12px 0 0; padding: 14px 16px; border-radius: var(--dsw-radius-md);
@@ -1484,6 +1503,53 @@ function build(require) {
     )
   }
 
+  /**
+   * A long source/health detail that must not stretch its card. Collapsed text is
+   * clamped to `clamp` lines with an explicit toggle; the full text also stays
+   * available through the title tooltip. Short text renders unchanged.
+   */
+  function ExpandableDetail(props) {
+    const [expanded, setExpanded] = React.useState(false)
+    const text = typeof props.text === 'string' ? props.text : ''
+    if (text.length === 0) return null
+    const clamp = props.clamp === undefined ? 3 : props.clamp
+    const threshold = props.threshold === undefined ? 160 : props.threshold
+    const long = text.length > threshold || text.split('\n').length > clamp
+    const clamped = long && !expanded
+    const className = [
+      'sa-detail',
+      props.variant === 'hero' ? 'sa-detail--hero' : '',
+      clamped ? 'sa-detail--clamp' : '',
+    ]
+      .filter(Boolean)
+      .join(' ')
+    return h(
+      'div',
+      { className: 'sa-detailwrap' },
+      h(
+        'div',
+        {
+          className,
+          title: long ? text : undefined,
+          style: clamped ? { WebkitLineClamp: String(clamp) } : undefined,
+        },
+        text,
+      ),
+      long
+        ? h(
+            'button',
+            {
+              type: 'button',
+              className: 'sa-detaillink',
+              'aria-expanded': expanded ? 'true' : 'false',
+              onClick: () => setExpanded(value => !value),
+            },
+            expanded ? props.t('common.collapse') : props.t('common.expand'),
+          )
+        : null,
+    )
+  }
+
   function SummaryRow(props) {
     return h(
       'div',
@@ -1634,7 +1700,7 @@ function build(require) {
           'div',
           { className: 'sa-rowmain' },
           h('div', { className: 'sa-rowtitle' }, source.id || t('common.noValue')),
-          source.detail ? h('div', { className: 'sa-rowmeta' }, source.detail) : null,
+          source.detail ? h(ExpandableDetail, { t, text: source.detail, clamp: 3, threshold: 140 }) : null,
         ),
         h(Pill, { tone: source.health === 'ready' ? 'ok' : source.health === 'error' ? 'error' : 'plain' },
           t(`status.${source.health === 'ready' ? 'ready' : source.health === 'error' ? 'error' : source.health === 'starting' ? 'starting' : 'off'}`) || source.health),
@@ -1650,7 +1716,7 @@ function build(require) {
           'div',
           { className: 'sa-rowmain' },
           h('div', { className: 'sa-rowtitle' }, ticket.title || ticket.id),
-          ticket.question ? h('div', { className: 'sa-rowmeta sa-rowmeta--wrap', style: { marginTop: 3 } }, ticket.question) : null,
+          ticket.question ? h('div', { style: { marginTop: 3 } }, h(ExpandableDetail, { t, text: ticket.question, clamp: 3, threshold: 140 })) : null,
           h(
             'div',
             { className: 'sa-rowmeta', style: { marginTop: 3 } },
@@ -1738,7 +1804,7 @@ function build(require) {
           h(
             'p',
             { className: 'sa-hero-detail' },
-            plugin.detail || t('app.subtitle'),
+            h(ExpandableDetail, { t, text: plugin.detail || t('app.subtitle'), clamp: 3, threshold: 220, variant: 'hero' }),
           ),
           h(
             'div',
@@ -1870,7 +1936,7 @@ function build(require) {
                   { className: 'sa-row', key: entry.name || index },
                   h(Dot, { tone: entry.state === 'ready' ? 'ok' : entry.state === 'error' ? 'error' : 'warn' }),
                   h('div', { className: 'sa-rowmain' }, h('div', { className: 'sa-rowtitle' }, entry.name || t('common.noValue')),
-                    entry.detail ? h('div', { className: 'sa-rowmeta' }, entry.detail) : null),
+                    entry.detail ? h(ExpandableDetail, { t, text: entry.detail, clamp: 2, threshold: 120 }) : null),
                 ),
               ),
             ),
@@ -2536,7 +2602,7 @@ function build(require) {
                     'div',
                     { className: 'sa-rowmain' },
                     h('div', { className: 'sa-rowtitle' }, entry.title || entry.id || t('common.noValue')),
-                    entry.detail ? h('div', { className: 'sa-rowmeta sa-rowmeta--wrap' }, entry.detail) : null,
+                    entry.detail ? h(ExpandableDetail, { t, text: entry.detail, clamp: 3, threshold: 160 }) : null,
                   ),
                   h(Pill, { tone: stateTone(entry.state) }, stateLabel(entry.state)),
                   entry.restartRequired ? h(Pill, { tone: 'warn' }, t('common.restartRequired')) : null,
@@ -2911,7 +2977,7 @@ function build(require) {
     internals: {
       // Views are exposed for the offline render smoke test; the loader only
       // reads `inject` and `apply`.
-      views: { OverviewView, SetupView, PermissionsView },
+      views: { OverviewView, SetupView, PermissionsView, ExpandableDetail },
       API_PATHS,
       WIZARD_STEPS,
       MAX_WORKERS,

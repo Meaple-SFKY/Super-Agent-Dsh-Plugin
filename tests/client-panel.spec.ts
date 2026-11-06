@@ -55,6 +55,7 @@ interface Internals {
     OverviewView: (props: Record<string, unknown>) => unknown
     SetupView: (props: Record<string, unknown>) => unknown
     PermissionsView: (props: Record<string, unknown>) => unknown
+    ExpandableDetail: (props: Record<string, unknown>) => unknown
   }
   API_PATHS: Record<string, string>
   WIZARD_STEPS: string[]
@@ -315,6 +316,18 @@ describe('src/client/main.js', () => {
     expect(source).toContain('catch (error)')
     // The wizard polls after saving so it can wait for the plugin restart.
     expect(source).toContain('RESTART_WAIT_MS')
+  })
+
+  it('clamps long source and health details instead of stretching cards', async () => {
+    const source = await readFile(join(root, 'src', 'client', 'main.js'), 'utf8')
+    expect(source).toContain('function ExpandableDetail')
+    expect(source).toContain('sa-detail--clamp')
+    expect(source).toContain('WebkitLineClamp')
+    expect(source).toContain('sa-detaillink')
+    expect(source).toContain("'common.expand'")
+    expect(source).toContain("'common.collapse'")
+    expect(source).toContain('overflow-wrap: anywhere')
+    expect(source).toContain('overflow: hidden')
   })
 
   it('degrades to a no-op module when it cannot load', async () => {
@@ -591,5 +604,30 @@ describe('panel render smoke test', () => {
 
     react.reset()
     expect(() => internals.views.PermissionsView(permissionsProps)).not.toThrow()
+  })
+
+  it('renders long details collapsed with a toggle and short details plain', async () => {
+    const source = await readFile(join(root, 'src', 'client', 'main.js'), 'utf8')
+    const { entry } = loadClient(source)
+    const react = renderableReact()
+    const factory = entry.factory
+    if (factory === undefined) throw new Error('client module registered no factory')
+    const module = factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error(`unexpected require: ${specifier}`)
+    }) as FakeModule
+    const internals = internalsOf(module)
+    const t = (key: string) => key
+
+    react.reset()
+    const long = JSON.stringify(internals.views.ExpandableDetail({ t, text: 'boom '.repeat(80), clamp: 3, threshold: 100 }))
+    expect(long).toContain('sa-detail--clamp')
+    expect(long).toContain('common.expand')
+    expect(long).toContain('WebkitLineClamp')
+
+    react.reset()
+    const short = JSON.stringify(internals.views.ExpandableDetail({ t, text: 'ok', clamp: 3 }))
+    expect(short).not.toContain('sa-detail--clamp')
+    expect(short).not.toContain('common.expand')
   })
 })
