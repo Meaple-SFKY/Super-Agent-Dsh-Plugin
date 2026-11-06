@@ -1010,9 +1010,14 @@ function build(require) {
     const { telegram, github, repositories } = normalizeSetupAccounts(setup)
     const git = setup && typeof setup === 'object' && setup.git && typeof setup.git === 'object' ? setup.git : {}
     const existing = repositories.map(repo => repo.fullName).filter(Boolean)
+    const configured = telegram.configured === true || github.configured === true
     return {
       ...base,
       open: true,
+      // A configured install opens on the summary instead of asking for the
+      // token again; the wizard only restarts at step 0 via "Reconfigure".
+      step: configured ? 3 : 0,
+      finish: configured ? { status: 'done', error: '', elapsed: 0 } : base.finish,
       telegram: {
         ...base.telegram,
         status: telegram.configured === true ? 'validated' : 'idle',
@@ -1065,6 +1070,7 @@ function build(require) {
   }
 
   function stepStates(wizard) {
+    if (wizard.finish && wizard.finish.status === 'done') return WIZARD_STEPS.map(() => 'done')
     const states = []
     for (let index = 0; index < WIZARD_STEPS.length; index += 1) {
       if (index < wizard.step) states.push('done')
@@ -3494,7 +3500,7 @@ function build(require) {
           h(Pill, { tone: 'plain' }, t('setup.progress', { done: states.filter(state => state === 'done').length, total: WIZARD_STEPS.length }))),
       ),
       setup.error && !setup.data ? h(Alert, { tone: 'warn' }, t('setup.apiOffline')) : null,
-      configured
+      configured && !(wizard.finish && wizard.finish.status === 'done')
         ? h(Alert, { tone: 'warn' }, t('setup.configuredNotice'))
         : null,
       h(Stepper, { labels, states, current: step, ariaLabel: t('setup.title') }),
@@ -3741,10 +3747,8 @@ function build(require) {
       const data = setup.snapshot.data
       if (hydrated.current || data === undefined) return
       hydrated.current = true
-      if (!isSetupConfigured(data)) {
-        setWizard(wizardFromSetup(data))
-        setView('setup')
-      }
+      setWizard(wizardFromSetup(data))
+      if (!isSetupConfigured(data)) setView('setup')
     }, [setup.snapshot.data])
 
     React.useEffect(() => {
@@ -4082,7 +4086,8 @@ function build(require) {
     }
 
     function reconfigure() {
-      setWizard(wizardFromSetup(setup.snapshot.data || {}))
+      const next = wizardFromSetup(setup.snapshot.data || {})
+      setWizard({ ...next, step: 0, finish: { status: 'idle', error: '', elapsed: 0 } })
     }
 
     const setupWatchdogRaw = setup.snapshot.data && setup.snapshot.data.watchdog

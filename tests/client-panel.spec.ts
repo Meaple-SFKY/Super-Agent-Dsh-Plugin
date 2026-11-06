@@ -609,6 +609,9 @@ describe('setup wizard state machine', () => {
       }),
     )
     expect(configured.telegram.status).toBe('validated')
+    expect(configured.step).toBe(3)
+    expect(configured.finish.status).toBe('done')
+    expect(internals.stepStates(configured)).toEqual(['done', 'done', 'done', 'done'])
     expect(configured.telegram.botUsername).toBe('demo_bot')
     expect(configured.telegram.richText).toBe(false)
     expect(configured.telegram.files).toBe(false)
