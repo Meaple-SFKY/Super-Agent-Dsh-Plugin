@@ -1,6 +1,6 @@
 # 验证报告（独立 QA / M5）
 
-最后更新：2026-11-06 16:50（Asia/Shanghai）
+最后更新：2026-11-06 17:05（Asia/Shanghai）
 环境：DSH 0.2.2-rc.1，Node 26.13.0（bundled pnpm），macOS；`research/` 为本地提取物，不参与安装。
 范围：`src/**` 静态审计 + 隔离/恢复/E2E/打包验证；不修改 `src/`，不 commit。
 复跑入口：`./scripts/pnpmw check`（typecheck + build + 全量测试）。
@@ -9,9 +9,9 @@
 
 ## 1. 结论摘要
 
-- 全量 `./scripts/pnpmw check`：**22 个测试文件 / 268 个测试全部通过**，构建产物 `lib/index.js`、`lib/engine.js`（含拆分 chunk）与 `lib/client.js` 齐全。
-- 用户硬要求（DSH 不被拖垮、失败可见、崩溃自愈、数据不丢不坏、安静打扰、双渠道同一助手、可安装、版本兼容）**全部有自动化证据**；唯一待办是 Lead 的真实安装（§7 冒烟清单）与少量残余风险（§6）。
-- 静态审计共 18 项：**3 项高危已由 owner 修复并被回归测试锁定**（guardian 重启安全、teardown 时机、来源事件丢失），**4 项中等风险仍开放**（重复打扰消息、guardian/runtime 状态不一致、无报告结束的 Assignment、PR 绑定仅契约级验证），其余为低风险/信息项。详见 §4。
+- 全量 `./scripts/pnpmw check`：**22 个测试文件 / 279 个测试全部通过**，构建产物 `lib/index.js`、`lib/engine.js`（含拆分 chunk）与 `lib/client.js` 齐全。
+- 用户硬要求（DSH 不被拖垮、失败可见、崩溃自愈、数据不丢不坏、安静打扰、双渠道同一助手、可安装、版本兼容）均有自动化证据；**Lead 已完成真实安装**：`plugin_manager install_bundle` 返回 `application: applied`，插件 `ready`，API 200/403 正确，面板 slot 已注册（§8）。
+- 静态审计共 18 项：3 项高危 + B1/B2/B3 三项中等风险已由 owner 修复并被回归测试锁定；剩余低风险见 §4.2（B4–B6 文档/实现差距，不影响启动与打扰策略）。
 
 ## 2. 方法与可复现命令
 
@@ -53,9 +53,9 @@
 
 | # | 严重度 | 问题 | 证据（file:line） | 建议 owner |
 | --- | --- | --- | --- | --- |
-| B1 | **中** | **重复打扰**：`Engine.report` 不拒绝已 `ended` Assignment 的后续报告，也不按 `(kind, summary)` 去重；worker 同一 ticket 再报一次 `blocked/ready/failed` 会再排一条对外消息，违反“同一 Ticket 的多个进展合并/最多一条”。 | `src/core/engine.ts:858-931`（找到 assignment 后无 `state` 检查）；绑定在 `src/app/sessions.ts` 直到 interrupt/end 才清除 | core-engine（+ runtime 绑定生命周期） |
-| B2 | **中** | **guardian 状态与 runtime 状态可能相反**：引擎 chunk 能加载但 Runtime 初始化失败（如 host 缺 `agents` 服务）时，`startRuntime` 内部 catch 后仍返回 handle → guardian 写 `status: ready`，watchdog 判健康，而插件实际不可用。实测证据：guardian `bootState()={"status":"ready"}`，同时日志 `SuperAgent failed to initialize … agents is unavailable`。 | `src/app/runtime.ts:379-382`（ready 内部消化错误）、`src/engine.ts:51-55`（总是返回 handle）、`src/index.ts:452`（置 ready） | packaging + runtime（engine.start 返回状态/getter，或 runtime 初始化失败时停止并 rethrow；guardian 读状态） |
-| B3 | **中** | **worker 回合结束但没报告 → 静默停摆**：`turnEnded` 把 assignment 置 `ended`，watchdog 只扫描 `state==='running'`，于是 ticket 无 running/pending assignment、无重试、无对外提示，直到人再发消息（`deliverOrLaunch` 才新建 assignment）。 | `src/core/engine.ts:831-845`；`src/app/watchdog.ts:96-99,126-132` | runtime/core-engine（turn 结束无报告时记 stall 并重试/通知，或 watchdog 也扫描“open 且无 assignment”的 ticket） |
+| B1 | 中→已修 | **重复打扰**：`Engine.report` 不拒绝已 `ended` Assignment，也不按 `(kind, summary)` 去重。 | 现 `src/core/engine.ts` report()：ended assignment 直接返回；同 assignment 同 `(kind, summary)` 幂等；blocked→ready 不同 kind 仍生效。回归见 `tests/core-ticket.spec.ts`（4 例） | ✅ core-engine |
+| B2 | 中→已修 | **guardian 状态与 runtime 相反**：Runtime 初始化失败仍返回 handle → guardian 记 ready。 | 现 Runtime 暴露 `status`/`detail`；`start()` 非 ready 时先 stop 再 throw（detail 经 redact）；`tests/runtime-watchdog.spec.ts` 缺 agents/invalid config 用例 | ✅ runtime |
+| B3 | 中→已修 | **回合结束无报告 → 静默停摆**。 | 现 watchdog 第二扫描：open + 无 terminal report + 无 pending/running assignment + 静默超阈值 → 最多 2 次 retryTicket（KV 计数跨重启），用尽后 `watchdog:silent` health error；测试覆盖 | ✅ runtime |
 | B4 | 低 | `store.migrate()` 先执行全部 `CREATE TABLE IF NOT EXISTS` 再读 `schema_version`；打开“更新 schema”的库时会先补表再拒绝（拒绝本身已验证无损：integrity ok、数据不变）。 | `src/app/store.ts:846-950`（DDL 在版本检查前） | core-engine（先读 meta 再 DDL） |
 | B5 | 低 | 首次渲染 prompt 时用 `readFileSync` 同步读盘（一次性、阻塞 host 事件循环数十 µs 级）。 | `src/prompts/index.ts:54`（`loadMarkdown`），缓存后不再读 | runtime（改异步或在启动期预载） |
 | B6 | 低 | `quiet.quietHours` 被 `RuntimeConfig` 类型接受但无实现，`docs/000-architecture.md` §5 仍称“可选时段”。 | `src/app/runtime.ts:103`、`src/core/engine.ts:43` 仅类型 | runtime（实现或从类型/文档移除） |
@@ -90,11 +90,11 @@
 
 ## 6. 未验证 / 残余风险
 
-1. **真实 DSH 安装与宿主启动**（Lead 执行）：`plugin_manager install_bundle` 的 npm/local 路径解析、profile patch 合并、`fiberPhase`、真实 DSH 0.2.2-rc.1 下的 engine chunk 加载、client bundle 服务路径。见 §7 清单。
-2. **Web 面板渲染**：只做了 manifest/模块静态校验（`slots`/`locale`/`id`/`/superagent/api` 路径与 header）；未在真实浏览器挂载页面，slot props 与样式未验证（`docs/dsh-types-verified.md` §6 同样标注 client 注册未验证）。
+1. ~~**真实 DSH 安装与宿主启动**（Lead 执行）~~ **已完成（§8）**：桌面版 `desktop` profile 安装成功、插件 ready、API 与面板 slot 正常。仍未验证：卸载、坏配置重启后的降级（黑盒测试覆盖，但未在真实宿主注入）。
+2. **Web 面板视觉渲染**：slot 注册已在真实 client（`sidebar.panellist` occupant `superagent`、`main` key `superagent`）确认 active；未做截图/点击级验证（本环境无浏览器控制），按钮请求路径已由 mock + API 实测覆盖。
 3. **真实 Telegram/GitHub 网络**：假 HTTP 覆盖了轮询/游标/发送/幂等 marker，但真实限速、长轮询超时、token 失效、GitHub Secondary Rate Limit 未打到真实服务。
 4. **真实模型行为**：Router/Worker 的语义决策、quiet policy 的“模型不乱说话”、报告格式均用模拟 host 的 tool 调用验证，未用真实 LLM。
-5. **B1 重复打扰、B2 状态不一致、B3 无报告停摆**：代码/探针证据在 §4.2，未做自动化回归（需要 owner 先决定语义）。
+5. ~~**B1/B2/B3**~~ **已修复并回归**（§4.2）：B1 core-ticket 4 例，B2 runtime-watchdog 4 例，B3 watchdog 5 例；全量 279 绿。
 6. **PR 绑定 glue**（A4）：source 回调 payload（含 `thread`）有 owner 测试，runtime `onPullOpened`→`bindThread` 仅代码核对；尝试在 E2E 中通过注入 source 验证时发现注入路径不经过 runtime 的 callback 装配（runtime 自建 source 才装配），故未纳入自动化；建议真实安装后用一次真实/回放 PR 验证。
 7. **watchdog/launchd**：`scripts/watchdog.mjs`、`install-launchd.sh`、`setup.mjs` 仅静态审查（无 secret 打印、参数校验、退避/上限逻辑），未执行 `launchctl`。
 8. **多 worker 并发**（`executor.maxWorkers>1`）：core/runtime 单测覆盖部分，E2E 用 1–2 个 worker，未做并发压力/锁竞争测试。
@@ -140,3 +140,21 @@ Tests 19 passed — verify-flow(5) + verify-plugin-boot(5) + verify-packaging(9)
 ```
 
 证据缺口（诚实声明）：§6 的 1–9 项均无自动化证据；其余结论均可由上述命令复现。
+
+## 8. 真实安装记录（2026-11-06 17:00，Lead）
+
+环境：DSH Desktop 0.2.2-rc.1，profile `desktop`，Node 24.21.0，stateDir `~/.dsh/state/superagent`。
+
+| 检查 | 结果 |
+| --- | --- |
+| profile patch 写入配置行（`scripts/setup.mjs --profile desktop --write-patch`） | ✅ 原文件已备份到 `/tmp/cordis.patch.yml.backup-*`，追加 `dsh-superagent-personal` 配置行（sources 暂关闭、observe） |
+| `plugin_manager install_bundle`（绝对路径、link 安装） | ✅ `application: applied`；profile pnpm 链接成功，无 `engines` 警告（仅 peer 链接提示） |
+| 插件状态文件 | ✅ `superagent-status.json`: `status:"ready"`、`dshVersion:"0.2.2-rc.1"`；无 `superagent-degraded.json` |
+| 心跳 | ✅ `superagent-heartbeat.json` 新鲜（pid 存在、`router:true`、`safeMode:false`） |
+| 管理 API | ✅ `GET /superagent/api/state`（带 `x-superagent-request: 1`）返回 `ok:true`、`plugin.status=ready`、health runtime/effects/sessions:router ready；**无 header → 403** |
+| 面板 slot | ✅ client `Slots.listSubTree`: `sidebar.panellist` 有 occupant `superagent`（order 20，active），`main` 有 key `superagent`（active） |
+| 看门狗 | ✅ `watchdog.mjs --dry-run --json` → `healthy`；`install-launchd.sh --dry-run` 渲染 plist 成功（未 `launchctl load`） |
+| token 泄漏 | ✅ status/heartbeat/API 响应中 grep token 前缀 0 命中 |
+| 提交与推送 | ✅ `main` 已推送到 `github.com/Meaple-SFKY/Super-Agent-Dsh-Plugin` |
+
+待完成（需要操作者）：写入 Telegram bot token、GitHub PAT（`~/.config/superagent/`，600）、填写 allowedUserIds/repositories/login，启用 sources 并重启插件；之后按 §7 复核 `/status`、真实消息链路与 watchdog 安装。
