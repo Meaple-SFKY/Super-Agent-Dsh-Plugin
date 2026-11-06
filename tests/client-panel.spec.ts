@@ -318,6 +318,48 @@ describe('src/client/main.js', () => {
     expect(source).toContain('RESTART_WAIT_MS')
   })
 
+  it('follows the DSH-native rhythm, card and control sizes across all tabs', async () => {
+    const source = await readFile(join(root, 'src', 'client', 'main.js'), 'utf8')
+    // One page wrapper: flex column, 24px rhythm, used by all three tabs.
+    expect(source).toContain('.sa-page { display: flex; flex-direction: column; gap: 24px; }')
+    expect((source.match(/sa-page sa-fade/g) ?? []).length).toBe(3)
+    // Native content width and one grid gap (20px) everywhere.
+    expect(source).toContain('.sa-main { max-width: 960px;')
+    expect(source).toContain('.sa-grid { display: grid; gap: 20px; }')
+    expect(source).toContain('.sa-grid--stats { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }')
+    expect(source).toContain('.sa-grid--two { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }')
+    expect(source).not.toContain('grid-gap')
+    expect(source).not.toMatch(/gap:\s*(32|36|40|44)px/)
+    // Native card: 0.5px border, theme radius, layer-1 background, no heavy shadow.
+    expect(source).toMatch(/\.sa-card \{[\s\S]*?border: \.5px solid var\(--dsw-alias-border-l2\);/)
+    expect(source).toMatch(/\.sa-card \{[\s\S]*?border-radius: var\(--dsw-radius-lg\);/)
+    expect(source).toMatch(/\.sa-card \{[\s\S]*?background: var\(--dsw-alias-bg-layer-1\);/)
+    expect(source).toMatch(/\.sa-card \{[\s\S]*?padding: 20px;/)
+    expect(source).toContain('.sa-card--hero { padding: 24px;')
+    expect(source).not.toContain('0 6px 22px')
+    // Native text scale.
+    expect(source).toMatch(/\.sa-root \{[\s\S]*?font-size: 13px;/)
+    expect(source).toMatch(/\.sa-root \{[\s\S]*?line-height: 20px;/)
+    expect(source).toContain('.sa-stat-value { font-size: 28px;')
+    expect(source).toContain('.sa-stat-label {')
+    // Control and rhythm sizes.
+    expect(source).toContain('margin-bottom: 12px;')
+    expect(source).toContain('.sa-field { display: flex; flex-direction: column; gap: 12px; min-width: 0; }')
+    expect(source).toContain('.sa-inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }')
+    expect(source).toContain('.sa-list { display: flex; flex-direction: column; gap: 8px; }')
+    expect(source).toMatch(/\.sa-btn \{[\s\S]*?height: 32px;/)
+    expect(source).toContain('.sa-btn--sm { height: 28px;')
+    expect(source).toMatch(/\.sa-input, \.sa-textarea, \.sa-select \{[\s\S]*?min-height: 40px;/)
+    expect(source).toContain('border: .5px solid var(--dsw-alias-border-l4);')
+    expect(source).toMatch(/\.sa-row \{[\s\S]*?min-height: 44px;/)
+    expect(source).toContain('border-bottom: .5px solid var(--dsw-alias-border-l2);')
+    expect(source).toContain('@media (max-width: 900px)')
+    // Tab roots use the shared class; only the four wizard step bodies keep the
+    // bare animation class (they are single cards inside the page rhythm).
+    expect((source.match(/className: 'sa-fade'/g) ?? []).length).toBe(4)
+    expect(source).not.toMatch(/style: \{ display: 'flex', flexDirection: 'column', gap: (12|16|20|24|28|32) \}/)
+  })
+
   it('clamps long source and health details instead of stretching cards', async () => {
     const source = await readFile(join(root, 'src', 'client', 'main.js'), 'utf8')
     expect(source).toContain('function ExpandableDetail')
