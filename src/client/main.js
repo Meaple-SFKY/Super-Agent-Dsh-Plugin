@@ -1067,7 +1067,7 @@ function build(require) {
 .sa-kv { display: flex; align-items: baseline; gap: 12px; font-size: 14px; line-height: 1.7; padding: 6px 0; }
 .sa-kv-key { color: var(--dsw-alias-label-secondary); flex: 0 0 auto; }
 .sa-kv-val { min-width: 0; word-break: break-word; }
-.sa-fade { animation: sa-fade .18s ease-out; }
+.sa-fade { animation: sa-fade .18s ease-out; display: flex; flex-direction: column; gap: 44px; }
 .sa-footerbar { display: flex; align-items: center; gap: 12px; margin-top: 28px; flex-wrap: wrap; }
 .sa-footerbar .sa-spacer { flex: 1 1 auto; }
 .sa-toast {
