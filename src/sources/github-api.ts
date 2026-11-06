@@ -219,7 +219,12 @@ export interface GithubRepo {
 /** A repository invitation as the REST API returns it (pending only). */
 export interface GithubInvitation {
   id: number
-  repository?: { full_name?: string; private?: boolean; html_url?: string }
+  repository?: {
+    full_name?: string
+    private?: boolean
+    html_url?: string
+    owner?: { login?: string }
+  }
   invitee?: { login?: string }
   inviter?: { login?: string }
   permissions?: string
@@ -418,6 +423,35 @@ export interface GithubSearchResult {
   items: GithubIssue[]
 }
 
+/** A GitHub notification from `GET /notifications`. */
+export interface GithubNotification {
+  id: string
+  unread?: boolean
+  reason?: string
+  updated_at?: string
+  subject?: { title?: string; url?: string; type?: string }
+  repository?: { full_name?: string }
+}
+
+/** Primary rate-limit information observed on the most recent response. */
+export interface GithubRateLimitSnapshot {
+  limit?: number
+  remaining?: number
+  /** Epoch milliseconds at which the window resets. */
+  resetAt?: number
+  retryAfterMs?: number
+  observedAt?: number
+}
+
+/** Request counters for health reporting and quota budgeting. */
+export interface GithubApiStats {
+  requests: number
+  notModified: number
+  retries: number
+  rateLimitedResponses: number
+  rateLimit: GithubRateLimitSnapshot
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -505,6 +539,8 @@ export class GithubApi {
   private readonly timeoutMs: number
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>
   private readonly tokenProvider: () => Promise<string>
+  private readonly counters = { requests: 0, notModified: 0, retries: 0, rateLimitedResponses: 0 }
+  private rateLimitState: GithubRateLimitSnapshot = {}
 
   constructor(options: GithubApiOptions) {
     this.baseUrl = (options.baseUrl ?? 'https://api.github.com').replace(/\/+$/, '')
@@ -521,6 +557,40 @@ export class GithubApi {
       this.tokenProvider = async () => literal
     } else {
       this.tokenProvider = options.token
+    }
+  }
+
+  /** Cumulative request counters plus the latest rate-limit snapshot. */
+  stats(): GithubApiStats {
+    return { ...this.counters, rateLimit: { ...this.rateLimitState } }
+  }
+
+  /** Reset only the counters (the rate-limit snapshot is kept). */
+  resetStats(): void {
+    this.counters.requests = 0
+    this.counters.notModified = 0
+    this.counters.retries = 0
+    this.counters.rateLimitedResponses = 0
+  }
+
+  private recordRateLimit(headers: Headers): void {
+    const observedAt = Date.now()
+    const headerNumber = (name: string): number => {
+      const raw = headers.get(name)
+      if (raw === null || raw.trim() === '') return Number.NaN
+      return Number(raw)
+    }
+    const limit = headerNumber('x-ratelimit-limit')
+    const remaining = headerNumber('x-ratelimit-remaining')
+    const reset = headerNumber('x-ratelimit-reset')
+    const retryAfterMs = this.retryAfter(headers)
+    this.rateLimitState = {
+      ...this.rateLimitState,
+      observedAt,
+      ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}),
+      ...(Number.isFinite(remaining) && remaining >= 0 ? { remaining } : {}),
+      ...(Number.isFinite(reset) && reset > 0 ? { resetAt: reset * 1000 } : {}),
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
     }
   }
 
@@ -594,6 +664,7 @@ export class GithubApi {
           error.status >= 500 ||
           (error.status === 403 && error.rateLimited)
         if (!retryable || attempt >= attempts) throw error
+        this.counters.retries += 1
         const delay = Math.min(this.maxDelayMs, error.retryAfterMs ?? this.backoff(attempt))
         await this.sleep(delay, options.signal)
       }
@@ -646,6 +717,10 @@ export class GithubApi {
     }
     const notModified = response.status === 304
     const etag = response.headers.get('etag') ?? undefined
+    this.counters.requests += 1
+    if (notModified) this.counters.notModified += 1
+    if (response.status === 429 || response.status === 403) this.counters.rateLimitedResponses += 1
+    this.recordRateLimit(response.headers)
     return {
       status: response.status,
       headers: response.headers,
@@ -1033,6 +1108,24 @@ export class GithubApi {
     return { status: result.status }
   }
 
+  /**
+   * Notifications for the authenticated user (`GET /notifications`), newest
+   * first. This is the cheap cross-repository "something happened" stream used
+   * to decide which repositories need a full poll.
+   */
+  async listNotifications(
+    options: { since?: string; all?: boolean; etag?: string; perPage?: number; maxPages?: number; signal?: AbortSignal } = {},
+  ): Promise<GithubPage<GithubNotification>> {
+    const params: string[] = [`all=${options.all === true ? 'true' : 'false'}`]
+    if (options.since) params.push(`since=${encodeURIComponent(options.since)}`)
+    return this.paginate<GithubNotification>(`/notifications?${params.join('&')}`, {
+      ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.etag ? { etag: options.etag } : {}),
+      ...(options.perPage !== undefined ? { perPage: options.perPage } : {}),
+      maxPages: options.maxPages ?? 2,
+    })
+  }
+
   /** Create a repository under the authenticated user's account. */
   async createRepository(
     input: { name: string; private?: boolean; description?: string; autoInit?: boolean; signal?: AbortSignal },
@@ -1055,7 +1148,7 @@ export class GithubApi {
     since: string,
     options: { signal?: AbortSignal; etag?: string; maxPages?: number } = {},
   ): Promise<GithubPage<GithubIssue>> {
-    const query = `state=open&sort=updated&direction=asc&since=${encodeURIComponent(since)}`
+    const query = `state=open&sort=updated&direction=desc&since=${encodeURIComponent(since)}`
     return this.paginate<GithubIssue>(`/repos/${repoPath(repo)}/issues?${query}`, options)
   }
 
@@ -1146,7 +1239,7 @@ export class GithubApi {
   async listPullReviews(
     repo: string,
     number: number,
-    options: { signal?: AbortSignal; maxPages?: number } = {},
+    options: { signal?: AbortSignal; maxPages?: number; etag?: string } = {},
   ): Promise<GithubPage<GithubReview>> {
     return this.paginate<GithubReview>(`/repos/${repoPath(repo)}/pulls/${number}/reviews`, {
       ...options,
@@ -1583,6 +1676,67 @@ export async function acceptRepositoryInvitation(
   } catch (error) {
     if (error instanceof GithubApiError && error.status === 422) {
       return { ok: true, invitationId: id, status: 'already-accepted-or-gone' }
+    }
+    throw error
+  }
+}
+
+/** Result of {@link acceptInvitationForRepo}. */
+export interface AcceptInvitationForRepoResult {
+  ok: true
+  /** The matched repository (`owner/name`), or the normalized input when none. */
+  repo: string
+  status: 'accepted' | 'none' | 'already-accepted-or-gone'
+  invitationId?: number
+}
+
+/**
+ * Accept the pending repository invitation for `owner/name`, if the token's
+ * account has one (typically the operator invited the bot into a repository).
+ *
+ * Matching is case-insensitive. Outcomes:
+ * - `accepted` — the invitation existed and PATCH succeeded;
+ * - `already-accepted-or-gone` — GitHub answered 404/422 on PATCH (already a
+ *   collaborator, revoked or expired), the same end state for automation;
+ * - `none` — no such invitation is pending; nothing is patched.
+ *
+ * Stateless, token-free errors; 401/403/429/network and other failures throw
+ * {@link GithubApiError}.
+ */
+export async function acceptInvitationForRepo(
+  token: string,
+  repo: string,
+  options: SetupHelperOptions = {},
+): Promise<AcceptInvitationForRepoResult> {
+  const normalized = repo.trim()
+  const match = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(normalized)
+  if (!match) {
+    throw new GithubApiError({
+      status: 422,
+      method: 'GET',
+      path: '/user/repository_invitations',
+      details: 'invalid repository name (expected owner/name)',
+    })
+  }
+  const target = `${match[1]}/${match[2]}`
+  const api = setupApi(token, options)
+  const page = await api.listRepositoryInvitations({ maxPages: 2, perPage: 100 })
+  const invitation = page.items.find(
+    item => (item.repository?.full_name ?? '').toLowerCase() === target.toLowerCase(),
+  )
+  if (!invitation) return { ok: true, repo: target, status: 'none' }
+  const matchedRepo = invitation.repository?.full_name ?? target
+  try {
+    const result = await api.acceptRepositoryInvitation(invitation.id)
+    return {
+      ok: true,
+      repo: matchedRepo,
+      status: result.status === 204 ? 'accepted' : 'already-accepted-or-gone',
+      invitationId: invitation.id,
+    }
+  } catch (error) {
+    if (error instanceof GithubApiError && error.status === 422) {
+      return { ok: true, repo: matchedRepo, status: 'already-accepted-or-gone', invitationId: invitation.id }
     }
     throw error
   }

@@ -31,10 +31,14 @@ export interface GithubToolOptions {
   fetchImpl?: typeof fetch
   /**
    * GitHub logins automatically invited (permission: admin) when
-   * `superagent_github action=create_repository` creates a repository.
-   * Overridable per call with the tool's `collaborators` argument.
+   * `superagent_github action=create_repository` creates a repository. The
+   * invite list comes from configuration only (the tool has no per-call arg).
    */
   collaborators?: string[]
+  /** Authenticated GitHub account login (used for wildcard repo-owner checks). */
+  login?: string
+  /** Personal (operator) PAT file used to auto-accept repository invitations. */
+  operatorTokenFile?: string
 }
 
 export interface ToolDeps {
@@ -47,6 +51,8 @@ export interface ToolDeps {
   idPrefix?: string
   /** GitHub credentials for `superagent_github`; resolved from env/secret file when absent. */
   github?: GithubToolOptions
+  /** Wake the runtime pipeline after a committed command (event-driven fast path). */
+  wake?: () => void
 }
 
 export function clockOf(deps: ToolDeps): () => IsoTime {

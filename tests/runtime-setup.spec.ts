@@ -8,7 +8,18 @@
  * the HTTP fence/ordering through `registerApi`.
  */
 
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+  mkdirSync,
+} from 'node:fs'
+import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -17,7 +28,9 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   SetupService,
   SETUP_MODELS_PATH,
+  SETUP_OPERATOR_PATH,
   SETUP_SSH_KEY_PATH,
+  SETUP_WATCHDOG_PATH,
   SETUP_CONFIG_PATH,
   SETUP_GITHUB_PATH,
   SETUP_PERMISSIONS_PATH,
@@ -461,16 +474,25 @@ describe('setup wizard backend', () => {
 })
 
 describe('setup HTTP routes', () => {
-  function makeApi(harness: Harness): { web: FakeWebServer; dispose: () => void } {
+  function makeApi(
+    harness: Harness,
+    options: { connection?: unknown; warnings?: string[] } = {},
+  ): { web: FakeWebServer; dispose: () => void } {
     const web = new FakeWebServer()
-    const ctx = { get: (name: string) => (name === 'webServer' ? web : undefined) } as unknown as Context
+    const ctx = {
+      get: (name: string) => {
+        if (name === 'webServer') return web
+        if (name === 'connection') return options.connection
+        return undefined
+      },
+    } as unknown as Context
     const dispose = registerApi(ctx, {
       state: () => {
         throw new Error('not used')
       },
       action: () => ({ ok: false, error: 'not used' }),
       setup: harness.service,
-      logger: { warn: () => undefined },
+      logger: { warn: (message: string) => options.warnings?.push(message) },
     })
     return { web, dispose }
   }
@@ -490,13 +512,18 @@ describe('setup HTTP routes', () => {
     const api = makeApi(harness)
     for (const path of [
       SETUP_STATE_PATH,
+      SETUP_PERMISSIONS_PATH,
+      SETUP_MODELS_PATH,
       SETUP_TELEGRAM_PATH,
       SETUP_GITHUB_PATH,
+      SETUP_SSH_KEY_PATH,
+      SETUP_WATCHDOG_PATH,
+      SETUP_OPERATOR_PATH,
       SETUP_CONFIG_PATH,
-      SETUP_PERMISSIONS_PATH,
     ]) {
       expect(api.web.route(path)).toBeDefined()
     }
+    expect(api.web.routes).toHaveLength(11) // state/action + 9 setup routes
 
     const forbidden = await invoke(api.web, SETUP_STATE_PATH, new FakeRequest({}))
     expect(forbidden.statusCode).toBe(403)
@@ -507,6 +534,70 @@ describe('setup HTTP routes', () => {
     expect(ok.statusCode).toBe(200)
     expect(ok.json<{ ok: boolean }>().ok).toBe(true)
     api.dispose()
+    expect(api.web.routes).toHaveLength(0)
+  })
+
+  it('applies the host connection fence when available', async () => {
+    const harness = makeHarness()
+    const api = makeApi(harness, { connection: { requestRejection: () => 403 as const } })
+    const rejected = await invoke(api.web, SETUP_STATE_PATH, new FakeRequest({ headers: { [API_HEADER]: '1' } }))
+    expect(rejected.statusCode).toBe(403)
+    expect(rejected.json<{ error: string }>().error).toBe('forbidden')
+
+    api.dispose()
+    const unauthorized = makeApi(harness, { connection: { requestRejection: () => 401 as const } })
+    const response = await invoke(unauthorized.web, SETUP_MODELS_PATH, new FakeRequest({ headers: { [API_HEADER]: '1' } }))
+    expect(response.statusCode).toBe(401)
+    expect(response.json<{ error: string }>().error).toBe('unauthorized')
+    unauthorized.dispose()
+  })
+
+  it('degrades explicitly without a connection service: loopback Host/Origin checks', async () => {
+    const harness = makeHarness()
+    const warnings: string[] = []
+    const api = makeApi(harness, { warnings })
+    const evilOrigin = await invoke(
+      api.web,
+      SETUP_STATE_PATH,
+      new FakeRequest({ headers: { [API_HEADER]: '1', origin: 'https://evil.example' } }),
+    )
+    expect(evilOrigin.statusCode).toBe(403)
+    const evilHost = await invoke(
+      api.web,
+      SETUP_STATE_PATH,
+      new FakeRequest({ headers: { [API_HEADER]: '1', host: 'evil.example' } }),
+    )
+    expect(evilHost.statusCode).toBe(403)
+    const loopback = await invoke(
+      api.web,
+      SETUP_STATE_PATH,
+      new FakeRequest({ headers: { [API_HEADER]: '1', origin: 'http://127.0.0.1:1234', host: '127.0.0.1:1234' } }),
+    )
+    expect(loopback.statusCode).toBe(200)
+    expect(warnings.some(line => line.includes('connection service is unavailable'))).toBe(true)
+    api.dispose()
+  })
+
+  it('does not throw or duplicate routes when registered twice', async () => {
+    const harness = makeHarness()
+    const web = new FakeWebServer()
+    const ctx = { get: (name: string) => (name === 'webServer' ? web : undefined) } as unknown as Context
+    const deps = {
+      state: () => {
+        throw new Error('not used')
+      },
+      action: () => ({ ok: false, error: 'not used' }),
+      setup: harness.service,
+      logger: { warn: () => undefined },
+    }
+    const first = registerApi(ctx, deps)
+    expect(() => registerApi(ctx, deps)).not.toThrow()
+    expect(web.routes).toHaveLength(11)
+    first()
+    expect(web.routes).toHaveLength(0)
+    const second = registerApi(ctx, deps)
+    expect(web.routes).toHaveLength(11)
+    second()
   })
 
   it('saves a token through the route and never echoes it', async () => {
@@ -556,6 +647,41 @@ describe('setup HTTP routes', () => {
     expect(order[0]).toBe('schedule')
     expect(order[1]).toBe('edit:dsh-superagent-personal')
     expect(order[2]).toBe('response')
+  })
+})
+
+describe('runtime route lifecycle (task-49)', () => {
+  it('releases every route on stop and re-registers cleanly on restart', async () => {
+    const stateDir = tempStateDir()
+    const host = createFakeHost()
+    const store = createMemoryStore()
+    const make = (): Runtime =>
+      new Runtime(
+        host.ctx as unknown as Context,
+        {
+          stateDir,
+          sources: { telegram: { enabled: false }, github: { enabled: false } },
+          policy: { mode: 'observe' },
+          passIntervalMs: 60_000,
+          heartbeatIntervalMs: 60_000,
+          watchdog: { intervalMs: 60_000 },
+        },
+        { store, sources: [], skipLock: true },
+      )
+
+    const first = make()
+    await first.ready
+    expect(host.webServer.routes).toHaveLength(11)
+    const firstPaths = host.webServer.routes.map(route => route.path).sort()
+    expect(new Set(firstPaths).size).toBe(11)
+    await first.stop()
+    expect(host.webServer.routes).toHaveLength(0)
+
+    const second = make()
+    await second.ready
+    expect(host.webServer.routes).toHaveLength(11)
+    expect(host.webServer.routes.map(route => route.path).sort()).toEqual(firstPaths)
+    await second.stop()
   })
 })
 
@@ -645,6 +771,12 @@ describe('runtime setup wiring', () => {
     try {
       await runtime.ready
       expect(runtime.status).toBe('ready')
+      // The watchdog writes the uninstall state marker once it starts.
+      const marker = JSON.parse(readFileSync(join(stateDir, '.superagent-state'), 'utf8')) as {
+        plugin: string
+        markerVersion: number
+      }
+      expect(marker).toMatchObject({ plugin: 'dsh-superagent-personal', markerVersion: 1 })
       expect(host.webServer.route(SETUP_STATE_PATH)).toBeDefined()
       expect(host.webServer.route(SETUP_PERMISSIONS_PATH)).toBeDefined()
 
@@ -1104,5 +1236,292 @@ describe('setup watchdog toggle (task-36)', () => {
     } finally {
       await runtime.stop()
     }
+  })
+})
+
+describe('stale state-directory lock recovery (task-49)', () => {
+  const lockPathFor = (stateDir: string): string => `${stateDir}.lock`
+  const pidPathFor = (stateDir: string): string => join(stateDir, 'runtime.pid')
+
+  function createLock(stateDir: string, pid?: number): void {
+    mkdirSync(stateDir, { recursive: true })
+    mkdirSync(lockPathFor(stateDir), { recursive: true })
+    if (pid !== undefined) {
+      writeFileSync(pidPathFor(stateDir), JSON.stringify({ pid, at: new Date().toISOString() }), { mode: 0o600 })
+    }
+  }
+
+  async function startRuntimeWithLock(stateDir: string): Promise<Runtime> {
+    const host = createFakeHost()
+    const runtime = new Runtime(
+      host.ctx as unknown as Context,
+      {
+        stateDir,
+        sources: { telegram: { enabled: false }, github: { enabled: false } },
+        policy: { mode: 'observe' },
+        passIntervalMs: 60_000,
+        heartbeatIntervalMs: 60_000,
+        watchdog: { intervalMs: 60_000 },
+      },
+      { store: createMemoryStore(), sources: [], skipLock: false },
+    )
+    await runtime.ready
+    return runtime
+  }
+
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) {
+      rmSync(lockPathFor(dir), { recursive: true, force: true })
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 })
+    }
+  })
+
+  it('removes a lock whose recorded PID is dead', async () => {
+    const stateDir = tempStateDir()
+    createLock(stateDir, 999_999)
+    const runtime = await startRuntimeWithLock(stateDir)
+    try {
+      expect(runtime.status).toBe('ready')
+      const record = JSON.parse(readFileSync(pidPathFor(stateDir), 'utf8')) as { pid: number }
+      expect(record.pid).toBe(process.pid)
+    } finally {
+      await runtime.stop()
+    }
+    expect(existsSync(lockPathFor(stateDir))).toBe(false)
+  })
+
+  it('removes a lock left by a previous in-process runtime (same PID)', async () => {
+    const stateDir = tempStateDir()
+    createLock(stateDir, process.pid)
+    const runtime = await startRuntimeWithLock(stateDir)
+    try {
+      expect(runtime.status).toBe('ready')
+    } finally {
+      await runtime.stop()
+    }
+  })
+
+  it('removes an old lock that has no PID record (30 s threshold)', async () => {
+    const stateDir = tempStateDir()
+    createLock(stateDir)
+    const old = new Date(Date.now() - 60_000)
+    utimesSync(lockPathFor(stateDir), old, old)
+    const runtime = await startRuntimeWithLock(stateDir)
+    try {
+      expect(runtime.status).toBe('ready')
+    } finally {
+      await runtime.stop()
+    }
+  })
+
+  it('fails fast and clearly for a recent lock with no PID record', async () => {
+    const stateDir = tempStateDir()
+    createLock(stateDir)
+    const runtime = await startRuntimeWithLock(stateDir)
+    try {
+      expect(runtime.status).toBe('degraded')
+      expect(runtime.detail ?? '').toContain('unknown process')
+    } finally {
+      await runtime.stop()
+    }
+  })
+
+  it('fails fast while a live foreign process owns the lock', async () => {
+    const stateDir = tempStateDir()
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 15000)'], { stdio: 'ignore' })
+    try {
+      await new Promise(resolve => child.once('spawn', resolve))
+      createLock(stateDir, child.pid!)
+      const runtime = await startRuntimeWithLock(stateDir)
+      try {
+        expect(runtime.status).toBe('degraded')
+        expect(runtime.detail ?? '').toContain('locked by a running SuperAgent process')
+      } finally {
+        await runtime.stop()
+      }
+    } finally {
+      child.kill('SIGKILL')
+    }
+  })
+
+  it('releases the lock and PID file on stop, so a restart acquires it again', async () => {
+    const stateDir = tempStateDir()
+    const first = await startRuntimeWithLock(stateDir)
+    expect(first.status).toBe('ready')
+    expect(existsSync(pidPathFor(stateDir))).toBe(true)
+    await first.stop()
+    expect(existsSync(lockPathFor(stateDir))).toBe(false)
+
+    const second = await startRuntimeWithLock(stateDir)
+    try {
+      expect(second.status).toBe('ready')
+    } finally {
+      await second.stop()
+    }
+  })
+})
+
+describe('personal (operator) PAT bootstrap (task-52)', () => {
+  interface OperatorHarness {
+    harness: Harness
+    calls: Array<{ kind: string; args: unknown[] }>
+    operatorFile: string
+  }
+
+  async function makeOperatorHarness(options: { failRepo?: string } = {}): Promise<OperatorHarness> {
+    const calls: Array<{ kind: string; args: unknown[] }> = []
+    const harness = makeHarness({
+      loadGithubHelpers: async () => ({
+        async validate(token: string) {
+          if (token === 'bad') {
+            throw Object.assign(new Error('GitHub token check failed: HTTP 401: Bad credentials'), {
+              name: 'GithubTokenValidationError',
+              status: 401,
+            })
+          }
+          return { login: 'operator-user' }
+        },
+        async listRepositories() {
+          return []
+        },
+        async addCollaborator(token, repo, login, permission) {
+          calls.push({ kind: 'add', args: [token, repo, login, permission] })
+          if (repo === options.failRepo) {
+            throw Object.assign(new Error(`forbidden on ${repo}`), { status: 403 })
+          }
+          return { alreadyCollaborator: false }
+        },
+        async acceptForRepo(token, repo) {
+          calls.push({ kind: 'accept', args: [token, repo] })
+          return { status: 'accepted', invitationId: 11 }
+        },
+      }),
+    })
+    const github = harness.config.sources as { github: Record<string, unknown> }
+    github.github.login = 'bot-user'
+    github.github.repositories = ['octocat/one', 'octocat/two']
+    mkdirSync(join(harness.stateDir, 'secrets'), { recursive: true, mode: 0o700 })
+    writeFileSync(join(harness.stateDir, 'secrets', 'github-token'), 'ghp_bot_token', { mode: 0o600 })
+    return {
+      harness,
+      calls,
+      operatorFile: join(harness.stateDir, 'secrets', 'github-operator-token'),
+    }
+  }
+
+  it('invites the bot as a push collaborator, accepts invitations and saves the PAT 0600', async () => {
+    const { harness, calls, operatorFile } = await makeOperatorHarness()
+    const result = await harness.service.saveOperatorToken({ token: 'op-secret-token' })
+    expect(result.status).toBe(200)
+    expect(result.body).toMatchObject({
+      ok: true,
+      login: 'operator-user',
+      operatorTokenFile: operatorFile,
+      invited: [
+        { repo: 'octocat/one', login: 'bot-user', status: 'invited' },
+        { repo: 'octocat/two', login: 'bot-user', status: 'invited' },
+      ],
+      accepted: [
+        { repo: 'octocat/one', status: 'accepted', invitationId: 11 },
+        { repo: 'octocat/two', status: 'accepted', invitationId: 11 },
+      ],
+    })
+    expect(calls.filter(call => call.kind === 'add')).toHaveLength(2)
+    expect(calls[0]!.args).toEqual(['op-secret-token', 'octocat/one', 'bot-user', 'push'])
+    expect(calls.filter(call => call.kind === 'accept')[0]!.args).toEqual(['ghp_bot_token', 'octocat/one'])
+    expect(readFileSync(operatorFile, 'utf8').trim()).toBe('op-secret-token')
+    expect(statSync(operatorFile).mode & 0o777).toBe(0o600)
+    expect(JSON.stringify(result.body)).not.toContain('op-secret-token')
+    expect(JSON.stringify(result.body)).not.toContain('ghp_bot_token')
+
+    expect(harness.service.persistOperatorTokenFile(operatorFile)).toBe(true)
+    runScheduled(harness)
+    await harness.service.waitForCommit()
+    expect((harness.editor.calls[0]!.next.sources as Record<string, unknown>).github).toMatchObject({
+      operatorTokenFile: operatorFile,
+    })
+  })
+
+  it('keeps per-repository failures as warnings and still saves the token', async () => {
+    const { harness } = await makeOperatorHarness({ failRepo: 'octocat/two' })
+    const result = await harness.service.saveOperatorToken({ token: 'op-secret-token', repositories: ['octocat/one', 'octocat/two'] })
+    expect(result.status).toBe(200)
+    const warnings = result.body.warnings as string[]
+    expect(warnings.some(line => line.includes('octocat/two'))).toBe(true)
+    expect(result.body.invited).toEqual([{ repo: 'octocat/one', login: 'bot-user', status: 'invited' }])
+    expect(result.body.accepted).toEqual([{ repo: 'octocat/one', status: 'accepted', invitationId: 11 }])
+  })
+
+  it('rejects an invalid operator token without writing a file', async () => {
+    const { harness, operatorFile } = await makeOperatorHarness()
+    const result = await harness.service.saveOperatorToken({ token: 'bad' })
+    expect(result.status).toBe(400)
+    expect(result.body.error).toBe('invalid_token')
+    expect(JSON.stringify(result.body)).not.toContain('bad')
+    expect(existsSync(operatorFile)).toBe(false)
+  })
+
+  it('requires the bot login (or a saved bot token) before inviting', async () => {
+    const { harness } = await makeOperatorHarness()
+    const github = harness.config.sources as { github: Record<string, unknown> }
+    delete github.github.login
+    rmSync(join(harness.stateDir, 'secrets', 'github-token'), { force: true })
+    const result = await harness.service.saveOperatorToken({ token: 'op-secret-token' })
+    expect(result.status).toBe(400)
+    expect(result.body.error).toBe('bot_login_unknown')
+  })
+
+  it('exposes only the operator-token path/configured flag in setup state', async () => {
+    const { harness, operatorFile } = await makeOperatorHarness()
+    await harness.service.saveOperatorToken({ token: 'op-secret-token' })
+    const github = harness.config.sources as { github: Record<string, unknown> }
+    github.github.operatorTokenFile = operatorFile
+    const state = (await harness.service.state()).body as {
+      accounts: { github: { operatorTokenConfigured: boolean; operatorTokenFile?: string } }
+    }
+    expect(state.accounts.github.operatorTokenConfigured).toBe(true)
+    expect(state.accounts.github.operatorTokenFile).toBe(operatorFile)
+    expect(JSON.stringify(state)).not.toContain('op-secret-token')
+  })
+})
+
+describe('operator PAT removal (task-52)', () => {
+  it('removes the token file, clears the configured path and reports configured:false', async () => {
+    const harness = makeHarness()
+    const operatorFile = join(harness.stateDir, 'secrets', 'github-operator-token')
+    mkdirSync(join(harness.stateDir, 'secrets'), { recursive: true, mode: 0o700 })
+    writeFileSync(operatorFile, 'op-secret', { mode: 0o600 })
+    const github = harness.config.sources as { github: Record<string, unknown> }
+    github.github.operatorTokenFile = operatorFile
+
+    const stateBefore = (await harness.service.state()).body as {
+      accounts: { github: { operatorTokenConfigured: boolean } }
+    }
+    expect(stateBefore.accounts.github.operatorTokenConfigured).toBe(true)
+
+    const result = await harness.service.saveOperatorToken({ remove: true })
+    expect(result.status).toBe(200)
+    expect(result.body).toMatchObject({ ok: true, removed: true, operatorTokenConfigured: false })
+    expect(existsSync(operatorFile)).toBe(false)
+
+    github.github.operatorTokenFile = ''
+    const stateAfter = (await harness.service.state()).body as {
+      accounts: { github: { operatorTokenConfigured: boolean } }
+    }
+    expect(stateAfter.accounts.github.operatorTokenConfigured).toBe(false)
+
+    runScheduled(harness)
+    await harness.service.waitForCommit()
+    expect((harness.editor.calls[0]!.next.sources as Record<string, unknown>).github).toMatchObject({
+      operatorTokenFile: '',
+    })
+    expect(JSON.stringify(result.body)).not.toContain('op-secret')
+  })
+
+  it('is idempotent when the file is already missing', async () => {
+    const harness = makeHarness()
+    const result = await harness.service.saveOperatorToken({ remove: true })
+    expect(result.status).toBe(200)
+    expect(result.body).toMatchObject({ ok: true, operatorTokenConfigured: false })
   })
 })

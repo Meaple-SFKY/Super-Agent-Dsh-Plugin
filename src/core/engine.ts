@@ -505,6 +505,20 @@ export class Engine implements EnginePort {
     if (trigger === undefined) return undefined
     const thread = this.ensureThread(trigger.thread, now)
     const evalRun = thread.eval !== undefined && thread.eval.triggerIds.includes(trigger.id) ? thread.eval : undefined
+    // Idempotence: one Trigger yields at most one Decision. A repeated accept
+    // (tool retry, panel double click, a stale candidate card) returns the
+    // stored Decision/Ticket instead of creating a second Ticket. A fresh Eval
+    // (attach/reevaluate) bypasses this guard and decides normally.
+    if (evalRun === undefined) {
+      const priorDisposition = this.store.dispositions.get(trigger.id)
+      if (priorDisposition?.decisionId !== undefined) {
+        const prior = this.store.decisions.get(priorDisposition.decisionId)
+        if (prior !== undefined) {
+          const priorTicket = prior.ticketId === undefined ? undefined : this.store.tickets.get(prior.ticketId)
+          return { decision: prior, ...(priorTicket === undefined ? {} : { ticket: priorTicket }) }
+        }
+      }
+    }
     const triggerIds = evalRun?.triggerIds ?? [trigger.id]
     const triggers = triggerIds
       .map(id => this.store.triggers.get(id))
@@ -725,6 +739,9 @@ export class Engine implements EnginePort {
     this.store.atomic(() => {
       const ticket = this.store.tickets.get(ticketId)
       if (ticket === undefined || ticket.ends !== undefined) return
+      // A pending Assignment already waits to launch: retrying would stack a
+      // second launch for the same Ticket.
+      if (ticket.assignments.some(assignment => assignment.state === 'pending')) return
       const now = this.now()
       for (const assignment of ticket.assignments) {
         if (assignment.state === 'ended') continue
@@ -1323,6 +1340,11 @@ export class Engine implements EnginePort {
     const reached: TicketId[] = []
     let owned = false
     const person = this.isPerson(trigger)
+    // At most one ended Ticket resumes from one message. Without this, every
+    // Ticket ever completed on a long-lived Thread (a Telegram DM) would spawn
+    // a new Assignment for the same message. An open Ticket that already owns
+    // the Thread takes the follow-up; no ended Ticket is resumed then.
+    const resumeTarget = person ? this.resumeTargetFor(thread, trigger) : undefined
 
     for (const ticketId of [...thread.subscriptions]) {
       const ticket = this.store.tickets.get(ticketId)
@@ -1330,10 +1352,10 @@ export class Engine implements EnginePort {
       const contextOnly = thread.context.includes(ticketId)
       if (ticket.ends !== undefined) {
         if (contextOnly || !person) continue
-        if (ticket.ends.by === 'person') continue
+        if (ticketId !== resumeTarget) continue
         if (this.tryResume(ticket, trigger, thread, now)) {
           reached.push(ticketId)
-          if (!contextOnly) owned = true
+          owned = true
         }
         continue
       }
@@ -1357,7 +1379,73 @@ export class Engine implements EnginePort {
       this.store.tickets.save(ticket)
       reached.push(ticketId)
     }
+
+    // An explicit `meta.ticketId` may name an ended Ticket the Thread no
+    // longer lists; it still gets the message when its Mandate holds.
+    if (resumeTarget !== undefined && !reached.includes(resumeTarget)) {
+      const target = this.store.tickets.get(resumeTarget)
+      if (target !== undefined && this.tryResume(target, trigger, thread, now)) {
+        reached.push(resumeTarget)
+        owned = true
+      }
+    }
     return { tickets: [...new Set(reached)], owned }
+  }
+
+  /**
+   * The one ended Ticket a person's message may resume: an explicit
+   * `meta.ticketId`/`meta.ticket` wins; otherwise the most recently updated
+   * resumable Ticket, and only when no open Ticket already owns the Thread.
+   * Stopped Tickets, context-only follows and Mandates that no longer hold are
+   * never candidates.
+   */
+  private resumeTargetFor(thread: ThreadState, trigger: Trigger): TicketId | undefined {
+    const policy = this.currentPolicy()
+    const explicit = this.explicitTicketRef(trigger)
+    if (explicit !== undefined) {
+      const ticket = this.store.tickets.get(explicit)
+      if (ticket !== undefined && this.resumable(ticket, thread, policy)) return ticket.id
+    }
+    if (this.threadHasOpenOwner(thread)) return undefined
+    let best: Ticket | undefined
+    for (const ticketId of thread.subscriptions) {
+      if (thread.context.includes(ticketId)) continue
+      const ticket = this.store.tickets.get(ticketId)
+      if (ticket === undefined || !this.resumable(ticket, thread, policy)) continue
+      if (
+        best === undefined ||
+        ticket.updatedAt > best.updatedAt ||
+        (ticket.updatedAt === best.updatedAt && ticket.id > best.id)
+      ) {
+        best = ticket
+      }
+    }
+    return best?.id
+  }
+
+  /** Whether an open Ticket already owns follow-ups on this Thread. */
+  private threadHasOpenOwner(thread: ThreadState): boolean {
+    for (const ticketId of thread.subscriptions) {
+      if (thread.context.includes(ticketId)) continue
+      const ticket = this.store.tickets.get(ticketId)
+      if (ticket !== undefined && ticket.ends === undefined) return true
+    }
+    return false
+  }
+
+  /** Whether an ended Ticket may take a person's message as a follow-up. */
+  private resumable(ticket: Ticket, thread: ThreadState, policy: Policy): boolean {
+    if (ticket.ends === undefined) return false
+    if (ticket.ends.by === 'person') return false
+    if (thread.context.includes(ticket.id)) return false
+    return revalidateMandate(ticket.mandate, policy)
+  }
+
+  /** A Source may name the Ticket a Trigger belongs to in its own metadata. */
+  private explicitTicketRef(trigger: Trigger): TicketId | undefined {
+    const meta = trigger.meta
+    const candidate = meta.ticketId ?? meta.ticket ?? meta.ticket_id
+    return typeof candidate === 'string' && candidate !== '' ? candidate : undefined
   }
 
   private tryResume(ticket: Ticket, trigger: Trigger, thread: ThreadState, now: IsoTime): boolean {

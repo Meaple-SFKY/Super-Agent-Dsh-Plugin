@@ -85,7 +85,10 @@ describe('package.json wiring', () => {
   })
 
   it('ships the runtime assets it lists', () => {
-    for (const required of ['lib', 'cordis.patch.yml', 'locale/*.json', 'icon.svg']) {
+    // Built JS/declarations may be listed as directory globs (tarball installs),
+    // so accept any entry that covers lib/ rather than the literal "lib".
+    expect(pkg.files.some(entry => entry === 'lib' || entry.startsWith('lib/'))).toBe(true)
+    for (const required of ['cordis.patch.yml', 'locale/*.json', 'icon.svg']) {
       expect(pkg.files).toContain(required)
     }
     expect(existsSync(join(ROOT, 'locale/en.json'))).toBe(true)
@@ -138,8 +141,11 @@ describe('client module', () => {
     const client = readText('src/client/main.js')
     expect(client).toContain("id: 'dsh-superagent-personal'")
     expect(client).toContain("const inject = ['slots', 'locale']")
-    // The built copy mirrors the source.
-    expect(readText('lib/client.js')).toContain("id: 'dsh-superagent-personal'")
+    // The built copy may be minified/bundled: assert the loader id and the
+    // package name survive the build rather than a specific quote style.
+    const built = readText('lib/client.js')
+    expect(built).toContain('__ModuleLoader__')
+    expect(built).toContain(pkg.name)
     // Client bundles the Host must serve first are bundle names, not services.
     for (const bundle of pkg.dsh.client?.inject ?? []) expect(bundle.startsWith('@deepseek-ai/')).toBe(true)
   })

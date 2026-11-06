@@ -84,6 +84,8 @@ Source ◀──Channel── Outbox ◀──reply── Engine
 
 规则：effect 在事务内 enqueue、提交后执行；失败指数退避；同一 kind+key 合并。所有外部调用都有幂等键。旧记录暂不自动清理（后续加 retention）。
 
+**Schema 2**（`src/app/store.ts:56 SCHEMA_VERSION = 2`）：在 schema 1 基础上为 `thread.last_trigger_at` 建索引列并从 Thread JSON 回填（`json_extract(data,'$.lastTriggerAt')`），同时补 `ticket_updated`、`thread_active_recent` 索引；打开 v1 库时就地升级并写回 `schema_version=2`。更高版本（如 99）在 DDL 后明确拒绝且不改数据。文档/测试里如仍写“schema 1”指的是旧版布局，当前支持版本是 **2**。
+
 ## 7. 执行器与恢复
 
 - Worker = DSH Session，使用 bundle patch 里的 `superagent-worker` preset（完整执行工具，无“问人/展示/调度”工具）；Router 使用 `superagent-router` preset（读 + 调度 + 回复，无写盘/改代码）。

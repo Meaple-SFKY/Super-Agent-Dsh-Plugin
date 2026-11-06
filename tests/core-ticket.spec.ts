@@ -68,6 +68,27 @@ function startAssignment(harness: ReturnType<typeof makeHarness>, ticket: Ticket
   return harness.store.tickets.get(ticket.id)!.assignments[0]!
 }
 
+function acceptOnThread(harness: ReturnType<typeof makeHarness>, triggerId: string, threadKey: string): Ticket {
+  harness.engine.sources.receive(makeTrigger({ id: triggerId, threadKey }))
+  harness.engine.evaluateDue()
+  const result = harness.engine.mainSession.decide({
+    triggerId,
+    outcome: 'accept',
+    reason: [{ code: 'asked', triggerId }],
+  })
+  expect(result.ticket).toBeDefined()
+  return result.ticket!
+}
+
+function endWithReady(harness: ReturnType<typeof makeHarness>, ticket: Ticket): void {
+  const assignment = harness.store.tickets.get(ticket.id)!.assignments[0]!
+  harness.engine.executor.report({
+    ticketId: ticket.id,
+    assignmentId: assignment.id,
+    report: { kind: 'ready', summary: 'done', at: harness.clock.now() },
+  })
+}
+
 describe('reports', () => {
   it('keeps progress quiet', () => {
     const harness = makeHarness()
@@ -756,5 +777,182 @@ describe('report attachments', () => {
     expect(message.text).toHaveLength(30)
     expect(message.text.endsWith('…')).toBe(true)
     expect(message.attachments).toHaveLength(1)
+  })
+})
+
+describe('resume lifecycle (P0)', () => {
+  /** Twenty ended Tickets, all subscribed to one Telegram DM Thread. */
+  function manyEndedTickets(harness: ReturnType<typeof makeHarness>, count = 20): Ticket[] {
+    const tickets: Ticket[] = []
+    for (let index = 0; index < count; index += 1) {
+      const ticket = acceptOnThread(harness, `old-${index}`, `side-${index}`)
+      harness.engine.sources.bindThread(ticket.id, { key: 'chat-1', source: 'telegram' }, false)
+      harness.clock.advance(1_000)
+      endWithReady(harness, ticket)
+      tickets.push(ticket)
+    }
+    expect(harness.store.tickets.open()).toHaveLength(0)
+    return tickets
+  }
+
+  it('resumes only the most recent ended Ticket from one person message', () => {
+    const harness = makeHarness()
+    const tickets = manyEndedTickets(harness)
+    harness.effects.clear()
+    const latest = tickets[tickets.length - 1]!
+    harness.clock.advance(1_000)
+
+    harness.engine.sources.receive(makeTrigger({ id: 'next', text: 'one more thing' }))
+    harness.engine.evaluateDue()
+
+    const reopened = harness.store.tickets.open()
+    expect(reopened).toHaveLength(1)
+    expect(reopened[0]?.id).toBe(latest.id)
+    // Exactly one new Assignment/launch, and the message does not create an Eval.
+    expect(reopened[0]?.assignments).toHaveLength(2)
+    expect(reopened[0]?.assignments[1]?.state).toBe('pending')
+    expect(harness.effects.list('launch')).toHaveLength(1)
+    expect(harness.effects.list('assessment')).toEqual([])
+    // Every other ended Ticket keeps its state, its single Assignment and no input.
+    for (const ticket of tickets.slice(0, -1)) {
+      const stored = harness.store.tickets.get(ticket.id)!
+      expect(stored.ends).toBeDefined()
+      expect(stored.assignments).toHaveLength(1)
+      expect(stored.inputs.some(input => input.triggerId === 'next')).toBe(false)
+    }
+  })
+
+  it('lets an open Ticket take the follow-up instead of resuming an ended one', () => {
+    const harness = makeHarness()
+    const open = acceptTrigger(harness, 'open-1')
+    const ended = acceptOnThread(harness, 'ended-1', 'side-1')
+    harness.engine.sources.bindThread(ended.id, { key: 'chat-1', source: 'telegram' }, false)
+    endWithReady(harness, ended)
+    expect(harness.store.tickets.get(ended.id)?.ends).toBeDefined()
+    harness.effects.clear()
+
+    harness.engine.sources.receive(makeTrigger({ id: 'follow', text: 'for the open one' }))
+    harness.engine.evaluateDue()
+
+    const openStored = harness.store.tickets.get(open.id)!
+    expect(openStored.inputs.some(input => input.triggerId === 'follow')).toBe(true)
+    const endedStored = harness.store.tickets.get(ended.id)!
+    expect(endedStored.ends).toBeDefined()
+    expect(endedStored.assignments).toHaveLength(1)
+    expect(endedStored.inputs.some(input => input.triggerId === 'follow')).toBe(false)
+    expect(harness.store.tickets.open()).toHaveLength(1)
+  })
+
+  it('prefers an explicitly referenced ended Ticket over the most recent one', () => {
+    const harness = makeHarness()
+    const tickets = manyEndedTickets(harness, 3)
+    harness.effects.clear()
+    harness.clock.advance(1_000)
+
+    harness.engine.sources.receive(
+      makeTrigger({ id: 'explicit', text: 'that one', meta: { ticketId: tickets[0]!.id } }),
+    )
+    harness.engine.evaluateDue()
+
+    const reopened = harness.store.tickets.open()
+    expect(reopened).toHaveLength(1)
+    expect(reopened[0]?.id).toBe(tickets[0]!.id)
+    expect(harness.effects.list('launch')).toHaveLength(1)
+  })
+
+  it('keeps normal fan-out to open Tickets unchanged', () => {
+    const harness = makeHarness()
+    const first = acceptTrigger(harness, 'open-1')
+    const second = acceptOnThread(harness, 'open-2', 'side-2')
+    harness.engine.sources.bindThread(second.id, { key: 'chat-1', source: 'telegram' }, false)
+    harness.effects.clear()
+
+    harness.engine.sources.receive(makeTrigger({ id: 'follow', text: 'for both' }))
+
+    for (const ticket of [first, second]) {
+      const stored = harness.store.tickets.get(ticket.id)!
+      expect(stored.inputs.some(input => input.triggerId === 'follow')).toBe(true)
+    }
+    expect(harness.store.tickets.open()).toHaveLength(2)
+    expect(harness.effects.list('assessment')).toEqual([])
+  })
+})
+
+describe('decision idempotence (P0)', () => {
+  it('returns the existing Ticket when accept is repeated', () => {
+    const harness = makeHarness()
+    harness.engine.sources.receive(makeTrigger({ id: 'tr_1' }))
+    harness.engine.evaluateDue()
+
+    const first = harness.engine.mainSession.decide({
+      triggerId: 'tr_1',
+      outcome: 'accept',
+      reason: [{ code: 'asked' }],
+      title: 'First',
+    })
+    const second = harness.engine.mainSession.decide({
+      triggerId: 'tr_1',
+      outcome: 'accept',
+      reason: [{ code: 'asked' }],
+      title: 'Second',
+    })
+
+    expect(second.decision.id).toBe(first.decision.id)
+    expect(second.ticket?.id).toBe(first.ticket?.id)
+    expect(harness.store.tickets.open()).toHaveLength(1)
+    expect(harness.store.tickets.open()[0]?.title).toBe('First')
+    expect(harness.effects.list('launch')).toHaveLength(1)
+    expect(harness.store.threads.get('chat-1')?.decisions).toHaveLength(1)
+  })
+
+  it('ignores a repeated decision with a different outcome for the same Trigger', () => {
+    const harness = makeHarness()
+    const ticket = acceptTrigger(harness, 'tr_1')
+    harness.effects.clear()
+
+    const repeated = harness.engine.mainSession.decide({
+      triggerId: 'tr_1',
+      outcome: 'stop',
+      reason: [{ code: 'changed_mind' }],
+    })
+
+    expect(repeated.decision.outcome).toBe('accept')
+    expect(repeated.ticket?.id).toBe(ticket.id)
+    expect(harness.store.tickets.get(ticket.id)?.ends).toBeUndefined()
+    expect(harness.effects.list('notice')).toEqual([])
+  })
+
+  it('still decides a Trigger again after an explicit reevaluate', () => {
+    const harness = makeHarness()
+    const ticket = acceptTrigger(harness, 'tr_1')
+    harness.effects.clear()
+
+    harness.engine.people.reevaluate('tr_1')
+    harness.engine.evaluateDue()
+    const second = harness.engine.mainSession.decide({
+      triggerId: 'tr_1',
+      outcome: 'ignore',
+      reason: [{ code: 'not_needed' }],
+    })
+
+    expect(second.decision.outcome).toBe('ignore')
+    expect(harness.store.threads.get('chat-1')?.decisions).toHaveLength(2)
+    expect(harness.store.tickets.open()).toHaveLength(1)
+    expect(harness.store.tickets.get(ticket.id)?.ends).toBeUndefined()
+  })
+
+  it('does not stack a second pending Assignment when retry is called on a queued Ticket', () => {
+    const harness = makeHarness()
+    const ticket = acceptTrigger(harness, 'tr_1')
+    expect(harness.store.tickets.get(ticket.id)?.assignments).toHaveLength(1)
+    expect(harness.effects.list('launch')).toHaveLength(1)
+
+    harness.engine.people.retryTicket(ticket.id)
+
+    const stored = harness.store.tickets.get(ticket.id)!
+    expect(stored.assignments).toHaveLength(1)
+    expect(stored.assignments[0]?.state).toBe('pending')
+    expect(harness.effects.list('launch')).toHaveLength(1)
+    expect(harness.executor.interrupts).toEqual([])
   })
 })

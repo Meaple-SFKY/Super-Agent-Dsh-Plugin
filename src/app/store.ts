@@ -53,7 +53,7 @@ import type {
 } from '../core/stores.js'
 
 /** The schema written by this build. */
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
 
 /** How many rows a read returns when the caller leaves the limit out. */
 const DEFAULT_LIMIT = 50
@@ -141,6 +141,19 @@ function ticketTriggerIds(ticket: Ticket): TriggerId[] {
 function effectRowId(kind: EffectKind, key: string): string {
   return `${kind}\u0000${key}`
 }
+
+/**
+ * Timeline paging: order by the Trigger's own copy on `trigger_thread` so the
+ * `(thread_key, at, trigger_id)` index provides the order and the `LIMIT`
+ * never reads past the requested page. `threadTriggers` reverses the page to
+ * keep its public ascending order.
+ */
+const THREAD_TRIGGERS_PAGE_SQL =
+  'SELECT t.data AS data FROM trigger_thread tt JOIN trigger t ON t.id = tt.trigger_id WHERE tt.thread_key = ? ORDER BY tt.at DESC, tt.trigger_id DESC LIMIT ?'
+const THREAD_TRIGGERS_BEFORE_SQL =
+  'SELECT t.data AS data FROM trigger_thread tt JOIN trigger t ON t.id = tt.trigger_id WHERE tt.thread_key = ? AND tt.at < ? ORDER BY tt.at DESC, tt.trigger_id DESC LIMIT ?'
+const THREAD_TRIGGERS_BEFORE_ID_SQL =
+  'SELECT t.data AS data FROM trigger_thread tt JOIN trigger t ON t.id = tt.trigger_id WHERE tt.thread_key = ? AND (tt.at, tt.trigger_id) < (?, ?) ORDER BY tt.at DESC, tt.trigger_id DESC LIMIT ?'
 
 // ---------------------------------------------------------------------------
 // In-memory store
@@ -454,6 +467,7 @@ export function createMemoryStore(): AppStore {
 
 type SqliteModule = typeof import('node:sqlite')
 type SqliteDatabase = import('node:sqlite').DatabaseSync
+type SqliteStatement = import('node:sqlite').StatementSync
 
 let sqliteModule: SqliteModule | undefined
 
@@ -484,6 +498,7 @@ export function openStore(options: OpenStoreOptions): SqliteStore {
 export class SqliteStore implements AppStore {
   private readonly dbPath: string
   private readonly db: SqliteDatabase
+  private readonly statements = new Map<string, SqliteStatement>()
   private depth = 0
   private closed = false
   private effectSeq = 0
@@ -523,93 +538,94 @@ export class SqliteStore implements AppStore {
 
     this.triggers = {
       get: id => {
-        const row = this.db.prepare('SELECT data FROM trigger WHERE id = ?').get(id) as { data?: string } | undefined
+        const row = this.stmt('SELECT data FROM trigger WHERE id = ?').get(id) as { data?: string } | undefined
         return row?.data === undefined ? undefined : (JSON.parse(row.data) as Trigger)
       },
-      has: id => this.db.prepare('SELECT 1 AS present FROM trigger WHERE id = ?').get(id) !== undefined,
+      has: id => this.stmt('SELECT 1 AS present FROM trigger WHERE id = ?').get(id) !== undefined,
       save: trigger => {
-        this.db
-          .prepare('INSERT INTO trigger (id, at, source, thread_key, data) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET at = excluded.at, source = excluded.source, thread_key = excluded.thread_key, data = excluded.data')
+        this.stmt('INSERT INTO trigger (id, at, source, thread_key, data) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET at = excluded.at, source = excluded.source, thread_key = excluded.thread_key, data = excluded.data')
           .run(trigger.id, trigger.at, trigger.source, trigger.thread.key, JSON.stringify(trigger))
-        this.db.prepare('DELETE FROM trigger_thread WHERE trigger_id = ?').run(trigger.id)
-        const insert = this.db.prepare('INSERT OR IGNORE INTO trigger_thread (trigger_id, thread_key, at) VALUES (?, ?, ?)')
-        insert.run(trigger.id, trigger.thread.key, trigger.at)
+        this.stmt('DELETE FROM trigger_thread WHERE trigger_id = ?').run(trigger.id)
+        const threadKeys = [trigger.thread.key]
         for (const correlation of trigger.correlations ?? []) {
-          insert.run(trigger.id, correlation.key, trigger.at)
+          if (!threadKeys.includes(correlation.key)) threadKeys.push(correlation.key)
         }
+        this.stmt('INSERT OR IGNORE INTO trigger_thread (trigger_id, thread_key, at) SELECT ?, value, ? FROM json_each(?)').run(
+          trigger.id,
+          trigger.at,
+          JSON.stringify(threadKeys),
+        )
       },
     }
 
     this.threads = {
       get: key => {
-        const row = this.db.prepare('SELECT data FROM thread WHERE key = ?').get(key) as { data?: string } | undefined
+        const row = this.stmt('SELECT data FROM thread WHERE key = ?').get(key) as { data?: string } | undefined
         return row?.data === undefined ? undefined : (JSON.parse(row.data) as ThreadState)
       },
       save: thread => {
-        this.db
-          .prepare('INSERT INTO thread (key, active, data) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET active = excluded.active, data = excluded.data')
-          .run(thread.key, threadActive(thread) ? 1 : 0, JSON.stringify(thread))
+        this.stmt('INSERT INTO thread (key, active, last_trigger_at, data) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET active = excluded.active, last_trigger_at = excluded.last_trigger_at, data = excluded.data')
+          .run(thread.key, threadActive(thread) ? 1 : 0, thread.lastTriggerAt ?? null, JSON.stringify(thread))
       },
       active: () =>
-        (this.db.prepare('SELECT data FROM thread WHERE active = 1').all() as Array<{ data: string }>)
+        (this.stmt('SELECT data FROM thread WHERE active = 1').all() as Array<{ data: string }>)
           .map(row => JSON.parse(row.data) as ThreadState)
           .sort((a, b) => (a.lastTriggerAt ?? '').localeCompare(b.lastTriggerAt ?? '') || a.key.localeCompare(b.key)),
     }
 
     this.tickets = {
       get: id => {
-        const row = this.db.prepare('SELECT data FROM ticket WHERE id = ?').get(id) as { data?: string } | undefined
+        const row = this.stmt('SELECT data FROM ticket WHERE id = ?').get(id) as { data?: string } | undefined
         return row?.data === undefined ? undefined : (JSON.parse(row.data) as Ticket)
       },
       save: ticket => {
-        this.db
-          .prepare('INSERT INTO ticket (id, open, active, created_at, updated_at, data) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET open = excluded.open, active = excluded.active, created_at = excluded.created_at, updated_at = excluded.updated_at, data = excluded.data')
+        this.stmt('INSERT INTO ticket (id, open, active, created_at, updated_at, data) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET open = excluded.open, active = excluded.active, created_at = excluded.created_at, updated_at = excluded.updated_at, data = excluded.data')
           .run(ticket.id, ticketOpen(ticket) ? 1 : 0, ticketActive(ticket) ? 1 : 0, ticket.createdAt, ticket.updatedAt, JSON.stringify(ticket))
-        this.db.prepare('DELETE FROM ticket_thread WHERE ticket_id = ?').run(ticket.id)
-        const insert = this.db.prepare('INSERT OR IGNORE INTO ticket_thread (ticket_id, thread_key) VALUES (?, ?)')
-        for (const key of threadKeysOfTicket(ticket)) insert.run(ticket.id, key)
+        this.stmt('DELETE FROM ticket_thread WHERE ticket_id = ?').run(ticket.id)
+        this.stmt('INSERT OR IGNORE INTO ticket_thread (ticket_id, thread_key) SELECT ?, value FROM json_each(?)').run(
+          ticket.id,
+          JSON.stringify(threadKeysOfTicket(ticket)),
+        )
       },
       open: () =>
-        (this.db.prepare('SELECT data FROM ticket WHERE open = 1 ORDER BY created_at, id').all() as Array<{ data: string }>).map(
+        (this.stmt('SELECT data FROM ticket WHERE open = 1 ORDER BY created_at, id').all() as Array<{ data: string }>).map(
           row => JSON.parse(row.data) as Ticket,
         ),
       active: () =>
-        (this.db.prepare('SELECT data FROM ticket WHERE active = 1 ORDER BY updated_at, id').all() as Array<{ data: string }>).map(
+        (this.stmt('SELECT data FROM ticket WHERE active = 1 ORDER BY updated_at, id').all() as Array<{ data: string }>).map(
           row => JSON.parse(row.data) as Ticket,
         ),
     }
 
     this.decisions = {
       get: id => {
-        const row = this.db.prepare('SELECT data FROM decision WHERE id = ?').get(id) as { data?: string } | undefined
+        const row = this.stmt('SELECT data FROM decision WHERE id = ?').get(id) as { data?: string } | undefined
         return row?.data === undefined ? undefined : (JSON.parse(row.data) as Decision)
       },
       save: decision => {
-        this.db
-          .prepare('INSERT INTO decision (id, thread_key, at, data) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET thread_key = excluded.thread_key, at = excluded.at, data = excluded.data')
+        this.stmt('INSERT INTO decision (id, thread_key, at, data) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET thread_key = excluded.thread_key, at = excluded.at, data = excluded.data')
           .run(decision.id, decision.thread, decision.at, JSON.stringify(decision))
       },
     }
 
     this.receipts = {
       get: id => {
-        const row = this.db.prepare('SELECT data FROM receipt WHERE id = ?').get(id) as { data?: string } | undefined
+        const row = this.stmt('SELECT data FROM receipt WHERE id = ?').get(id) as { data?: string } | undefined
         return row?.data === undefined ? undefined : (JSON.parse(row.data) as Receipt)
       },
       save: receipt => {
-        this.db
-          .prepare('INSERT INTO receipt (id, status, ticket_id, created_at, data) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET status = excluded.status, ticket_id = excluded.ticket_id, created_at = excluded.created_at, data = excluded.data')
+        this.stmt('INSERT INTO receipt (id, status, ticket_id, created_at, data) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET status = excluded.status, ticket_id = excluded.ticket_id, created_at = excluded.created_at, data = excluded.data')
           .run(receipt.id, receipt.status, receipt.ticketId ?? null, receipt.createdAt, JSON.stringify(receipt))
       },
       pending: () =>
-        (this.db.prepare("SELECT data FROM receipt WHERE status = 'pending' ORDER BY created_at, id").all() as Array<{ data: string }>).map(
+        (this.stmt("SELECT data FROM receipt WHERE status = 'pending' ORDER BY created_at, id").all() as Array<{ data: string }>).map(
           row => JSON.parse(row.data) as Receipt,
         ),
     }
 
     this.kv = {
       get: <T>(key: string): T | undefined => {
-        const row = this.db.prepare('SELECT value FROM kv WHERE key = ?').get(key) as { value?: string } | undefined
+        const row = this.stmt('SELECT value FROM kv WHERE key = ?').get(key) as { value?: string } | undefined
         if (row?.value === undefined) return undefined
         try {
           return JSON.parse(row.value) as T
@@ -618,20 +634,19 @@ export class SqliteStore implements AppStore {
         }
       },
       set: <T>(key: string, value: T): void => {
-        this.db
-          .prepare('INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+        this.stmt('INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
           .run(key, JSON.stringify(value ?? null))
       },
       delete: (key: string): void => {
-        this.db.prepare('DELETE FROM kv WHERE key = ?').run(key)
+        this.stmt('DELETE FROM kv WHERE key = ?').run(key)
       },
       keys: (prefix?: string): string[] => {
         let rows: Array<{ key: string }>
         if (prefix === undefined) {
-          rows = this.db.prepare('SELECT key FROM kv ORDER BY key').all() as Array<{ key: string }>
+          rows = this.stmt('SELECT key FROM kv ORDER BY key').all() as Array<{ key: string }>
         } else {
           const escaped = prefix.replace(/[\\%_]/g, character => `\\${character}`)
-          rows = this.db.prepare("SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\' ORDER BY key").all(`${escaped}%`) as Array<{ key: string }>
+          rows = this.stmt("SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\' ORDER BY key").all(`${escaped}%`) as Array<{ key: string }>
         }
         return rows.map(row => row.key)
       },
@@ -639,30 +654,27 @@ export class SqliteStore implements AppStore {
 
     this.dispositions = {
       get: triggerId => {
-        const row = this.db.prepare('SELECT data FROM disposition WHERE trigger_id = ?').get(triggerId) as { data?: string } | undefined
+        const row = this.stmt('SELECT data FROM disposition WHERE trigger_id = ?').get(triggerId) as { data?: string } | undefined
         return row?.data === undefined ? undefined : (JSON.parse(row.data) as Disposition)
       },
       save: disposition => {
-        this.db
-          .prepare('INSERT INTO disposition (trigger_id, thread_key, outcome, data) VALUES (?, ?, ?, ?) ON CONFLICT(trigger_id) DO UPDATE SET thread_key = excluded.thread_key, outcome = excluded.outcome, data = excluded.data')
+        this.stmt('INSERT INTO disposition (trigger_id, thread_key, outcome, data) VALUES (?, ?, ?, ?) ON CONFLICT(trigger_id) DO UPDATE SET thread_key = excluded.thread_key, outcome = excluded.outcome, data = excluded.data')
           .run(disposition.triggerId, disposition.thread, disposition.outcome, JSON.stringify(disposition))
       },
     }
 
     this.effects = {
       get: (kind, key) => {
-        const row = this.db
-          .prepare('SELECT kind, key, payload, seq, due_at, attempts, last_error, created_at, updated_at FROM effect WHERE kind = ? AND key = ?')
+        const row = this.stmt('SELECT kind, key, payload, seq, due_at, attempts, last_error, created_at, updated_at FROM effect WHERE kind = ? AND key = ?')
           .get(kind, key) as Record<string, unknown> | undefined
         return row === undefined ? undefined : this.effectFromRow(row)
       },
       save: row => {
-        const existing = this.db.prepare('SELECT seq FROM effect WHERE kind = ? AND key = ?').get(row.kind, row.key) as
+        const existing = this.stmt('SELECT seq FROM effect WHERE kind = ? AND key = ?').get(row.kind, row.key) as
           | { seq: number }
           | undefined
         const seq = existing?.seq ?? (row.seq > 0 ? row.seq : ++this.effectSeq)
-        this.db
-          .prepare('INSERT INTO effect (kind, key, payload, seq, due_at, attempts, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, key) DO UPDATE SET payload = excluded.payload, due_at = excluded.due_at, attempts = excluded.attempts, last_error = excluded.last_error, updated_at = excluded.updated_at')
+        this.stmt('INSERT INTO effect (kind, key, payload, seq, due_at, attempts, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, key) DO UPDATE SET payload = excluded.payload, due_at = excluded.due_at, attempts = excluded.attempts, last_error = excluded.last_error, updated_at = excluded.updated_at')
           .run(
             row.kind,
             row.key,
@@ -676,18 +688,16 @@ export class SqliteStore implements AppStore {
           )
       },
       remove: (kind, key) => {
-        this.db.prepare('DELETE FROM effect WHERE kind = ? AND key = ?').run(kind, key)
+        this.stmt('DELETE FROM effect WHERE kind = ? AND key = ?').run(kind, key)
       },
       due: at =>
         (
-          this.db
-            .prepare('SELECT kind, key, payload, seq, due_at, attempts, last_error, created_at, updated_at FROM effect WHERE due_at <= ? ORDER BY seq')
+          this.stmt('SELECT kind, key, payload, seq, due_at, attempts, last_error, created_at, updated_at FROM effect WHERE due_at <= ? ORDER BY seq')
             .all(at) as Array<Record<string, unknown>>
         ).map(row => this.effectFromRow(row)),
       all: () =>
         (
-          this.db
-            .prepare('SELECT kind, key, payload, seq, due_at, attempts, last_error, created_at, updated_at FROM effect ORDER BY seq')
+          this.stmt('SELECT kind, key, payload, seq, due_at, attempts, last_error, created_at, updated_at FROM effect ORDER BY seq')
             .all() as Array<Record<string, unknown>>
         ).map(row => this.effectFromRow(row)),
     }
@@ -695,24 +705,18 @@ export class SqliteStore implements AppStore {
     this.read = {
       threadTriggers: (thread, options) => {
         const before = options?.before
-        const limit = options?.limit ?? DEFAULT_LIMIT
-        const rows: Array<{ data: string }> = before === undefined
-          ? (this.db
-              .prepare('SELECT t.data AS data FROM trigger_thread tt JOIN trigger t ON t.id = tt.trigger_id WHERE tt.thread_key = ? ORDER BY t.at, t.id')
-              .all(thread) as Array<{ data: string }>)
-          : (() => {
-              const parsed = parseBefore(before)
-              if (parsed.id === undefined) {
-                return this.db
-                  .prepare('SELECT t.data AS data FROM trigger_thread tt JOIN trigger t ON t.id = tt.trigger_id WHERE tt.thread_key = ? AND t.at < ? ORDER BY t.at, t.id')
-                  .all(thread, parsed.at) as Array<{ data: string }>
-              }
-              return this.db
-                .prepare('SELECT t.data AS data FROM trigger_thread tt JOIN trigger t ON t.id = tt.trigger_id WHERE tt.thread_key = ? AND (t.at < ? OR (t.at = ? AND t.id < ?)) ORDER BY t.at, t.id')
-                .all(thread, parsed.at, parsed.at, parsed.id) as Array<{ data: string }>
-            })()
-        const items = rows.map(row => JSON.parse(row.data) as Trigger)
-        return items.slice(Math.max(0, items.length - limit))
+        const limit = Math.max(1, Math.floor(options?.limit ?? DEFAULT_LIMIT))
+        let rows: Array<{ data: string }>
+        if (before === undefined) {
+          rows = this.stmt(THREAD_TRIGGERS_PAGE_SQL).all(thread, limit) as Array<{ data: string }>
+        } else {
+          const parsed = parseBefore(before)
+          rows = parsed.id === undefined
+            ? (this.stmt(THREAD_TRIGGERS_BEFORE_SQL).all(thread, parsed.at, limit) as Array<{ data: string }>)
+            : (this.stmt(THREAD_TRIGGERS_BEFORE_ID_SQL).all(thread, parsed.at, parsed.id, limit) as Array<{ data: string }>)
+        }
+        // The public contract is ascending time order; the SQL page is newest-first.
+        return rows.map(row => JSON.parse(row.data) as Trigger).reverse()
       },
       ticketTriggers: ticketId => {
         const ticket = this.tickets.get(ticketId)
@@ -726,7 +730,7 @@ export class SqliteStore implements AppStore {
         const state = this.threads.get(thread)
         if (state === undefined) return undefined
         const triggers = this.read.threadTriggers(thread, { limit: DEFAULT_LIMIT })
-        const ids = (this.db.prepare('SELECT ticket_id FROM ticket_thread WHERE thread_key = ?').all(thread) as Array<{ ticket_id: string }>).map(
+        const ids = (this.stmt('SELECT ticket_id FROM ticket_thread WHERE thread_key = ?').all(thread) as Array<{ ticket_id: string }>).map(
           row => row.ticket_id,
         )
         const tickets = ids
@@ -735,7 +739,7 @@ export class SqliteStore implements AppStore {
         return { thread: state, triggers, tickets: sortRelatedTickets(tickets) }
       },
       relatedTickets: (thread, limit) => {
-        const ids = (this.db.prepare('SELECT ticket_id FROM ticket_thread WHERE thread_key = ?').all(thread) as Array<{ ticket_id: string }>).map(
+        const ids = (this.stmt('SELECT ticket_id FROM ticket_thread WHERE thread_key = ?').all(thread) as Array<{ ticket_id: string }>).map(
           row => row.ticket_id,
         )
         const tickets = ids
@@ -744,33 +748,34 @@ export class SqliteStore implements AppStore {
         return sortRelatedTickets(tickets).slice(0, limit ?? 10)
       },
       recentTickets: limit =>
-        (this.db.prepare('SELECT data FROM ticket ORDER BY updated_at DESC, id DESC LIMIT ?').all(limit ?? DEFAULT_LIMIT) as Array<{ data: string }>).map(
+        (this.stmt('SELECT data FROM ticket ORDER BY updated_at DESC, id DESC LIMIT ?').all(limit ?? DEFAULT_LIMIT) as Array<{ data: string }>).map(
           row => JSON.parse(row.data) as Ticket,
         ),
       activeThreads: limit =>
-        (this.db.prepare('SELECT data FROM thread WHERE active = 1').all() as Array<{ data: string }>)
-          .map(row => JSON.parse(row.data) as ThreadState)
-          .sort((a, b) => (b.lastTriggerAt ?? '').localeCompare(a.lastTriggerAt ?? '') || a.key.localeCompare(b.key))
-          .slice(0, limit ?? DEFAULT_LIMIT),
+        (
+          this.stmt('SELECT data FROM thread WHERE active = 1 ORDER BY last_trigger_at DESC, key ASC LIMIT ?').all(
+            limit ?? DEFAULT_LIMIT,
+          ) as Array<{ data: string }>
+        ).map(row => JSON.parse(row.data) as ThreadState),
       search: (query, limit) => {
         const max = limit ?? 20
         const like = `%${query.toLowerCase()}%`
         const results: Array<{ kind: string; id: string; text: string }> = []
-        const triggers = this.db.prepare('SELECT id, data FROM trigger WHERE LOWER(data) LIKE ? ORDER BY at DESC LIMIT ?').all(like, max) as Array<{
+        const triggers = this.stmt('SELECT id, data FROM trigger WHERE LOWER(data) LIKE ? ORDER BY at DESC LIMIT ?').all(like, max) as Array<{
           id: string
           data: string
         }>
         for (const row of triggers) {
           results.push({ kind: 'trigger', id: row.id, text: (JSON.parse(row.data) as Trigger).text })
         }
-        const tickets = this.db.prepare('SELECT id, data FROM ticket WHERE LOWER(data) LIKE ? ORDER BY updated_at DESC LIMIT ?').all(like, max) as Array<{
+        const tickets = this.stmt('SELECT id, data FROM ticket WHERE LOWER(data) LIKE ? ORDER BY updated_at DESC LIMIT ?').all(like, max) as Array<{
           id: string
           data: string
         }>
         for (const row of tickets) {
           results.push({ kind: 'ticket', id: row.id, text: (JSON.parse(row.data) as Ticket).title })
         }
-        const decisions = this.db.prepare('SELECT id, data FROM decision WHERE LOWER(data) LIKE ? ORDER BY at DESC LIMIT ?').all(like, max) as Array<{
+        const decisions = this.stmt('SELECT id, data FROM decision WHERE LOWER(data) LIKE ? ORDER BY at DESC LIMIT ?').all(like, max) as Array<{
           id: string
           data: string
         }>
@@ -814,6 +819,9 @@ export class SqliteStore implements AppStore {
   close(): void {
     if (this.closed) return
     this.closed = true
+    // Statement handles die with the connection; drop them first so a late
+    // caller cannot touch a closed database through a cached handle.
+    this.statements.clear()
     this.db.close()
   }
 
@@ -823,6 +831,17 @@ export class SqliteStore implements AppStore {
   }
 
   // -- internals -----------------------------------------------------------
+
+  /** One cached prepared statement per SQL text (single connection, single thread). */
+  private stmt(sql: string): SqliteStatement {
+    if (this.closed) throw new Error('superagent store is closed')
+    let statement = this.statements.get(sql)
+    if (statement === undefined) {
+      statement = this.db.prepare(sql)
+      this.statements.set(sql, statement)
+    }
+    return statement
+  }
 
   private effectFromRow(row: Record<string, unknown>): EffectRow {
     return {
@@ -839,17 +858,23 @@ export class SqliteStore implements AppStore {
   }
 
   private readEffectSeq(): number {
-    const row = this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM effect').get() as { seq?: number } | undefined
+    const row = this.stmt('SELECT COALESCE(MAX(seq), 0) AS seq FROM effect').get() as { seq?: number } | undefined
     return Number(row?.seq ?? 0)
   }
 
   private migrate(): void {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS superagent_meta (
-        name TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
+    // Read the schema version before any other DDL: a database written by a
+    // newer build must be refused without being touched.
+    this.db.exec('CREATE TABLE IF NOT EXISTS superagent_meta (name TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    const row = this.stmt('SELECT value FROM superagent_meta WHERE name = ?').get('schema_version') as
+      | { value?: string }
+      | undefined
+    const current = row?.value === undefined ? undefined : Number(row.value)
+    if (current !== undefined && current > SCHEMA_VERSION) {
+      throw new Error(`state database schema ${current} is newer than supported schema ${SCHEMA_VERSION}`)
+    }
 
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS trigger (
         id TEXT PRIMARY KEY,
         at TEXT NOT NULL,
@@ -879,6 +904,7 @@ export class SqliteStore implements AppStore {
       CREATE TABLE IF NOT EXISTS thread (
         key TEXT PRIMARY KEY,
         active INTEGER NOT NULL,
+        last_trigger_at TEXT,
         data TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS thread_active ON thread (active);
@@ -938,20 +964,30 @@ export class SqliteStore implements AppStore {
       );
     `)
 
-    const row = this.db.prepare('SELECT value FROM superagent_meta WHERE name = ?').get('schema_version') as
-      | { value?: string }
-      | undefined
-    const current = row?.value === undefined ? undefined : Number(row.value)
+    // Schema 1 kept the last Trigger time only inside the Thread JSON. The
+    // indexed column is added in place and backfilled once.
+    this.ensureThreadTimelineColumn()
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS ticket_updated ON ticket (updated_at DESC, id DESC);
+      CREATE INDEX IF NOT EXISTS thread_active_recent ON thread (active, last_trigger_at DESC, key);
+    `)
+
     if (current === undefined) {
-      this.db.prepare('INSERT INTO superagent_meta (name, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION))
+      this.stmt('INSERT INTO superagent_meta (name, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION))
       return
     }
-    if (current > SCHEMA_VERSION) {
-      throw new Error(`state database schema ${current} is newer than supported schema ${SCHEMA_VERSION}`)
-    }
     if (current < SCHEMA_VERSION) {
-      // Only schema 1 exists so far; older files are upgraded in place.
-      this.db.prepare('UPDATE superagent_meta SET value = ? WHERE name = ?').run(String(SCHEMA_VERSION), 'schema_version')
+      this.stmt(
+        "UPDATE thread SET last_trigger_at = json_extract(data, '$.lastTriggerAt') WHERE last_trigger_at IS NULL AND json_valid(data)",
+      ).run()
+      this.stmt('UPDATE superagent_meta SET value = ? WHERE name = ?').run(String(SCHEMA_VERSION), 'schema_version')
+    }
+  }
+
+  private ensureThreadTimelineColumn(): void {
+    const columns = this.stmt('PRAGMA table_info(thread)').all() as Array<{ name: string }>
+    if (!columns.some(column => column.name === 'last_trigger_at')) {
+      this.db.exec('ALTER TABLE thread ADD COLUMN last_trigger_at TEXT')
     }
   }
 }

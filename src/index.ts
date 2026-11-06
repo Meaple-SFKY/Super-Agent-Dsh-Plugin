@@ -98,6 +98,34 @@ export const Config: unknown = Schema.object({
         en: 'Optional Telegram group chat ids to listen to (mentions only).',
         zh: '可选：要监听的 Telegram 群 chat id（只处理 @）。',
       }),
+      pollTimeoutSeconds: Schema.number().default(25).i18n({
+        en: 'Telegram getUpdates long-poll timeout in seconds (0 makes it a plain poll).',
+        zh: 'Telegram getUpdates 长轮询超时（秒）；0 表示普通轮询。',
+      }),
+      observeCallbacks: Schema.boolean().default(false).i18n({
+        en: 'Turn inline-button presses into callback Triggers. Default false: buttons are ignored unless enabled.',
+        zh: '把内联按钮点击转成 callback 候选。默认 false：未开启时按钮点击被忽略。',
+      }),
+      observeAllChatMessages: Schema.boolean().default(false).i18n({
+        en: 'Admit unaddressed group messages (addressed: none). Default false.',
+        zh: '接收群聊中未 @ 的消息（addressed: none）。默认 false。',
+      }),
+      replyToMessages: Schema.boolean().default(false).i18n({
+        en: 'Reply under the Telegram message that caused a Trigger. Default false.',
+        zh: '在触发工作的 Telegram 消息下回复。默认 false。',
+      }),
+      mentionPattern: Schema.string().default('').i18n({
+        en: 'Extra literal @name considered an address of the bot.',
+        zh: '额外视为 bot 名称的字面 @name。',
+      }),
+      processBacklog: Schema.boolean().default(false).i18n({
+        en: 'On the first start, drain up to 24h of Bot API backlog instead of only the latest pending update.',
+        zh: '首次启动时回灌最多 24 小时的 Bot API 积压，而不是只取最新一条。',
+      }),
+      maxDownloadBytes: Schema.number().default(20 * 1024 * 1024).i18n({
+        en: 'Refuse to download Telegram media larger than this many bytes (default 20 MiB).',
+        zh: '拒绝下载超过该字节数的 Telegram 媒体（默认 20 MiB）。',
+      }),
       richText: Schema.boolean().default(true).i18n({
         en: 'Render rich text (Telegram HTML) for outgoing messages; off sends plain text.',
         zh: '对外消息使用富文本（Telegram HTML）；关闭则发送纯文本。',
@@ -110,9 +138,9 @@ export const Config: unknown = Schema.object({
         en: 'Allow inline keyboards/buttons on outgoing messages; button presses only become Triggers when observeCallbacks is on.',
         zh: '允许对外消息附带内联按钮/键盘；只有在 observeCallbacks 开启时按钮点击才会成为候选。',
       }),
-      pollSeconds: Schema.number().default(60).i18n({
-        en: 'Polling interval in seconds.',
-        zh: '轮询间隔（秒）。',
+      pollSeconds: Schema.number().default(1).i18n({
+        en: 'Idle delay after an empty long poll, in seconds (0.01–300). Default 1: the long poll already waits up to pollTimeoutSeconds.',
+        zh: '空长轮询后的等待秒数（0.01–300）。默认 1：长轮询本身最多等待 pollTimeoutSeconds。',
       }),
     }).default({}),
     github: Schema.object({
@@ -143,6 +171,30 @@ export const Config: unknown = Schema.object({
       collaborators: Schema.array(Schema.string()).default([]).i18n({
         en: 'GitHub logins invited as collaborators when the bot creates a repository (usually your personal account).',
         zh: 'bot 新建仓库时自动邀请为 collaborator 的 GitHub 登录名（通常是你的个人账号）。',
+      }),
+      botLogins: Schema.array(Schema.string()).default([]).i18n({
+        en: 'Bot logins whose events are admitted as inferred candidates.',
+        zh: '允许作为推断候选来源的 bot 登录名。',
+      }),
+      notifications: Schema.union(['auto', 'off', 'on']).default('auto').i18n({
+        en: 'GitHub notification stream: auto (use it when the token can read notifications), off, or on.',
+        zh: 'GitHub 通知流：auto（token 可读通知时使用）、off 或 on。',
+      }),
+      maxTextChars: Schema.number().default(16_000).min(1_000).max(64_000).i18n({
+        en: 'Maximum characters of issue/PR text fed to the model (1k–64k, default 16k).',
+        zh: '传给模型的 Issue/PR 文本上限（1k–64k，默认 16k）。',
+      }),
+      adaptivePolling: Schema.boolean().default(true).i18n({
+        en: 'Poll repositories mentioned by the notifications stream first; off polls every repository on the normal schedule.',
+        zh: '优先轮询通知流涉及的仓库；关闭后所有仓库按常规节奏轮询。',
+      }),
+      operatorTokenFile: Schema.string().default('').i18n({
+        en: 'Path to the operator personal PAT file (0600, local only) used to invite the bot / accept repository invitations; the token content is never stored in configuration.',
+        zh: '操作者个人 PAT 文件路径（本机 0600），用于邀请 bot/接受仓库邀请；token 内容不写入配置。',
+      }),
+      acceptInvitations: Schema.union(['off', 'allowlist', 'all']).default('allowlist').i18n({
+        en: 'Which bot-account repository invitations may be accepted automatically: off, allowlist (inviter/owner in allowedLogins/collaborators; default) or all.',
+        zh: 'bot 账号收到的仓库邀请如何自动接受：off（关）、allowlist（邀请者在 allowedLogins/collaborators 内，默认）或 all（全部）。',
       }),
       allowSelf: Schema.boolean().default(false).i18n({
         en: 'Allow events from the token owner account itself. Enable when the agent runs as your own GitHub account; its own output is still filtered by the agent marker.',
@@ -249,13 +301,6 @@ export const Config: unknown = Schema.object({
     maxChars: Schema.number().default(0).i18n({
       en: 'Optional hard cap for outbound messages; 0 uses minChars.',
       zh: '可选：对外消息硬上限；0 表示使用 minChars。',
-    }),
-    quietHours: Schema.object({
-      from: Schema.string().default('').i18n({ en: 'Start of quiet hours, HH:MM.', zh: '静默时段开始，HH:MM。' }),
-      to: Schema.string().default('').i18n({ en: 'End of quiet hours, HH:MM.', zh: '静默时段结束，HH:MM。' }),
-    }).default({}).i18n({
-      en: 'Optional quiet hours; non-urgent messages wait until they end.',
-      zh: '可选静默时段；非紧急消息延迟到结束后。',
     }),
   }).default({}),
   watchdog: Schema.object({

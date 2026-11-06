@@ -26,7 +26,8 @@ Usage: $0 [options]
   --state-dir <path>  Superagent state directory (default: \$SUPERAGENT_STATE_DIR or
                       \$HOME/.dsh/state/superagent). Must be absolute.
   --label <label>     LaunchAgent label (default: $LABEL)
-  --node <path>       Node executable (default: node on PATH, then the DSH-bundled Node)
+  --node <path>       Absolute Node executable (default: the running Node's
+                      process.execPath, then the DSH-bundled Node)
   --dry-run           Render the plist to stdout; do not write or load it
   -h, --help          Show this help
 
@@ -78,8 +79,11 @@ esac
 [ -f "$TEMPLATE" ] || fail "missing plist template: $TEMPLATE"
 [ -f "$SCRIPT_DIR/watchdog.mjs" ] || fail "missing watchdog: $SCRIPT_DIR/watchdog.mjs"
 
+# Resolve Node to an absolute path captured at install time: launchd does not
+# read the user's shell profile, so a `command -v node` nvm/volta shim would
+# stop working after the next Node upgrade or logout.
 if [ -z "$NODE_BIN" ]; then
-  NODE_BIN=$(command -v node 2>/dev/null || true)
+  NODE_BIN=$(node -p 'process.execPath' 2>/dev/null || true)
 fi
 if [ -z "$NODE_BIN" ]; then
   BUNDLED_NODE="$HOME/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node"
@@ -87,8 +91,22 @@ if [ -z "$NODE_BIN" ]; then
     NODE_BIN="$BUNDLED_NODE"
   fi
 fi
-[ -n "$NODE_BIN" ] || fail 'node not found; install Node 22.19+/24+ or pass --node <path>'
-NODE_DIR=$(CDPATH= cd -- "$(dirname -- "$NODE_BIN")" && pwd)
+[ -n "$NODE_BIN" ] || fail 'node not found; pass --node <absolute path to node 22.19+/24+>'
+case "$NODE_BIN" in
+  /*) ;;
+  *) fail "--node must be an absolute path: $NODE_BIN" ;;
+esac
+[ -x "$NODE_BIN" ] || fail "node is not executable: $NODE_BIN"
+NODE_BIN=$(CDPATH= cd -- "$(dirname -- "$NODE_BIN")" && pwd -P)/$(basename -- "$NODE_BIN")
+NODE_VERSION=$("$NODE_BIN" -v 2>/dev/null || true)
+case "$NODE_VERSION" in
+  v22.*|v23.*|v24.*|v25.*|v26.*|v27.*) ;;
+  *) printf 'install-launchd: warning: %s is %s; Node 22.19+/24+ is required by the plugin\n' "$NODE_BIN" "${NODE_VERSION:-unknown}" >&2 ;;
+esac
+if printf '%s' "$NODE_BIN" | grep -q '/\.nvm/'; then
+  printf 'install-launchd: warning: %s points into nvm; upgrades/removal will break the LaunchAgent. Pass --node with a stable path (e.g. the DSH bundled node).\n' "$NODE_BIN" >&2
+fi
+NODE_DIR=$(CDPATH= cd -- "$(dirname -- "$NODE_BIN")" && pwd -P)
 PATH_VALUE="$NODE_DIR:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 mkdir -p "$STATE_DIR"
@@ -105,7 +123,8 @@ render() {
 }
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf 'install-launchd: dry run, plist would be written to %s\n\n' "$PLIST" >&2
+  printf 'install-launchd: dry run, plist would be written to %s\n' "$PLIST" >&2
+  printf 'install-launchd: node=%s; self-check would run: %s/watchdog.mjs --state-dir %s --dry-run\n\n' "$NODE_BIN" "$SCRIPT_DIR" "$STATE_DIR" >&2
   render
   exit 0
 fi
@@ -125,13 +144,29 @@ launchctl enable "gui/$UID/$LABEL" 2>/dev/null || true
 # Run one check immediately so a broken setup is visible now.
 launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null || true
 
+# Post-install self-check: the same dry run a person would run by hand. It
+# proves the chosen node path and the watchdog script are usable before the
+# first real LaunchAgent interval. A failure rolls the install back.
+SELF_CHECK_CODE=0
+SELF_CHECK_OUTPUT=$("$NODE_BIN" "$SCRIPT_DIR/watchdog.mjs" --state-dir "$STATE_DIR" --dry-run --json 2>&1) || SELF_CHECK_CODE=$?
+if [ "$SELF_CHECK_CODE" -ne 0 ]; then
+  printf 'install-launchd: self-check failed (node=%s, exit=%s):\n%s\n' "$NODE_BIN" "$SELF_CHECK_CODE" "$SELF_CHECK_OUTPUT" >&2
+  launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+  rm -f "$PLIST"
+  fail 'watchdog self-check failed; LaunchAgent was removed'
+fi
+STATUS_FILE="$STATE_DIR/watchdog-status.json"
+"$NODE_BIN" -e 'const fs=require("fs");const p=process.argv[1];let s={};try{s=JSON.parse(fs.readFileSync(p,"utf8"))}catch{};s.installed=true;s.loaded=true;s.label=process.argv[2];s.plistPath=process.argv[3];s.installedAt=new Date().toISOString();fs.writeFileSync(p,JSON.stringify(s,null,2)+"\n");' "$STATUS_FILE" "$LABEL" "$PLIST" 2>/dev/null || true
+
 cat <<EOF
 install-launchd: installed $LABEL
   plist:      $PLIST
   watchdog:   $SCRIPT_DIR/watchdog.mjs
-  node:       $NODE_BIN
+  node:       $NODE_BIN (${NODE_VERSION:-unknown})
   state dir:  $STATE_DIR
-  log:        $STATE_DIR/watchdog.log
+  log:        $STATE_DIR/watchdog.log (rotates at 2 MiB, keeps .1)
+  status:     $STATUS_FILE
+  self-check: passed
 
 Verify:
   launchctl print gui/$UID/$LABEL | head -20

@@ -7,6 +7,9 @@
  * report. Both steps are bounded and idempotent per assignment.
  */
 
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+
 import type { Assignment, IsoTime, Ticket, TicketId } from '../core/model.js'
 import type { EffectsPort, Engine, ExecutorPort, Store } from '../core/ports.js'
 import type { AppLogger } from './support.js'
@@ -26,6 +29,8 @@ export interface WatchdogConfig {
 }
 
 export interface WatchdogOptions {
+  /** Absolute state directory; when set, a `.superagent-state` marker is written on start. */
+  stateDir?: string
   store: Store
   executor: ExecutorPort
   engine: () => Engine
@@ -37,6 +42,29 @@ export interface WatchdogOptions {
   isPaused?: () => boolean
   /** Health sink for the silent-ticket self-heal (the runtime owns the registry). */
   reportHealth?: (name: string, state: 'ready' | 'error', detail?: string) => void
+}
+
+/** Marker file proving a directory is SuperAgent-owned (used by uninstall guards). */
+export const STATE_MARKER_FILE = '.superagent-state'
+
+/**
+ * Write `<stateDir>/.superagent-state` with the plugin id. Best effort: the
+ * marker only guards destructive uninstall operations, so a failed write must
+ * never prevent the plugin from starting.
+ */
+export function writeStateMarker(
+  stateDir: string,
+  pluginName = 'dsh-superagent-personal',
+  at: IsoTime = new Date().toISOString(),
+): void {
+  if (typeof stateDir !== 'string' || stateDir.length === 0) return
+  try {
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+    const body = JSON.stringify({ plugin: pluginName, at, markerVersion: 1 }, null, 2) + '\n'
+    writeFileSync(join(stateDir, STATE_MARKER_FILE), body, { mode: 0o600 })
+  } catch {
+    // Best effort by contract.
+  }
 }
 
 /** KV prefix of the bounded self-heal counter, one per ticket. */
@@ -89,6 +117,7 @@ export class Watchdog {
 
   /** Start the periodic scan (unref'ed timer; never throws). */
   start(): void {
+    if (this.options.stateDir !== undefined) writeStateMarker(this.options.stateDir)
     if (this.timer) return
     const interval = Math.max(5_000, this.options.config?.intervalMs ?? DEFAULT_INTERVAL_MS)
     this.timer = setInterval(() => {

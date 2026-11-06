@@ -74,11 +74,18 @@ interface PluginConfig {
   stateDir: string
   sources?: {
     telegram?: { enabled?: boolean; tokenEnv?: string; tokenFile?: string; allowedUserIds?: string[]; chats?: string[] }
-    github?: { enabled?: boolean; tokenEnv?: string; tokenFile?: string; repositories?: string[]; login?: string; observeIssues?: boolean; observePulls?: boolean; observeComments?: boolean; observeCi?: boolean }
+    github?: {
+      enabled?: boolean; tokenEnv?: string; tokenFile?: string; repositories?: string[]; login?: string
+      allowSelf?: boolean; allowedLogins?: string[]; botLogins?: string[]; collaborators?: string[]
+      operatorTokenFile?: string; acceptInvitations?: 'off' | 'allowlist' | 'all'
+      notifications?: 'auto' | 'off' | 'on'; maxTextChars?: number; adaptivePolling?: boolean
+      observeIssues?: boolean; observePulls?: boolean; observeComments?: boolean; observeCi?: boolean
+    }
   }
+  router?: { provider?: string; model?: string; reasoningEffort?: string }
   policy?: { mode?: 'off' | 'observe' | 'auto'; rules?: Array<{ id: string; name: string; enabled?: boolean; instructions: string }> }
-  executor?: { model?: string; maxWorkers?: number; prepare?: string }
-  quiet?: { minChars?: number; quietHours?: { from: string; to: string } }
+  executor?: { provider?: string; model?: string; reasoningEffort?: string; maxWorkers?: number; prepare?: string }
+  quiet?: { minChars?: number; maxChars?: number }
 }
 ```
 

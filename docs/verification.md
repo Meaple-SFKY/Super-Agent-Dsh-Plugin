@@ -1,6 +1,6 @@
 # 验证报告（独立 QA / M5）
 
-最后更新：2026-11-06 17:05（Asia/Shanghai）
+最后更新：2026-11-07 00:30（Asia/Shanghai）
 环境：DSH 0.2.2-rc.1，Node 26.13.0（bundled pnpm），macOS；`research/` 为本地提取物，不参与安装。
 范围：`src/**` 静态审计 + 隔离/恢复/E2E/打包验证；不修改 `src/`，不 commit。
 复跑入口：`./scripts/pnpmw check`（typecheck + build + 全量测试）。
@@ -9,14 +9,14 @@
 
 ## 1. 结论摘要
 
-- 全量 `./scripts/pnpmw check`：**22 个测试文件 / 279 个测试全部通过**，构建产物 `lib/index.js`、`lib/engine.js`（含拆分 chunk）与 `lib/client.js` 齐全。
+- 全量 `./scripts/pnpmw check`：**32 个测试文件 / 600 个测试全部通过**（task-58 后；client minify/轮询门控/Config 契约/详情视图与打包瘦身），构建产物 `lib/index.js`、`lib/engine.js`（含拆分 chunk）与 `lib/client.js` 齐全。
 - 用户硬要求（DSH 不被拖垮、失败可见、崩溃自愈、数据不丢不坏、安静打扰、双渠道同一助手、可安装、版本兼容）均有自动化证据；**Lead 已完成真实安装**：`plugin_manager install_bundle` 返回 `application: applied`，插件 `ready`，API 200/403 正确，面板 slot 已注册（§8）。
 - 静态审计共 18 项：3 项高危 + B1/B2/B3 三项中等风险已由 owner 修复并被回归测试锁定；剩余低风险见 §4.2（B4–B6 文档/实现差距，不影响启动与打扰策略）。
 
 ## 2. 方法与可复现命令
 
 ```sh
-./scripts/pnpmw check        # tsc --noEmit && tsdown && build-client && vitest run  → 22 files / 268 tests
+./scripts/pnpmw check        # tsc --noEmit && tsdown && build-client && vitest run  → 32 files / 600 tests
 ./scripts/pnpmw exec vitest run tests/verify-guardian.spec.ts     # 20 tests
 ./scripts/pnpmw exec vitest run tests/verify-recovery.spec.ts     # 11 tests
 ./scripts/pnpmw exec vitest run tests/e2e                       # 19 tests（见 §3）
@@ -35,6 +35,14 @@
 | `tests/e2e/verify-packaging.spec.ts` | 9 | 打包静态契约：`dsh.bundle.patch`、`dsh.client`、`manifestVersion`、所有 `exports` 目标存在（含 `lib/client.js`/`lib/engine.js`）、`files` 列出的资产存在、`engines.node`/`engines.dsh` 与 guardian `SUPPORTED_DSH` 一致、patch 内 preset id 与 runtime 选择一致、示例 profile 覆盖同一插件 id、示例不含真实 token、client 模块 id == 包名且 inject 为 bundle 名 | ✅ 9/9 |
 
 > 合计：本报告新增 50 个测试（20 + 11 + 5 + 5 + 9）；其余 218 个测试来自各 owner（core/store/effects/outbox/sources/runtime/tools/patch/client/guardian-isolation 等），作为交叉验证一并跑绿。
+
+## 3.6 Schema 2 与打包/面板变更（task-58）
+
+- `SCHEMA_VERSION` 已从 **1 升到 2**：v1 → v2 增加 `thread.last_trigger_at` 索引列并从 JSON 回填，补 `ticket_updated` / `thread_active_recent` 索引；更高版本仍被明确拒绝（`newer than supported schema`），`integrity_check` 保持 ok。旧文档/注释里的“schema 1”指旧布局，当前支持 **2**。
+- 打包：`files` 从整个 `lib`/`docs` 收窄为 `lib/**/*.js` + `lib/**/*.d.ts` 与 `docs/000-003`；实测 `npm pack --dry-run` 从 44 files / 512 KB packed / 1.97 MB unpacked 降到 31 files / ~235 KB packed / ~845 KB unpacked（sourcemap 1.05 MB 与内部 docs 122 KB 不再入包）。
+- 客户端：`scripts/build-client.mjs` 用 tsdown 依赖的 rolldown 压缩 client（约 199 KB → 130 KB；gzip ~36 KB），轮询按 view 门控并跳过内容未变化的响应；空闲 Overview 由 29 req/min 降到约 13 req/min。
+- 面板：Ticket/待决策详情为只读抽屉（`role=dialog`、Esc 关闭），映射 8 个阶段标签；`SafeView` 隔离视图渲染异常。
+- Config：补齐 Telegram 7 个 source 字段与 GitHub `botLogins`/`notifications`/`maxTextChars`/`adaptivePolling`；`quiet.quietHours` 从未实现的 Schema 中移除；`telegram.pollSeconds` 默认改为 idle 1s 并修正文案；新增 Config↔source 字段契约测试。
 
 ## 4. 静态审计清单（file:line / 严重度 / 状态）
 
@@ -94,7 +102,7 @@
 2. **Web 面板视觉渲染**：slot 注册已在真实 client（`sidebar.panellist` occupant `superagent`、`main` key `superagent`）确认 active；未做截图/点击级验证（本环境无浏览器控制），按钮请求路径已由 mock + API 实测覆盖。
 3. **真实 Telegram/GitHub 网络**：假 HTTP 覆盖了轮询/游标/发送/幂等 marker，但真实限速、长轮询超时、token 失效、GitHub Secondary Rate Limit 未打到真实服务。
 4. **真实模型行为**：Router/Worker 的语义决策、quiet policy 的“模型不乱说话”、报告格式均用模拟 host 的 tool 调用验证，未用真实 LLM。
-5. ~~**B1/B2/B3**~~ **已修复并回归**（§4.2）：B1 core-ticket 4 例，B2 runtime-watchdog 4 例，B3 watchdog 5 例；全量 279 绿。
+5. ~~**B1/B2/B3**~~ **已修复并回归**（§4.2）：B1 core-ticket 4 例，B2 runtime-watchdog 4 例，B3 watchdog 5 例；全量 600 绿。
 6. **PR 绑定 glue**（A4）：source 回调 payload（含 `thread`）有 owner 测试，runtime `onPullOpened`→`bindThread` 仅代码核对；尝试在 E2E 中通过注入 source 验证时发现注入路径不经过 runtime 的 callback 装配（runtime 自建 source 才装配），故未纳入自动化；建议真实安装后用一次真实/回放 PR 验证。
 7. **watchdog/launchd**：`scripts/watchdog.mjs`、`install-launchd.sh`、`setup.mjs` 仅静态审查（无 secret 打印、参数校验、退避/上限逻辑），未执行 `launchctl`。
 8. **多 worker 并发**（`executor.maxWorkers>1`）：core/runtime 单测覆盖部分，E2E 用 1–2 个 worker，未做并发压力/锁竞争测试。
@@ -102,7 +110,7 @@
 
 ## 7. 安装冒烟清单（Lead 执行）
 
-前置：`./scripts/pnpmw check`（本报告 268/268 绿）→ `./scripts/pnpmw build`（`lib/` 被 gitignore，必须构建）。
+前置：`./scripts/pnpmw check`（本报告 600/600 绿）→ `./scripts/pnpmw build`（`lib/` 被 gitignore，必须构建）。
 
 1. **建独立 profile**，`plugin_manager install_bundle` 目标填本仓库绝对路径（`link:`）；安装结果无 `engines.dsh`/`engines.node` 报错。
 2. **行存在且激活**：`plugin_manager list_plugins` 中 `dsh-superagent-personal` 的 `fiberPhase` 为 active（`status 3` 以外的错误态立即检查 stderr/`superagent-status.json`）。
@@ -124,7 +132,7 @@
 $ ./scripts/pnpmw check
 tsdown … lib/index.js 16.31 kB, lib/engine.js 0.41 kB, lib/runtime-*.js 210.32 kB,
         lib/github-*.js 44.23 kB, lib/telegram-*.js 29.59 kB, lib/kind-*.js 0.50 kB
-vitest: Test Files 22 passed (22) · Tests 268 passed (268)
+vitest: Test Files 32 passed (32) · Tests 600 passed (600)
 
 $ ./scripts/pnpmw exec vitest run tests/verify-guardian.spec.ts
 Tests 20 passed — 含 “restarts after ready (config change / fiber.restart())”、

@@ -6,7 +6,7 @@
  * create tickets, talk to the user, or touch another ticket.
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve as resolvePath } from 'node:path'
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -165,6 +165,15 @@ interface GithubModule {
     permission: string
     alreadyCollaborator: boolean
   }>
+  acceptInvitationForRepo?: (
+    token: string,
+    repo: string,
+    options?: { apiBaseUrl?: string; timeoutMs?: number },
+  ) => Promise<{ ok: true; repo: string; status: string; invitationId?: number }>
+  validateGithubToken?: (
+    token: string,
+    options?: { apiBaseUrl?: string; timeoutMs?: number },
+  ) => Promise<{ ok: true; login: string; id: number }>
 }
 
 let githubModulePromise: Promise<GithubModule | undefined> | undefined
@@ -409,6 +418,56 @@ function summarizeCheckRuns(response: GithubCheckRunsResponse): Record<string, u
   }
 }
 
+const REPO_NAME = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
+
+function configuredRepositories(deps: ToolDeps): string[] {
+  try {
+    const policy = deps.engine.settings.policy()
+    return Array.isArray(policy.sources?.github?.repositories) ? policy.sources.github.repositories : []
+  } catch {
+    return []
+  }
+}
+
+function configuredGithubLogin(deps: ToolDeps): string | undefined {
+  const login = (deps.github as (GithubToolOptions & { login?: unknown }) | undefined)?.login
+  return typeof login === 'string' && login.trim() ? login.trim() : undefined
+}
+
+/**
+ * Writes may only touch repositories the Source is configured to listen to:
+ * an explicit allowlist, or (with `repositories: ['*']`) repositories owned by
+ * the token account / a configured operator. Everywhere else is denied before
+ * any API call.
+ */
+async function repositoryAllowedForWrites(deps: ToolDeps, repo: string, client: GithubApi): Promise<boolean> {
+  if (!REPO_NAME.test(repo)) return false
+  const configured = configuredRepositories(deps)
+  if (configured.length === 0) return false
+  if (!configured.includes('*')) {
+    return configured.some(entry => entry.toLowerCase() === repo.toLowerCase())
+  }
+  const trusted = new Set<string>()
+  try {
+    for (const actor of deps.engine.settings.policy().sources?.github?.allowed ?? []) {
+      trusted.add(actor.id.toLowerCase())
+    }
+  } catch {
+    // policy unavailable: rely on the token account below
+  }
+  for (const login of deps.github?.collaborators ?? []) trusted.add(login.toLowerCase())
+  const configuredLogin = configuredGithubLogin(deps)
+  if (configuredLogin) trusted.add(configuredLogin.toLowerCase())
+  if (!configuredLogin) {
+    try {
+      trusted.add((await client.getAuthenticatedUser()).login.toLowerCase())
+    } catch {
+      return false
+    }
+  }
+  return trusted.has(repo.split('/')[0]!.toLowerCase())
+}
+
 function summarizeWorkflowRuns(response: GithubWorkflowRunsResponse): Record<string, unknown> {
   const runs = Array.isArray(response.workflow_runs) ? response.workflow_runs : []
   return {
@@ -495,12 +554,6 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
         type: 'boolean',
         description: 'create_repository: create with an initial README/default branch (default false; the worker pushes main itself)',
       },
-      collaborators: {
-        type: 'array',
-        items: { type: 'string' },
-        description:
-          'create_repository: GitHub logins to invite as admin collaborators (default: the sources.github.collaborators configuration)',
-      },
       repo: { type: 'string', description: 'owner/name; defaults to the repository inferred from the ticket' },
       head: { type: 'string', description: 'pull_request: source branch (default agent/<ticketId>)' },
       base: { type: 'string', description: 'pull_request: target branch (default: repository default branch)' },
@@ -583,12 +636,63 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
               ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
             },
           )
-          // Invite collaborators after the repository exists. A failed invite
-          // is a warning only: the repository was created and must stay usable.
-          const requested: string[] = Array.isArray(args.collaborators)
-            ? args.collaborators.map((value: unknown) => String(value))
-            : (options.collaborators ?? [])
+          // Collaborators come only from the runtime configuration: the model
+          // cannot name arbitrary users, and an existing repository is left
+          // untouched (no surprise admin grants on retries/idempotent calls).
+          let requested = created.created ? [...(options.collaborators ?? [])] : []
+          // With an operator PAT but no configured collaborator list, derive the
+          // operator login from the token so the bot invitation still happens.
+          if (created.created && requested.length === 0 && options.operatorTokenFile && module.validateGithubToken) {
+            try {
+              const operatorToken = readFileSync(options.operatorTokenFile, 'utf8').trim()
+              if (operatorToken) {
+                const validated = await module.validateGithubToken(operatorToken, {
+                  ...(options.apiBaseUrl ? { apiBaseUrl: options.apiBaseUrl } : {}),
+                  ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
+                })
+                if (validated.login) requested = [validated.login]
+              }
+            } catch (error) {
+              // Not fatal: repository creation already succeeded.
+              requested = []
+            }
+          }
           const invitations = await inviteCollaborators(module, tokenResult.token, created.fullName, requested, options)
+          const warnings = [...invitations.warnings]
+          // Bootstrap automation: the operator (personal account) invites the
+          // bot, then the operator PAT accepts that invitation for the new repo
+          // so the bot can push immediately. Best effort: failures are warnings.
+          let operator: Record<string, unknown> | undefined
+          if (created.created && options.operatorTokenFile && requested.length > 0) {
+            try {
+              const operatorToken = readFileSync(options.operatorTokenFile, 'utf8').trim()
+              if (!operatorToken) {
+                warnings.push('operator token file is empty; the bot must accept the invitation manually')
+              } else if (!module.acceptInvitationForRepo) {
+                warnings.push('invitation-auto-accept is unavailable in this build; accept the invitation manually')
+              } else {
+                const accepted = await module.acceptInvitationForRepo(
+                  operatorToken,
+                  created.fullName,
+                  {
+                    ...(options.apiBaseUrl ? { apiBaseUrl: options.apiBaseUrl } : {}),
+                    ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
+                  },
+                )
+                operator = {
+                  status: accepted.status,
+                  ...(accepted.invitationId !== undefined ? { invitationId: accepted.invitationId } : {}),
+                }
+                if (accepted.status === 'none') {
+                  warnings.push(
+                    'the operator account has no pending invitation for the new repository; check it can access the repository',
+                  )
+                }
+              }
+            } catch (error) {
+              warnings.push(`could not accept the repository invitation as the operator: ${sanitizeGithub(errorMessage(error))}`)
+            }
+          }
           return {
             ok: true,
             action: 'create_repository',
@@ -602,7 +706,8 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
             defaultBranch: created.defaultBranch,
             created: created.created,
             ...(invitations.collaborators.length > 0 ? { collaborators: invitations.collaborators } : {}),
-            ...(invitations.warnings.length > 0 ? { warnings: invitations.warnings } : {}),
+            ...(operator ? { operator } : {}),
+            ...(warnings.length > 0 ? { warnings } : {}),
           }
         } catch (error) {
           return mapGithubError(error)
@@ -619,6 +724,12 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
       const clientResult = await githubClient(deps, call)
       if ('ok' in clientResult) return clientResult
       const client = clientResult.client
+      if (!(await repositoryAllowedForWrites(deps, repo, client))) {
+        return failure(
+          'repo_not_allowed',
+          `repository ${repo} is outside the configured repositories allowlist (sources.github.repositories)`,
+        )
+      }
       const ticket = deps.store.tickets.get(call.ticketId)
 
       try {
@@ -703,20 +814,38 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
               }
               const files = await client.listPullFiles(repo, Number(args.number))
               const maxFiles = Math.min(Math.max(limit, 1), 30)
-              return {
-                ok: true,
-                action,
-                repo,
-                number: Number(args.number),
-                files: files.slice(0, maxFiles).map(file => ({
+              // Structured truncation: cap each patch and the whole list by bytes,
+              // so the model always receives valid JSON with an explicit marker.
+              const budget = 8_000
+              const summarized: Array<Record<string, unknown>> = []
+              let used = 0
+              let truncated = files.length > maxFiles
+              for (const file of files.slice(0, maxFiles)) {
+                const patch = typeof file.patch === 'string' ? clampText(file.patch, 800) : null
+                const entry = {
                   filename: file.filename,
                   status: file.status,
                   additions: file.additions,
                   deletions: file.deletions,
                   changes: file.changes,
-                  patch: typeof file.patch === 'string' ? clampText(file.patch, 1200) : null,
-                })),
-                truncated: files.length > maxFiles,
+                  patch,
+                }
+                const size = JSON.stringify(entry).length
+                if (used + size > budget) {
+                  truncated = true
+                  break
+                }
+                used += size
+                summarized.push(entry)
+              }
+              return {
+                ok: true,
+                action,
+                repo,
+                number: Number(args.number),
+                files: summarized,
+                fileCount: summarized.length,
+                truncated,
               }
             }
             if (action === 'review') {
@@ -944,8 +1073,12 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
   return definition
 }
 
-/** All Worker tools, in prompt order. */
+const workerDefinitionsCache = new WeakMap<ToolDeps, ToolDefinition[]>()
+
+/** All Worker tools, in prompt order (schema compiled once per runtime deps). */
 export function workerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
+  const cached = workerDefinitionsCache.get(deps)
+  if (cached !== undefined) return cached
   const now = clockOf(deps)
 
   const readContext = jsonTool({
@@ -1055,6 +1188,7 @@ export function workerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
         ...(reportFiles.files.length > 0 ? { files: reportFiles.files } : {}),
       }
       deps.engine.executor.report({ ticketId: call.ticketId, assignmentId: call.assignmentId, report: reportValue })
+      deps.wake?.()
       return {
         ok: true,
         accepted: true,
@@ -1080,6 +1214,7 @@ export function workerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
       const ids = requested.length > 0 ? requested : undelivered.map(input => input.id)
       if (ids.length === 0) return { ok: true, acknowledged: 0 }
       deps.engine.executor.inputsDelivered(call.ticketId, call.assignmentId, ids)
+      deps.wake?.()
       return { ok: true, acknowledged: ids.length, inputIds: ids }
     },
   })
@@ -1096,6 +1231,7 @@ export function workerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
       const call = workerCallContext(exec, deps)
       if ('ok' in call) return call
       deps.engine.executor.handback(call.ticketId, String(args.triggerId), oneLine(args.reason, 300))
+      deps.wake?.()
       return { ok: true, ticketId: call.ticketId, triggerId: String(args.triggerId) }
     },
   })
@@ -1111,6 +1247,7 @@ export function workerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
     async run(args, exec) {
       const call = workerCallContext(exec, deps)
       if ('ok' in call) return call
+      deps.wake?.()
       deps.engine.executor.followForContext(call.ticketId, {
         key: String(args.thread),
         source: String(args.source),
@@ -1131,11 +1268,14 @@ export function workerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
       const call = workerCallContext(exec, deps)
       if ('ok' in call) return call
       deps.engine.executor.markUnrelated(call.ticketId, String(args.thread), oneLine(args.reason, 300))
+      deps.wake?.()
       return { ok: true, ticketId: call.ticketId, thread: String(args.thread) }
     },
   })
 
-  return [readContext, report, ack, githubToolDefinition(deps), handback, followContext, markUnrelated]
+  const definitions = [readContext, report, ack, githubToolDefinition(deps), handback, followContext, markUnrelated]
+  workerDefinitionsCache.set(deps, definitions)
+  return definitions
 }
 
 /** Register every Worker tool in a worker agent's scope. */

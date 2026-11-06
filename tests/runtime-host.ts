@@ -308,6 +308,9 @@ export class FakeWebServer {
   readonly routes: FakeRoute[] = []
 
   register(route: FakeRoute): () => void {
+    if (this.routes.some(entry => entry.kind === route.kind && entry.path === route.path)) {
+      throw new Error(`webserver: duplicate ${route.kind} route "${route.path}"`)
+    }
     this.routes.push(route)
     return () => {
       const index = this.routes.indexOf(route)
@@ -429,6 +432,11 @@ export function createFakeHost(
     defaultModel?: { provider: string; model: string; reasoningEffort?: string }
     /** Simulate the DSH `llm` service. */
     llm?: FakeLlm
+    /** Simulate the DSH `connection` service (Host/Origin + credential fence). */
+    connection?: {
+      requestRejection?: (request: { headers: Record<string, string | string[] | undefined> }) => 401 | 403 | undefined
+      allowsRemoteAuthorities?: boolean
+    }
   } = {},
 ): FakeHost {
   const logger = options.logger ?? new RecordingLogger()
@@ -445,6 +453,7 @@ export function createFakeHost(
       ? { agentDefaultModel: { currentSelection: () => ({ ...options.defaultModel }) } }
       : {}),
     ...(options.llm ? { llm: options.llm } : {}),
+    ...(options.connection ? { connection: options.connection } : {}),
   }
   const ctx = new FakeRootContext(services, logger)
   const host: FakeHost = {

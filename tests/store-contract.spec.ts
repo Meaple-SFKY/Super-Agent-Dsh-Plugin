@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { MemoryStore, SqliteStore, createMemoryStore, openStore } from '../src/app/store.js'
+import { MemoryStore, SCHEMA_VERSION, SqliteStore, createMemoryStore, openStore } from '../src/app/store.js'
 import type { AppStore, EffectRow } from '../src/core/stores.js'
 import type {
   Decision,
@@ -292,6 +292,73 @@ describe.each(variants)('$name store', ({ create }) => {
     expect(db.read.activeThreads().map(thread => thread.key)).toEqual(['chat-1'])
   })
 
+  it('pages a Thread timeline with a stable before-cursor', () => {
+    const db = fresh()
+    const base = Date.parse(AT)
+    for (let index = 0; index < 130; index += 1) {
+      db.triggers.save(
+        makeTrigger({ id: `p${index}`, threadKey: 'page', at: new Date(base + index * 1_000).toISOString() }),
+      )
+    }
+    const all = db.read.threadTriggers('page', { limit: 500 })
+    expect(all).toHaveLength(130)
+    expect(all.map(trigger => trigger.id)).toEqual(Array.from({ length: 130 }, (_value, index) => `p${index}`))
+
+    const newest = db.read.threadTriggers('page', { limit: 50 })
+    expect(newest).toHaveLength(50)
+    expect(newest[0]?.id).toBe('p80')
+    expect(newest[newest.length - 1]?.id).toBe('p129')
+
+    const older = db.read.threadTriggers('page', {
+      limit: 50,
+      before: `${newest[0]!.at}|${newest[0]!.id}`,
+    })
+    expect(older).toHaveLength(50)
+    expect(older[0]?.id).toBe('p30')
+    expect(older[older.length - 1]?.id).toBe('p79')
+
+    const oldest = db.read.threadTriggers('page', {
+      limit: 50,
+      before: `${older[0]!.at}|${older[0]!.id}`,
+    })
+    expect(oldest.map(trigger => trigger.id)).toEqual(Array.from({ length: 30 }, (_value, index) => `p${index}`))
+
+    // A time-only cursor excludes the cursor Trigger itself.
+    const byTime = db.read.threadTriggers('page', { limit: 2, before: newest[0]!.at })
+    expect(byTime.map(trigger => trigger.id)).toEqual(['p78', 'p79'])
+
+    // Concatenating the pages rebuilds the whole history without gaps or repeats.
+    expect([...oldest, ...older, ...newest].map(trigger => trigger.id)).toEqual(all.map(trigger => trigger.id))
+  })
+
+  it('breaks timeline ties by Trigger id, ascending', () => {
+    const db = fresh()
+    for (const id of ['b', 'a', 'c']) {
+      db.triggers.save(makeTrigger({ id, threadKey: 'ties', at: AT }))
+    }
+    expect(db.read.threadTriggers('ties').map(trigger => trigger.id)).toEqual(['a', 'b', 'c'])
+    expect(db.read.threadTriggers('ties', { limit: 2 }).map(trigger => trigger.id)).toEqual(['b', 'c'])
+    expect(db.read.threadTriggers('ties', { limit: 2, before: `${AT}|c` }).map(trigger => trigger.id)).toEqual([
+      'a',
+      'b',
+    ])
+  })
+
+  it('pages correlated Threads with the same ordering', () => {
+    const db = fresh()
+    const base = Date.parse(AT)
+    db.triggers.save(makeTrigger({ id: 'own', threadKey: 'corr', at: new Date(base + 1_000).toISOString() }))
+    db.triggers.save(
+      makeTrigger({
+        id: 'evidence',
+        threadKey: 'elsewhere',
+        at: new Date(base + 2_000).toISOString(),
+        correlations: [{ key: 'corr', source: 'telegram' }],
+      }),
+    )
+    expect(db.read.threadTriggers('corr', { limit: 10 }).map(trigger => trigger.id)).toEqual(['own', 'evidence'])
+  })
+
   it('searches Triggers, Tickets and Decisions', () => {
     const db = fresh()
     db.triggers.save(makeTrigger({ id: 'tr_1', text: 'please fix the pipeline' }))
@@ -300,6 +367,148 @@ describe.each(variants)('$name store', ({ create }) => {
     const results = db.read.search('pipeline')
     expect(results.map(result => result.kind).sort()).toEqual(['decision', 'ticket', 'trigger'])
     expect(db.read.search('pipeline', 1)).toHaveLength(1)
+  })
+})
+
+describe('SqliteStore performance internals', () => {
+  function rawDb(store: AppStore): DatabaseSync {
+    return (store as unknown as { db: DatabaseSync }).db
+  }
+
+  function queryPlan(store: AppStore, sql: string, params: unknown[] = []): string {
+    const rows = rawDb(store).prepare('EXPLAIN QUERY PLAN ' + sql).all(...(params as never[])) as Array<{
+      detail: string
+    }>
+    return rows.map(row => row.detail).join(' | ')
+  }
+
+  it('caches prepared statements by SQL text', () => {
+    const store = new SqliteStore(':memory:')
+    let prepares = 0
+    const original = DatabaseSync.prototype.prepare
+    DatabaseSync.prototype.prepare = function patched(this: DatabaseSync, sql: string) {
+      prepares += 1
+      return original.call(this, sql)
+    }
+    try {
+      for (let index = 0; index < 5; index += 1) store.triggers.get('missing')
+      expect(prepares).toBe(1)
+      for (let index = 0; index < 5; index += 1) store.threads.get('missing')
+      expect(prepares).toBe(2)
+      // Repeating both does not compile anything new.
+      for (let index = 0; index < 5; index += 1) {
+        store.triggers.get('missing')
+        store.threads.get('missing')
+      }
+      expect(prepares).toBe(2)
+    } finally {
+      DatabaseSync.prototype.prepare = original
+      store.close()
+    }
+  })
+
+  it('uses the new indexes and index-ordered timeline pages', () => {
+    const store = new SqliteStore(':memory:')
+    try {
+      const recentPlan = queryPlan(store, 'SELECT data FROM ticket ORDER BY updated_at DESC, id DESC LIMIT ?', [50])
+      expect(recentPlan).toContain('ticket_updated')
+      const threadsPlan = queryPlan(
+        store,
+        'SELECT data FROM thread WHERE active = 1 ORDER BY last_trigger_at DESC, key ASC LIMIT ?',
+        [50],
+      )
+      expect(threadsPlan).toContain('thread_active_recent')
+      const timelinePlan = queryPlan(
+        store,
+        'SELECT t.data AS data FROM trigger_thread tt JOIN trigger t ON t.id = tt.trigger_id WHERE tt.thread_key = ? ORDER BY tt.at DESC, tt.trigger_id DESC LIMIT ?',
+        ['thread', 50],
+      )
+      expect(timelinePlan).toContain('trigger_thread_by_thread')
+      expect(timelinePlan).not.toContain('TEMP B-TREE')
+    } finally {
+      store.close()
+    }
+  })
+
+  it('batches trigger_thread rows and replaces them on re-save', () => {
+    const store = new SqliteStore(':memory:')
+    try {
+      const raw = rawDb(store)
+      store.triggers.save(
+        makeTrigger({
+          id: 'tr_1',
+          threadKey: 'primary',
+          correlations: [
+            { key: 'c1', source: 'telegram' },
+            { key: 'c2', source: 'github' },
+            { key: 'c3', source: 'telegram' },
+          ],
+        }),
+      )
+      const count = () =>
+        (raw.prepare('SELECT COUNT(*) AS c FROM trigger_thread WHERE trigger_id = ?').get('tr_1') as { c: number }).c
+      expect(count()).toBe(4)
+      // A re-save with fewer correlations replaces the old child rows.
+      store.triggers.save(makeTrigger({ id: 'tr_1', threadKey: 'primary' }))
+      expect(count()).toBe(1)
+    } finally {
+      store.close()
+    }
+  })
+
+  it('maintains the indexed last_trigger_at column', () => {
+    const store = new SqliteStore(':memory:')
+    try {
+      const raw = rawDb(store)
+      store.threads.save(makeThread('chat', { lastTriggerAt: '2026-01-01T00:00:05.000Z' }))
+      expect(
+        (raw.prepare('SELECT last_trigger_at AS at FROM thread WHERE key = ?').get('chat') as { at: string | null }).at,
+      ).toBe('2026-01-01T00:00:05.000Z')
+      store.threads.save(makeThread('chat'))
+      expect(
+        (raw.prepare('SELECT last_trigger_at AS at FROM thread WHERE key = ?').get('chat') as { at: string | null }).at,
+      ).toBeNull()
+    } finally {
+      store.close()
+    }
+  })
+
+  it('upgrades a schema 1 database in place', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'superagent-store-'))
+    try {
+      const file = join(directory, 'superagent.sqlite')
+      const raw = new DatabaseSync(file)
+      raw.exec(`
+        CREATE TABLE superagent_meta (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE thread (key TEXT PRIMARY KEY, active INTEGER NOT NULL, data TEXT NOT NULL);
+        INSERT INTO superagent_meta (name, value) VALUES ('schema_version', '1');
+      `)
+      raw.prepare('INSERT INTO thread (key, active, data) VALUES (?, ?, ?)').run(
+        'legacy',
+        1,
+        JSON.stringify({ key: 'legacy', source: 'telegram', meta: {}, subscriptions: [], context: [], queued: [], expired: 0, decisions: [], lastTriggerAt: '2026-01-01T00:00:09.000Z' }),
+      )
+      raw.close()
+
+      const store = new SqliteStore(file)
+      try {
+        const db = rawDb(store)
+        const columns = db.prepare('PRAGMA table_info(thread)').all() as Array<{ name: string }>
+        expect(columns.some(column => column.name === 'last_trigger_at')).toBe(true)
+        expect(
+          (db.prepare('SELECT last_trigger_at AS at FROM thread WHERE key = ?').get('legacy') as { at: string | null }).at,
+        ).toBe('2026-01-01T00:00:09.000Z')
+        expect(
+          (db.prepare('SELECT value FROM superagent_meta WHERE name = ?').get('schema_version') as { value: string }).value,
+        ).toBe(String(SCHEMA_VERSION))
+        expect(store.threads.get('legacy')?.lastTriggerAt).toBe('2026-01-01T00:00:09.000Z')
+        expect(store.read.activeThreads().map(thread => thread.key)).toEqual(['legacy'])
+      } finally {
+        store.close()
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
   })
 })
 

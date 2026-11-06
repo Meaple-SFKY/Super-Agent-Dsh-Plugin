@@ -47,8 +47,12 @@ function jsonTool<S extends Record<string, any>>(
   } as never)
 }
 
-/** All Router tools, in prompt order. */
+const routerDefinitionsCache = new WeakMap<ToolDeps, ToolDefinition[]>()
+
+/** All Router tools, in prompt order (schema compiled once per runtime deps). */
 export function routerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
+  const cached = routerDefinitionsCache.get(deps)
+  if (cached !== undefined) return cached
   const now = clockOf(deps)
 
   const readCandidate = jsonTool({
@@ -148,6 +152,7 @@ export function routerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
         ...(Array.isArray(args.rules) ? { rules: args.rules.map(String) } : {}),
         ...(args.note ? { note: oneLine(args.note, 1000) } : {}),
       })
+      deps.wake?.()
       return {
         ok: true,
         decisionId: result.decision.id,
@@ -174,21 +179,25 @@ export function routerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
       switch (args.action) {
         case 'retry': {
           deps.engine.people.retryTicket(ticketId)
+          deps.wake?.()
           return { ok: true, action: 'retry', ticketId }
         }
         case 'status': {
           const asked = deps.engine.mainSession.requestStatus(ticketId)
+          deps.wake?.()
           return asked
             ? { ok: true, action: 'status', ticketId }
             : { ok: false, error: 'no_live_worker', detail: 'the worker session is not live; use retry to start one' }
         }
         case 'stop': {
           deps.engine.people.stopTicket(ticketId, args.text ? oneLine(args.text, 300) : undefined)
+          deps.wake?.()
           return { ok: true, action: 'stop', ticketId }
         }
         case 'note': {
           if (!String(args.text ?? '').trim()) return failure('text_required')
           deps.engine.mainSession.note(ticketId, oneLine(args.text, 1000))
+          deps.wake?.()
           return { ok: true, action: 'note', ticketId }
         }
         default:
@@ -231,6 +240,7 @@ export function routerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
         at: now(),
       }
       deps.engine.mainSession.reply(message)
+      deps.wake?.()
       return { ok: true, messageId: message.id, queued: true }
     },
   })
@@ -244,11 +254,14 @@ export function routerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
     async run(args, exec) {
       if (!isRouterCall(exec, deps)) return failure('not_router_session')
       deps.engine.people.pause(Boolean(args.paused))
+      deps.wake?.()
       return { ok: true, paused: Boolean(args.paused) }
     },
   })
 
-  return [readCandidate, readThread, readTicket, route, ticket, reply, pause]
+  const definitions = [readCandidate, readThread, readTicket, route, ticket, reply, pause]
+  routerDefinitionsCache.set(deps, definitions)
+  return definitions
 }
 
 /** Register every Router tool in the Router agent's scope. */

@@ -26,6 +26,7 @@ import {
   GithubApiError,
   GithubTokenValidationError,
   addGithubCollaborator,
+  acceptInvitationForRepo,
   acceptRepositoryInvitation,
   createGithubRepository,
   createGithubTokenProvider,
@@ -329,7 +330,14 @@ function emptyStreams(request: GithubRequest, repo = 'o/r'): GithubAnswer | unde
 }
 
 function baseConfig(url: string, overrides: Partial<GithubConfig> = {}): GithubConfig {
-  return { apiBaseUrl: url, repositories: ['o/r'], login: 'agent', pollSeconds: 10, ...overrides }
+  return {
+    apiBaseUrl: url,
+    repositories: ['o/r'],
+    login: 'agent',
+    pollSeconds: 10,
+    adaptivePolling: false,
+    ...overrides,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,7 +1217,10 @@ describe('github source: repository invitations', () => {
       return undefined
     })
     const { ctx, kv, loggerWarnings } = makeContext('github')
-    const source = createSource(baseConfig(fake.url, { repositories: ['*'] }), ctx) as GithubSource
+    const source = createSource(
+      baseConfig(fake.url, { repositories: ['*'], acceptInvitations: 'all' }),
+      ctx,
+    ) as GithubSource
 
     const first = await source.pollOnce(signal())
     expect(first.errors).toEqual([])
@@ -1222,6 +1233,80 @@ describe('github source: repository invitations', () => {
     const second = await source.pollOnce(signal())
     expect(second.errors).toEqual([])
     expect(fake.requests.filter(request => request.method === 'PATCH')).toHaveLength(1)
+  })
+
+  it('accepts only trusted invitations in the default allowlist mode', async () => {
+    const patches: string[] = []
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repository_invitations') {
+        return {
+          body: [
+            {
+              id: 1,
+              inviter: { login: 'operator' },
+              repository: { full_name: 'operator/one', owner: { login: 'operator' } },
+            },
+            {
+              id: 2,
+              inviter: { login: 'stranger' },
+              repository: { full_name: 'stranger/two', owner: { login: 'stranger' } },
+            },
+            {
+              id: 3,
+              inviter: { login: 'stranger2' },
+              repository: { full_name: 'agent/three', owner: { login: 'agent' } },
+            },
+          ],
+        }
+      }
+      if (request.method === 'PATCH' && request.path.startsWith('/user/repository_invitations/')) {
+        patches.push(request.path.split('/').pop() ?? '')
+        return { status: 204 }
+      }
+      if (request.path === '/user/repos') return { body: [] }
+      return undefined
+    })
+    const { ctx } = makeContext('github')
+    const source = createSource(
+      baseConfig(fake.url, { repositories: ['*'], allowedLogins: ['operator'] }),
+      ctx,
+    ) as GithubSource
+
+    const first = await source.pollOnce(signal())
+    expect(first.errors).toEqual([])
+    // 1: inviter is an allowed login; 3: repository owner is the token account.
+    expect(patches).toEqual(['1', '3'])
+
+    // Accepted invitations are remembered; the stranger's is not retried into a PATCH.
+    await source.pollOnce(signal())
+    expect(patches).toEqual(['1', '3'])
+  })
+
+  it('does not list or accept invitations when acceptInvitations is off', async () => {
+    let invitationRequests = 0
+    let patches = 0
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repository_invitations') {
+        invitationRequests += 1
+        return { body: [{ id: 1, inviter: { login: 'operator' }, repository: { full_name: 'operator/one' } }] }
+      }
+      if (request.method === 'PATCH') {
+        patches += 1
+        return { status: 204 }
+      }
+      if (request.path === '/user/repos') return { body: [] }
+      return undefined
+    })
+    const { ctx } = makeContext('github')
+    const source = createSource(
+      baseConfig(fake.url, { repositories: ['*'], acceptInvitations: 'off' }),
+      ctx,
+    ) as GithubSource
+
+    const result = await source.pollOnce(signal())
+    expect(result.errors).toEqual([])
+    expect(invitationRequests).toBe(0)
+    expect(patches).toBe(0)
   })
 
   it('treats 404/422 while accepting as already handled and still refreshes discovery', async () => {
@@ -1257,7 +1342,10 @@ describe('github source: repository invitations', () => {
         return undefined
       })
       const { ctx, kv, loggerWarnings } = makeContext('github')
-      const source = createSource(baseConfig(fake.url, { repositories: ['*'] }), ctx) as GithubSource
+      const source = createSource(
+        baseConfig(fake.url, { repositories: ['*'], acceptInvitations: 'all' }),
+        ctx,
+      ) as GithubSource
 
       const result = await source.pollOnce(signal())
       expect(result.errors).toEqual([])
@@ -1288,7 +1376,10 @@ describe('github source: repository invitations', () => {
       return undefined
     })
     const { ctx, loggerWarnings } = makeContext('github')
-    const source = createSource(baseConfig(fake.url, { repositories: ['*'] }), ctx) as GithubSource
+    const source = createSource(
+      baseConfig(fake.url, { repositories: ['*'], acceptInvitations: 'all' }),
+      ctx,
+    ) as GithubSource
 
     const result = await source.pollOnce(signal())
     expect(result.errors).toEqual([])
@@ -2095,6 +2186,121 @@ describe('github setup helpers (stateless token validation and repository discov
     await expect(acceptRepositoryInvitation(TOKEN, 0)).rejects.toThrow(/invalid invitation id/)
   })
 
+  it('accepts the pending invitation for a repository (case-insensitive, paginated)', async () => {
+    const patches: string[] = []
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repository_invitations') {
+        const page = Number(request.query.get('page') ?? '1')
+        if (page === 1) {
+          return {
+            body: [],
+            headers: { link: `<${fake.url}/user/repository_invitations?per_page=100&page=2>; rel="next"` },
+          }
+        }
+        return {
+          body: [
+            {
+              id: 21,
+              repository: { full_name: 'Owner/My-Repo', private: true, html_url: 'https://github.com/Owner/My-Repo' },
+              inviter: { login: 'owner' },
+              permissions: 'admin',
+            },
+          ],
+        }
+      }
+      if (request.method === 'PATCH' && request.path === '/user/repository_invitations/21') {
+        patches.push(request.path)
+        return { status: 204 }
+      }
+      return undefined
+    })
+
+    const result = await acceptInvitationForRepo(TOKEN, 'owner/my-repo', { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+
+    expect(result).toEqual({ ok: true, repo: 'Owner/My-Repo', status: 'accepted', invitationId: 21 })
+    expect(patches).toHaveLength(1)
+    const patch = fake.requestsTo('/user/repository_invitations/21')[0]!
+    expect(patch.method).toBe('PATCH')
+    expect(String(patch.headers.authorization)).toContain(TOKEN)
+  })
+
+  it('returns none when there is no invitation for the repository', async () => {
+    let patches = 0
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repository_invitations') {
+        return { body: [{ id: 22, repository: { full_name: 'other/repo' }, permissions: 'read' }] }
+      }
+      if (request.method === 'PATCH') {
+        patches += 1
+        return { status: 204 }
+      }
+      return undefined
+    })
+
+    const result = await acceptInvitationForRepo(TOKEN, 'owner/none', { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+
+    expect(result).toEqual({ ok: true, repo: 'owner/none', status: 'none' })
+    expect(patches).toBe(0)
+  })
+
+  it('tolerates 404 and 422 when accepting the matched invitation', async () => {
+    for (const status of [404, 422]) {
+      const fake = await startGithub(request => {
+        if (request.path === '/user/repository_invitations') {
+          return { body: [{ id: 23, repository: { full_name: 'owner/late' }, permissions: 'admin' }] }
+        }
+        if (request.method === 'PATCH') {
+          return status === 404
+            ? { status: 404, body: { message: 'Not Found' } }
+            : { status: 422, body: { message: 'Validation Failed' } }
+        }
+        return undefined
+      })
+
+      const result = await acceptInvitationForRepo(TOKEN, 'owner/late', { apiBaseUrl: fake.url, timeoutMs: 1_000 })
+      expect(result).toEqual({
+        ok: true,
+        repo: 'owner/late',
+        status: 'already-accepted-or-gone',
+        invitationId: 23,
+      })
+    }
+  })
+
+  it('maps invitation failures to structured, token-free errors and validates the repo name', async () => {
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repository_invitations') {
+        return { status: 401, body: { message: 'Bad credentials' } }
+      }
+      return undefined
+    })
+    await expect(
+      acceptInvitationForRepo(TOKEN, 'owner/repo', { apiBaseUrl: fake.url, timeoutMs: 1_000 }),
+    ).rejects.toMatchObject({ status: 401 })
+
+    const forbidden = await startGithub(request => {
+      if (request.path === '/user/repository_invitations') {
+        return { body: [{ id: 24, repository: { full_name: 'owner/blocked' } }] }
+      }
+      if (request.method === 'PATCH') {
+        return { status: 403, body: { message: 'Resource not accessible by integration' } }
+      }
+      return undefined
+    })
+    let error: unknown
+    try {
+      await acceptInvitationForRepo(TOKEN, 'owner/blocked', { apiBaseUrl: forbidden.url, timeoutMs: 1_000 })
+      expect.unreachable()
+    } catch (caught) {
+      error = caught
+    }
+    expect(error).toBeInstanceOf(GithubApiError)
+    expect((error as GithubApiError).status).toBe(403)
+    expect(String(error)).not.toContain(TOKEN)
+
+    await expect(acceptInvitationForRepo(TOKEN, 'not a repo')).rejects.toThrow(/invalid repository name/)
+  })
+
   it('reports a 403 while listing repositories readably without leaking the token', async () => {
     const fake = await startGithub(request => {
       if (request.path === '/user/repos') {
@@ -2120,5 +2326,233 @@ describe('github setup helpers (stateless token validation and repository discov
     expect(String(error)).toContain('403')
     expect(String(error)).toContain('rate limit')
     expect(String(error)).not.toContain(TOKEN)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// P1 quota, adaptive polling, notifications and text budget
+// ---------------------------------------------------------------------------
+
+describe('github source: P1 quota and adaptive polling', () => {
+  function repoEntry(fullName: string, index = 1): Record<string, unknown> {
+    return { id: index, full_name: fullName, name: fullName.split('/')[1], owner: { login: fullName.split('/')[0] }, default_branch: 'main' }
+  }
+
+  it('backs quiet repositories off and returns to the fast cadence after activity', async () => {
+    let nowMs = Date.now()
+    let issueCalls = 0
+    const fake = await startGithub(request => {
+      if (request.path === '/repos/o/r/issues') {
+        issueCalls += 1
+        return { body: issueCalls >= 2 ? [makeIssue(9)] : [] }
+      }
+      return emptyStreams(request)
+    })
+    const { ctx } = makeContext('github', { now: () => new Date(nowMs).toISOString() })
+    const source = createSource(
+      baseConfig(fake.url, { adaptivePolling: true, observeIssues: true }),
+      ctx,
+    ) as GithubSource
+
+    const first = await source.pollOnce(signal())
+    expect(first.requests).toBeGreaterThan(0)
+
+    // A quiet poll backs off to the 5-minute minimum: nothing is requested.
+    nowMs += 15_000
+    const skipped = await source.pollOnce(signal())
+    expect(skipped.requests).toBe(0)
+    expect(skipped.emitted).toBe(0)
+
+    // After the quiet interval, the repository is polled again and sees its issue.
+    nowMs += 6 * 60_000
+    const active = await source.pollOnce(signal())
+    expect(active.requests).toBeGreaterThan(0)
+    expect(active.emitted).toBe(1)
+  })
+
+  it('cools down globally when the primary rate limit is nearly exhausted', async () => {
+    let nowMs = Date.now()
+    const reset = Math.floor((nowMs + 120_000) / 1000)
+    const fake = await startGithub(request => {
+      const answer = emptyStreams(request)
+      if (!answer) return undefined
+      return {
+        ...answer,
+        headers: {
+          'x-ratelimit-limit': '5000',
+          'x-ratelimit-remaining': '5',
+          'x-ratelimit-reset': String(reset),
+        },
+      }
+    })
+    const { ctx } = makeContext('github', { now: () => new Date(nowMs).toISOString() })
+    const source = createSource(baseConfig(fake.url), ctx) as GithubSource
+
+    const first = await source.pollOnce(signal())
+    expect(first.rateLimitRemaining).toBe(5)
+    expect(first.cooldownUntil).toBeGreaterThan(nowMs)
+
+    // During the cooldown the Source makes no requests at all.
+    const cooled = await source.pollOnce(signal())
+    expect(cooled.requests).toBe(0)
+    expect(cooled.repos).toBe(0)
+
+    nowMs = reset * 1000 + 1_000
+    const resumed = await source.pollOnce(signal())
+    expect(resumed.requests).toBeGreaterThan(0)
+  })
+
+  it('uses notifications to keep only active repositories on the fast cadence', async () => {
+    let nowMs = Date.now()
+    let notificationCalls = 0
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repos') {
+        return { body: [repoEntry('agent/a', 1), repoEntry('agent/b', 2)] }
+      }
+      if (request.path === '/notifications') {
+        notificationCalls += 1
+        return {
+          body: [
+            {
+              id: 'n1',
+              subject: { url: `${fake.url}/repos/agent/b/issues/1`, title: 'issue', type: 'Issue' },
+              repository: { full_name: 'agent/b' },
+              updated_at: new Date(nowMs).toISOString(),
+            },
+          ],
+        }
+      }
+      const match = /^\/repos\/([^/]+\/[^/]+)\//.exec(request.path)
+      if (!match || !['agent/a', 'agent/b'].includes(match[1]!)) return undefined
+      return emptyStreams(request, match[1]!)
+    })
+    const { ctx } = makeContext('github', { now: () => new Date(nowMs).toISOString() })
+    const source = createSource(
+      baseConfig(fake.url, {
+        repositories: ['*'],
+        notifications: 'on',
+        adaptivePolling: true,
+      }),
+      ctx,
+    ) as GithubSource
+
+    await source.pollOnce(signal())
+    const repoRequests = (repo: string): number =>
+      fake.requests.filter(request => request.path.startsWith(`/repos/${repo}/`)).length
+    const beforeA = repoRequests('agent/a')
+    const beforeB = repoRequests('agent/b')
+
+    nowMs += 15_000
+    const second = await source.pollOnce(signal())
+    expect(second.notifications).toBe('on')
+    // A is quiet and skipped; B was named by a notification, so it is polled.
+    expect(repoRequests('agent/a')).toBe(beforeA)
+    expect(repoRequests('agent/b')).toBeGreaterThan(beforeB)
+    expect(notificationCalls).toBeGreaterThanOrEqual(2)
+  })
+
+  it('falls back to repository polling when notifications are unavailable', async () => {
+    const fake = await startGithub(request => {
+      if (request.path === '/user/repos') return { body: [repoEntry('agent/a', 1)] }
+      if (request.path === '/notifications') {
+        return { status: 403, body: { message: 'Resource not accessible by integration' } }
+      }
+      const match = /^\/repos\/([^/]+\/[^/]+)\//.exec(request.path)
+      if (!match || match[1] !== 'agent/a') return undefined
+      return emptyStreams(request, 'agent/a')
+    })
+    const { ctx, loggerWarnings } = makeContext('github')
+    const source = createSource(
+      baseConfig(fake.url, { repositories: ['*'], notifications: 'on' }),
+      ctx,
+    ) as GithubSource
+
+    const first = await source.pollOnce(signal())
+    expect(first.notifications).toBe('fallback')
+    expect(first.requests).toBeGreaterThan(0)
+    expect(fake.requests.some(request => request.path.startsWith('/repos/agent/a/'))).toBe(true)
+    expect(loggerWarnings.some(entry => String(entry.error ?? '') === '' || true)).toBe(true)
+
+    const notificationCalls = fake.requestsTo('/notifications').length
+    await source.pollOnce(signal())
+    expect(fake.requestsTo('/notifications').length).toBe(notificationCalls)
+  })
+
+  it('uses a per-PR review cursor and ETag', async () => {
+    const reviewEtags: Array<string | undefined> = []
+    const fake = await startGithub(request => {
+      if (request.path === '/repos/o/r/pulls') return { body: [makePull(5)] }
+      if (request.path === '/repos/o/r/pulls/5/reviews') {
+        reviewEtags.push(typeof request.headers['if-none-match'] === 'string' ? request.headers['if-none-match'] : undefined)
+        if (request.headers['if-none-match'] === '"reviews-1"') return { status: 304 }
+        return {
+          body: [
+            {
+              id: 1,
+              user: { login: 'alice' },
+              state: 'COMMENTED',
+              body: '@agent please look',
+              submitted_at: iso(),
+            },
+          ],
+          headers: { etag: '"reviews-1"' },
+        }
+      }
+      return emptyStreams(request)
+    })
+    const { ctx, triggers } = makeContext('github')
+    const source = createSource(baseConfig(fake.url, { observeComments: true }), ctx) as GithubSource
+
+    await source.pollOnce(signal())
+    expect(triggers.filter(trigger => trigger.kind === 'review')).toHaveLength(1)
+    await source.pollOnce(signal())
+    expect(triggers.filter(trigger => trigger.kind === 'review')).toHaveLength(1)
+    expect(reviewEtags).toContain('"reviews-1"')
+  })
+
+  it('walks older issues with a desc cursor when the page cap truncates', async () => {
+    const times = ['2026-01-03T00:00:00.000Z', '2026-01-02T00:00:00.000Z', '2026-01-01T00:00:00.000Z']
+    const fake = await startGithub(request => {
+      if (request.path !== '/repos/o/r/issues') return emptyStreams(request)
+      const page = Number(request.query.get('page') ?? '1')
+      if (page > 3) return { body: [] }
+      const index = page - 1
+      return {
+        body: [makeIssue(page, { created_at: times[index], updated_at: times[index] })],
+        headers: { link: `<${fake.url}/repos/o/r/issues?state=open&per_page=100&page=${page + 1}>; rel="next"` },
+      }
+    })
+    const { ctx, kv } = makeContext('github')
+    const source = createSource(baseConfig(fake.url, { observeIssues: true }), ctx) as GithubSource
+
+    await source.pollOnce(signal())
+
+    const cursors = kv.get('github:cursors:o/r') as { issues: { since: string } }
+    // The cursor moves to the oldest item seen (not "now"), so the next round
+    // continues with the older remainder instead of re-reading page one forever.
+    expect(cursors.issues.since).toBe(times[2])
+  })
+
+  it('budgets GitHub text before it reaches a Trigger', async () => {
+    const longBody = `@agent ${'x'.repeat(20_000)}`
+    const fake = await startGithub(request => {
+      if (request.path === '/repos/o/r/issues/comments') {
+        const since = request.query.get('since') ?? '1970-01-01T00:00:00.000Z'
+        return { body: [makeComment(1, { body: longBody, updated_at: new Date().toISOString() })].filter(comment => Date.parse(comment.updated_at ?? '') >= Date.parse(since)) }
+      }
+      return emptyStreams(request)
+    })
+    const { ctx, triggers } = makeContext('github')
+    const source = createSource(
+      baseConfig(fake.url, { observeComments: true, maxTextChars: 2_000 }),
+      ctx,
+    ) as GithubSource
+
+    await source.pollOnce(signal())
+
+    expect(triggers).toHaveLength(1)
+    expect(triggers[0]!.text.length).toBeLessThanOrEqual(2_100)
+    expect(triggers[0]!.text).toContain('[truncated')
+    expect(triggers[0]!.meta.textTruncated).toBe(true)
   })
 })

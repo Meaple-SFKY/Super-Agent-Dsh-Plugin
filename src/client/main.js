@@ -52,6 +52,7 @@ function build(require) {
   const RESTART_POLL_MS = 2000
   const RESTART_WAIT_MS = 60000
   const MAX_WORKERS = 8
+  const TICKET_STAGE_IDS = ['received', 'evaluated', 'decided', 'queued', 'working', 'reporting', 'attention', 'closed']
 
   const API_PATHS = {
     state: `${API}/state`,
@@ -60,6 +61,7 @@ function build(require) {
     setupTelegram: `${API}/setup/telegram`,
     setupGithub: `${API}/setup/github`,
     setupGithubSshKey: `${API}/setup/github/ssh-key`,
+    setupGithubOperator: `${API}/setup/github/operator`,
     setupModels: `${API}/setup/models`,
     setupWatchdog: `${API}/setup/watchdog`,
     setupConfig: `${API}/setup/config`,
@@ -130,6 +132,28 @@ function build(require) {
     'overview.pause': '暂停处理',
     'overview.resume': '恢复处理',
     'overview.retry': '重试',
+    'overview.detail': '详情',
+    'detail.ticket': 'Ticket',
+    'detail.decision': '待决策',
+    'detail.close': '关闭详情',
+    'detail.readonly': '只读详情：这里只展示运行时已记录的状态，不执行动作。',
+    'detail.id': 'ID',
+    'detail.stage': '阶段',
+    'detail.lastReport': '最近报告',
+    'detail.question': '问题',
+    'detail.kind': '类型',
+    'detail.at': '时间',
+    'detail.stages': 'Ticket 阶段',
+    'stage.received': '已接收',
+    'stage.evaluated': '已评估',
+    'stage.decided': '已决策',
+    'stage.queued': '排队中',
+    'stage.working': '执行中',
+    'stage.reporting': '汇报中',
+    'stage.attention': '待人工',
+    'stage.closed': '已结束',
+    'errorBoundary.title': '面板视图出错',
+    'errorBoundary.body': '这个视图渲染失败，已隔离，不会影响 DSH 其他部分。请刷新页面；如果持续出现，查看浏览器控制台与 DSH 日志。',
     'overview.stop': '停止',
     'overview.offlineTitle': '无法连接 Superagent',
     'overview.offlineBody': '插件可能正在重启、已降级或未运行。DSH 本身不受影响。',
@@ -213,9 +237,22 @@ function build(require) {
     'github.operator': '你的个人 GitHub 登录名',
     'github.operatorHint': '用于触发与验收；插件会写入 allowedLogins 和 collaborators。',
     'github.operatorRequired': '请填写你的个人 GitHub 登录名后才能继续。',
-    'github.personalToken': '你的个人 PAT（可选）',
-    'github.personalTokenHint': '可选：用于自动邀请/接受仓库邀请；只在本机使用，不写入配置，也不回显。',
+    'github.personalToken': '你的个人 PAT（可选，仅本机）',
+    'github.personalTokenHint': '会以 0600 保存到本机，用于把 bot 加入现有仓库/接受邀请；不写入插件配置、不回显，可随时清除。',
     'github.personalTokenPlaceholder': 'github_pat_…（可选）',
+    'github.operatorConfigured': '个人 PAT 已配置',
+    'github.operatorRemove': '清除个人 PAT',
+    'github.operatorRemoveHint': '当前后端不支持一键移除；可手动删除本机文件：{path}',
+    'github.acceptInvitations': '自动接受仓库邀请',
+    'github.acceptInvitationsHint': '默认仅信任 allowedLogins/collaborators 发来的邀请；off 全部拒绝，all 全部接受。',
+    'github.acceptInvitationsAllowlist': '仅白名单邀请者（推荐）',
+    'github.acceptInvitationsOff': '不自动接受',
+    'github.acceptInvitationsAll': '接受所有邀请',
+    'github.operatorResult': '个人 PAT 处理结果',
+    'github.operatorInvited': '已邀请',
+    'github.operatorAccepted': '已接受',
+    'github.operatorWarnings': '警告',
+
     'github.botTokenSection': 'bot 的 fine-grained PAT',
     'github.automationTitle': '插件自动完成',
     'github.auto1': '把 bot token 写成 0600 文件，并生成 git 凭据（HTTPS/PAT 或插件生成的 SSH key）',
@@ -423,6 +460,28 @@ function build(require) {
     'overview.pause': 'Pause processing',
     'overview.resume': 'Resume processing',
     'overview.retry': 'Retry',
+    'overview.detail': 'Details',
+    'detail.ticket': 'Ticket',
+    'detail.decision': 'Decision',
+    'detail.close': 'Close details',
+    'detail.readonly': 'Read-only: this shows the state the runtime recorded; no action runs here.',
+    'detail.id': 'ID',
+    'detail.stage': 'Stage',
+    'detail.lastReport': 'Last report',
+    'detail.question': 'Question',
+    'detail.kind': 'Kind',
+    'detail.at': 'At',
+    'detail.stages': 'Ticket stages',
+    'stage.received': 'Received',
+    'stage.evaluated': 'Evaluated',
+    'stage.decided': 'Decided',
+    'stage.queued': 'Queued',
+    'stage.working': 'Working',
+    'stage.reporting': 'Reporting',
+    'stage.attention': 'Needs a person',
+    'stage.closed': 'Closed',
+    'errorBoundary.title': 'Panel view failed',
+    'errorBoundary.body': 'This view failed to render and was isolated; the rest of DSH keeps working. Refresh the page; if it persists, check the browser console and the DSH log.',
     'overview.stop': 'Stop',
     'overview.offlineTitle': 'Superagent is not answering',
     'overview.offlineBody': 'The plugin may be restarting, degraded, or stopped. DSH itself is unaffected.',
@@ -506,9 +565,22 @@ function build(require) {
     'github.operator': 'Your personal GitHub login',
     'github.operatorHint': 'Triggers work and reviews it; the plugin writes it into allowedLogins and collaborators.',
     'github.operatorRequired': 'Enter your personal GitHub login to continue.',
-    'github.personalToken': 'Your personal PAT (optional)',
-    'github.personalTokenHint': 'Optional: used to invite/accept repository invites automatically; stays on this machine, never written to config or shown again.',
+    'github.personalToken': 'Your personal PAT (optional, local only)',
+    'github.personalTokenHint': 'Stored locally with 0600 and used to add the bot to existing repositories / accept invitations; never written to plugin config or shown again. You can remove it at any time.',
     'github.personalTokenPlaceholder': 'github_pat_… (optional)',
+    'github.operatorConfigured': 'Personal PAT configured',
+    'github.operatorRemove': 'Remove personal PAT',
+    'github.operatorRemoveHint': 'This backend cannot remove it yet; delete the local file manually: {path}',
+    'github.acceptInvitations': 'Accept repository invitations',
+    'github.acceptInvitationsHint': 'By default only invitations from allowedLogins/collaborators are trusted; off rejects all, all accepts every invitation.',
+    'github.acceptInvitationsAllowlist': 'Allowlisted inviters only (recommended)',
+    'github.acceptInvitationsOff': 'Never accept automatically',
+    'github.acceptInvitationsAll': 'Accept every invitation',
+    'github.operatorResult': 'Operator PAT result',
+    'github.operatorInvited': 'Invited',
+    'github.operatorAccepted': 'Accepted',
+    'github.operatorWarnings': 'Warnings',
+
     'github.botTokenSection': 'Bot fine-grained PAT',
     'github.automationTitle': 'The plugin does this for you',
     'github.auto1': 'Writes the bot token as a 0600 file and sets up git credentials (HTTPS/PAT or the generated SSH key)',
@@ -665,7 +737,7 @@ function build(require) {
         // Fall back to the static dictionary.
       }
     }
-    return key => EN[key] || key
+    return (key, vars) => interpolate(EN[key] || key, vars)
   }
 
   function interpolate(text, vars) {
@@ -914,8 +986,9 @@ function build(require) {
       open: false,
       step: 0,
       telegram: { status: 'idle', token: '', botUsername: '', tokenFile: '', richText: true, files: true, keyboards: true, error: '', skipped: false },
-      github: { status: 'idle', token: '', login: '', tokenFile: '', repositories: [], selected: [], allowSelf: false, operator: '', personalToken: '', sshKeyFile: '', sshKeyPublic: '', sshKeyGenerated: false, sshKeyExisting: false, sshKeyGenerating: false, sshKeyRestarting: false, sshKeyError: '', error: '', skipped: false },
+      github: { status: 'idle', token: '', login: '', tokenFile: '', repositories: [], selected: [], allowSelf: false, operator: '', personalToken: '', operatorTokenConfigured: false, operatorTokenFile: '', operatorError: '', acceptInvitations: 'allowlist', sshKeyFile: '', sshKeyPublic: '', sshKeyGenerated: false, sshKeyExisting: false, sshKeyGenerating: false, sshKeyRestarting: false, sshKeyError: '', error: '', skipped: false },
       behavior: { allowedUserIds: '', mode: 'observe', maxWorkers: 2, language: 'zh', routerModel: '', workerModel: '' },
+      operator: { status: 'idle', invited: [], accepted: [], warnings: [], error: '' },
       finish: { status: 'idle', error: '', elapsed: 0 },
     }
   }
@@ -957,6 +1030,10 @@ function build(require) {
         allowSelf: false,
         operator: listOf(github.allowedLogins)[0] || listOf(github.collaborators)[0] || '',
         personalToken: '',
+        operatorTokenConfigured: github.operatorTokenConfigured === true,
+        operatorTokenFile: typeof github.operatorTokenFile === 'string' ? github.operatorTokenFile : '',
+        operatorError: '',
+        acceptInvitations: github.acceptInvitations === 'off' || github.acceptInvitations === 'all' ? github.acceptInvitations : 'allowlist',
         sshKeyFile: git && typeof git.sshKeyFile === 'string' ? git.sshKeyFile : '',
         sshKeyPublic: git && typeof git.publicKey === 'string' ? git.publicKey : '',
         sshKeyGenerated: git && git.sshKeyConfigured === true,
@@ -1044,8 +1121,14 @@ function build(require) {
     if (githubEnabled) {
       github.repositories = listOf(wizard.github.selected)
       github.allowSelf = false
+      github.acceptInvitations =
+        wizard.github.acceptInvitations === 'off' || wizard.github.acceptInvitations === 'all'
+          ? wizard.github.acceptInvitations
+          : 'allowlist'
       if (wizard.github.login) github.login = wizard.github.login
       if (wizard.github.tokenFile) github.tokenFile = wizard.github.tokenFile
+      const operatorTokenFile = asText(wizard.github.operatorTokenFile).trim()
+      if (operatorTokenFile) github.operatorTokenFile = operatorTokenFile
       // The dedicated-bot flow derives both lists from the operator login; the
       // plugin writes the bot identity (login/git name/email) on the Host side.
       const operator = asText(wizard.github.operator).trim()
@@ -1072,6 +1155,66 @@ function build(require) {
     const router = decodeModelSelection(wizard.behavior.routerModel)
     if (router !== undefined) config.router = router
     return config
+  }
+
+  /**
+   * Body for POST setup/github/operator; undefined when no personal PAT is
+   * present. The Host endpoint validates `token` (the operator PAT) and reads
+   * `repositories` / optional `tokenFile`; `botLogin` is accepted as a hint.
+   */
+  function buildOperatorRequest(wizard) {
+    const token = asText(wizard.github.personalToken).trim()
+    if (token.length === 0) return undefined
+    const selected = listOf(wizard.github.selected)
+    const repositories = selected.includes('*') || selected.length === 0
+      ? listOf(wizard.github.repositories).map(repo => repoEntry(repo)?.fullName).filter(Boolean)
+      : selected
+    return {
+      token,
+      repositories,
+      botLogin: asText(wizard.github.login).trim(),
+    }
+  }
+
+  function formatOperatorRows(rows) {
+    return listOf(rows).map(entry => {
+      if (typeof entry === 'string') return entry
+      if (entry === null || typeof entry !== 'object') return String(entry)
+      const repo = asText(entry.repo)
+      const status = asText(entry.status)
+      const login = asText(entry.login)
+      const suffix = status.length > 0 ? ` (${status})` : ''
+      const prefix = login.length > 0 && repo.length > 0 ? `${login} → ` : ''
+      return `${prefix}${repo}${suffix}` || asText(entry.id)
+    })
+  }
+
+  /**
+   * Merge the operator endpoint result into the wizard state. On success the
+   * in-memory personal token is cleared; on failure it is kept so the person
+   * can retry, and the error is shown without blocking the config save.
+   */
+  function applyOperatorResult(wizard, result) {
+    const data = result && result.ok && result.data && typeof result.data === 'object' ? result.data : {}
+    const ok = result && result.ok === true
+    const warnings = listOf(data.warnings).map(String)
+    const operatorTokenFile = asText(data.operatorTokenFile) || asText(data.tokenFile)
+    return {
+      ...wizard,
+      github: {
+        ...wizard.github,
+        personalToken: ok ? '' : wizard.github.personalToken,
+        operatorTokenConfigured: ok ? true : wizard.github.operatorTokenConfigured,
+        operatorTokenFile: ok ? operatorTokenFile || wizard.github.operatorTokenFile : wizard.github.operatorTokenFile,
+      },
+      operator: {
+        status: ok ? (warnings.length > 0 ? 'warn' : 'done') : 'error',
+        invited: ok ? formatOperatorRows(data.invited) : [],
+        accepted: ok ? formatOperatorRows(data.accepted) : [],
+        warnings: ok ? warnings : [],
+        error: ok ? '' : asText(result && result.error, 'operator request failed'),
+      },
+    }
   }
 
   function repositoryChoices(setup) {
@@ -1475,6 +1618,24 @@ function build(require) {
   background: var(--dsw-alias-toast-bg); color: var(--dsw-alias-toast-label);
   animation: sa-fade .18s ease-out;
 }
+.sa-stages { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; margin: 4px 0 0; padding: 0; }
+.sa-stage { display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 999px; border: 0.5px solid var(--dsw-alias-border-l1); color: var(--dsw-alias-label-tertiary); font-size: 11.5px; line-height: 16px; }
+.sa-stage-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dsw-alias-border-l2); flex: 0 0 auto; }
+.sa-stage.is-done { color: var(--dsw-alias-label-secondary); border-color: var(--dsw-alias-border-l2); }
+.sa-stage.is-done .sa-stage-dot { background: var(--dsw-alias-state-success-primary); }
+.sa-stage.is-current { color: var(--dsw-alias-label-primary); border-color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-interactive-bg-active); font-weight: 500; }
+.sa-stage.is-current .sa-stage-dot { background: var(--dsw-alias-brand-primary); }
+.sa-drawer-overlay { position: fixed; inset: 0; z-index: 1000; display: flex; justify-content: flex-end; background: rgba(0, 0, 0, .28); }
+.sa-drawer { width: min(440px, 100%); height: 100%; overflow: auto; display: flex; flex-direction: column; gap: 14px; padding: 20px; background: var(--dsw-alias-bg-layer-1); border-left: 0.5px solid var(--dsw-alias-border-l1); box-shadow: var(--dsw-elevation-soft); }
+.sa-drawer-head { display: flex; align-items: flex-start; gap: 12px; }
+.sa-drawer-kicker { font-size: 11.5px; color: var(--dsw-alias-label-tertiary); text-transform: uppercase; letter-spacing: .04em; }
+.sa-drawer-title { margin: 2px 0 0; font-size: 17px; line-height: 24px; font-weight: 600; color: var(--dsw-alias-label-primary); word-break: break-word; }
+.sa-drawer-close { margin-left: auto; flex: 0 0 auto; width: 28px; height: 28px; border-radius: 8px; border: 0.5px solid var(--dsw-alias-border-l1); background: transparent; color: var(--dsw-alias-label-secondary); font-size: 18px; line-height: 1; cursor: pointer; }
+.sa-drawer-close:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+.sa-drawer-body { display: flex; flex-direction: column; gap: 12px; }
+.sa-drawer-rows { display: flex; flex-direction: column; gap: 6px; }
+.sa-drawer-section { border-top: 0.5px solid var(--dsw-alias-border-l1); padding-top: 12px; }
+@media (max-width: 900px) { .sa-drawer { width: 100%; } }
 @keyframes sa-spin { to { transform: rotate(360deg); } }
 @keyframes sa-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 @keyframes sa-fade { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
@@ -1999,8 +2160,12 @@ function build(require) {
   /**
    * Load `load` immediately and then every `intervalMs`, never overlapping.
    * Requests settle before the next tick; unmount stops the chain.
+   *
+   * `enabled` gates the timer to the visible view. A fetch runs once when the
+   * view becomes visible. Identical responses do not update state, so an idle
+   * panel does not re-render every interval.
    */
-  function usePolling(load, intervalMs) {
+  function usePolling(load, intervalMs, enabled = true) {
     const [snapshot, setSnapshot] = React.useState({ data: undefined, error: '', loading: true, at: '' })
     const loadRef = React.useRef(load)
     loadRef.current = load
@@ -2011,11 +2176,20 @@ function build(require) {
       if (!aliveRef.current) return result
       setSnapshot(previous => {
         if (result && result.ok) {
+          if (
+            previous.loading === false &&
+            previous.error === '' &&
+            JSON.stringify(previous.data) === JSON.stringify(result.data)
+          ) {
+            return previous
+          }
           return { data: result.data, error: '', loading: false, at: new Date().toISOString() }
         }
+        const error = errorText(result)
+        if (previous.loading === false && previous.error === error) return previous
         return {
           data: previous.data,
-          error: errorText(result),
+          error,
           loading: false,
           at: previous.at,
         }
@@ -2024,6 +2198,10 @@ function build(require) {
     }, [])
 
     React.useEffect(() => {
+      if (!enabled) {
+        aliveRef.current = false
+        return undefined
+      }
       aliveRef.current = true
       let timer
       const tick = async () => {
@@ -2036,7 +2214,7 @@ function build(require) {
         aliveRef.current = false
         if (timer) clearTimeout(timer)
       }
-    }, [intervalMs, run])
+    }, [enabled, intervalMs, run])
 
     return { snapshot, refresh: run }
   }
@@ -2100,8 +2278,124 @@ function build(require) {
 
   // -- overview ---------------------------------------------------------------
 
+  /**
+   * Map the runtime's coarse `stage` (+ attention kind) onto the eight
+   * read-only ticket phases shown by the detail drawer. The engine does not
+   * persist a phase field yet, so this is a client-side projection of the data
+   * the API already exposes; unknown values stay at `received`.
+   */
+  function ticketStageIndex(stage, kind) {
+    if (kind === 'failed' || kind === 'blocked') return 6
+    if (kind === 'ready') return 5
+    switch (stage) {
+      case 'working':
+        return 4
+      case 'queued':
+        return 3
+      case 'open':
+        return 2
+      case 'waiting':
+        return 6
+      default:
+        return 0
+    }
+  }
+
+  function StageStrip({ t, stage, kind }) {
+    const current = ticketStageIndex(stage, kind)
+    return h(
+      'ol',
+      { className: 'sa-stages', 'aria-label': t('detail.stages') },
+      TICKET_STAGE_IDS.map((id, index) =>
+        h(
+          'li',
+          {
+            key: id,
+            className: `sa-stage${index < current ? ' is-done' : ''}${index === current ? ' is-current' : ''}`,
+            'aria-current': index === current ? 'step' : undefined,
+          },
+          h('span', { className: 'sa-stage-dot', 'aria-hidden': true }),
+          h('span', { className: 'sa-stage-label' }, t(`stage.${id}`)),
+        ),
+      ),
+    )
+  }
+
+  /** Read-only drawer for one Ticket / attention Decision from `/state`. */
+  function DetailDrawer({ t, detail, onClose }) {
+    const item = detail.item || {}
+    const isTicket = detail.kind === 'ticket'
+    const rows = isTicket
+      ? [
+          [t('detail.id'), item.id],
+          [t('detail.stage'), item.stage ? t(`stage.${TICKET_STAGE_IDS[ticketStageIndex(item.stage, item.kind)]}`) : t('common.noValue')],
+          [t('detail.lastReport'), item.lastReport || t('common.noValue')],
+          [t('detail.at'), item.at ? formatTime(item.at) : t('common.noValue')],
+        ]
+      : [
+          [t('detail.id'), item.id],
+          [t('detail.kind'), item.kind],
+          [t('detail.question'), item.question || t('common.noValue')],
+          [t('detail.at'), item.at ? formatTime(item.at) : t('common.noValue')],
+        ]
+    return h(
+      'div',
+      {
+        className: 'sa-drawer-overlay',
+        onMouseDown: event => {
+          if (event.target === event.currentTarget) onClose()
+        },
+      },
+      h(
+        'div',
+        { className: 'sa-drawer', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'sa-detail-title' },
+        h(
+          'div',
+          { className: 'sa-drawer-head' },
+          h('div', null,
+            h('div', { className: 'sa-drawer-kicker' }, isTicket ? t('detail.ticket') : t('detail.decision')),
+            h('h2', { id: 'sa-detail-title', className: 'sa-drawer-title' }, item.title || item.id || t('common.noValue')),
+          ),
+          h('button', { type: 'button', className: 'sa-drawer-close', 'aria-label': t('detail.close'), autoFocus: true, onClick: onClose }, '×'),
+        ),
+        h('div', { className: 'sa-drawer-body' },
+          h('p', { className: 'sa-hint' }, t('detail.readonly')),
+          h('div', { className: 'sa-drawer-rows' }, rows.map(([label, value], index) =>
+            h('div', { className: 'sa-summary-row', key: `${label}-${index}` },
+              h('span', { className: 'sa-summary-key' }, label),
+              h('span', { className: 'sa-summary-val' }, String(value === undefined || value === null ? t('common.noValue') : value)),
+            ),
+          )),
+          h('div', { className: 'sa-drawer-section' }, h('div', { className: 'sa-section-title' }, t('detail.stages'))),
+          h(StageStrip, { t, stage: item.stage, kind: item.kind }),
+        ),
+      ),
+    )
+  }
+
+  /**
+   * Keep one thrown view from blanking the whole DSH slot. React error
+   * boundaries need a class, but the client must also work with the minimal
+   * fake React used by the panel tests, so this catches synchronous render
+   * throws explicitly (the common failure here: a malformed API payload).
+   */
+  function SafeView({ t, render }) {
+    try {
+      return render()
+    } catch (error) {
+      console.error('[superagent] panel view crashed', error)
+      return h('div', { className: 'sa-root' },
+        h('div', { className: 'sa-page' },
+          h(Alert, { tone: 'error', title: t('errorBoundary.title') },
+            h('div', null, t('errorBoundary.body')),
+          ),
+        ),
+      )
+    }
+  }
+
   function OverviewView(props) {
-    const { t, state, setup, busy, note, onAction, onRefresh, onOpenSetup } = props
+    const { t, state, setup, busy, note, onAction, onRefresh, onOpenSetup, onOpenDetail } = props
     const data = state.data || {}
     const setupData = setup.data
     const plugin = data.plugin || (setupData && setupData.plugin) || {}
@@ -2158,6 +2452,11 @@ function build(require) {
           { className: 'sa-rowactions' },
           h(Button, {
             size: 'sm',
+            variant: 'ghost',
+            onClick: () => onOpenDetail('decision', ticket),
+          }, t('overview.detail')),
+          h(Button, {
+            size: 'sm',
             icon: 'retry',
             disabled: busy !== '',
             onClick: () => onAction('retry', ticket.id),
@@ -2192,6 +2491,11 @@ function build(require) {
         h(
           'div',
           { className: 'sa-rowactions' },
+          h(Button, {
+            size: 'sm',
+            variant: 'ghost',
+            onClick: () => onOpenDetail('ticket', ticket),
+          }, t('overview.detail')),
           h(Button, {
             size: 'sm',
             variant: 'danger',
@@ -2385,7 +2689,7 @@ function build(require) {
   // -- setup wizard -----------------------------------------------------------
 
   function SetupView(props) {
-    const { t, wizard, setup, busy, saving, models, onSetWizard, onValidateTelegram, onValidateGithub, onSave, onSkipTelegram, onSkipGithub, onGenerateSshKey } = props
+    const { t, wizard, setup, busy, saving, models, onSetWizard, onValidateTelegram, onValidateGithub, onSave, onSkipTelegram, onSkipGithub, onGenerateSshKey, onRemoveOperatorToken } = props
     const [revealed, setRevealed] = React.useState(false)
     const [repoQuery, setRepoQuery] = React.useState('')
     const [advancedOpen, setAdvancedOpen] = React.useState(false)
@@ -2577,7 +2881,7 @@ function build(require) {
       ]
       const operatorMissing = validated && asText(github.operator).trim().length === 0
       const manualKeys = ['github.manual1', 'github.manual2', 'github.manual3']
-      if (asText(github.personalToken).trim().length === 0) manualKeys.push('github.manual4')
+      if (asText(github.personalToken).trim().length === 0 && github.operatorTokenConfigured !== true) manualKeys.push('github.manual4')
 
       const identityFields = h(
         'div',
@@ -2617,6 +2921,23 @@ function build(require) {
             }),
           ),
         ),
+        github.operatorTokenConfigured
+          ? h(
+              'div',
+              { className: 'sa-inline' },
+              h(Pill, { tone: 'ok' }, t('github.operatorConfigured')),
+              h(
+                Button,
+                {
+                  size: 'sm',
+                  variant: 'ghost',
+                  onClick: onRemoveOperatorToken,
+                },
+                t('github.operatorRemove'),
+              ),
+              github.operatorError ? h('span', { className: 'sa-hint', style: { color: 'var(--dsw-alias-state-error-primary)' } }, github.operatorError) : null,
+            )
+          : null,
         h('div', { className: 'sa-hint', style: { marginTop: 8 } }, t('github.identityNote')),
       )
 
@@ -2782,6 +3103,21 @@ function build(require) {
               'div',
               { className: 'sa-advancedbody' },
               h('div', { className: 'sa-hint' }, t('github.advancedHint')),
+              h(
+                Field,
+                { label: t('github.acceptInvitations'), hint: t('github.acceptInvitationsHint') },
+                h(
+                  'select',
+                  {
+                    className: 'sa-select',
+                    value: github.acceptInvitations || 'allowlist',
+                    onChange: event => patchGithub({ acceptInvitations: event.target.value }),
+                  },
+                  h('option', { value: 'allowlist' }, t('github.acceptInvitationsAllowlist')),
+                  h('option', { value: 'off' }, t('github.acceptInvitationsOff')),
+                  h('option', { value: 'all' }, t('github.acceptInvitationsAll')),
+                ),
+              ),
               h(
                 'div',
                 { className: 'sa-inline' },
@@ -3100,6 +3436,28 @@ function build(require) {
           h(CardHead, { icon: 'checkCircle', title: t('finish.title'), subtitle: t('finish.desc') }),
           h('div', { className: 'sa-section-title' }, t('finish.summary')),
           summary,
+          wizard.operator && wizard.operator.status !== 'idle'
+            ? h(
+                'div',
+                { style: { marginTop: 12 } },
+                h(
+                  Alert,
+                  {
+                    tone: wizard.operator.status === 'error' ? 'error' : wizard.operator.status === 'warn' ? 'warn' : 'ok',
+                    title: t('github.operatorResult'),
+                  },
+                  h(
+                    'div',
+                    { className: 'sa-hint' },
+                    `${t('github.operatorInvited')}: ${listOf(wizard.operator.invited).join(', ') || '—'} · ${t('github.operatorAccepted')}: ${listOf(wizard.operator.accepted).join(', ') || '—'}`,
+                  ),
+                  listOf(wizard.operator.warnings).length > 0
+                    ? h('div', { className: 'sa-hint' }, `${t('github.operatorWarnings')}: ${listOf(wizard.operator.warnings).join(' · ')}`)
+                    : null,
+                  wizard.operator.error ? h('div', { className: 'sa-hint' }, wizard.operator.error) : null,
+                ),
+              )
+            : null,
           h('div', { className: 'sa-note', style: { marginTop: 12 } }, t('finish.restartNote')),
           stateBlock,
           status === 'idle' || status === 'error'
@@ -3350,6 +3708,7 @@ function build(require) {
     const [watchdogOverride, setWatchdogOverride] = React.useState(undefined)
     const [watchdogBusy, setWatchdogBusy] = React.useState(false)
     const [watchdogNote, setWatchdogNote] = React.useState(null)
+    const [detail, setDetail] = React.useState(null)
     const aliveRef = React.useRef(true)
     const wizardRef = React.useRef(wizard)
     wizardRef.current = wizard
@@ -3361,11 +3720,21 @@ function build(require) {
       }
     }, [])
 
-    const dashboard = usePolling(() => api.get(API_PATHS.state), STATE_POLL_MS)
-    const setup = usePolling(() => api.get(API_PATHS.setupState), SETUP_POLL_MS)
-    const permissions = usePolling(() => api.get(API_PATHS.setupPermissions), 30000)
-    const models = usePolling(() => api.get(API_PATHS.setupModels), 60000)
-    const watchdogPoll = usePolling(() => api.get(API_PATHS.setupWatchdog), 30000)
+    // Poll only what the visible view needs. Overview keeps a slow setup poll so
+    // the header/configured state stays fresh without competing with the
+    // dashboard's 5 s refresh; the wizard's own view polls setup/state at 5 s.
+    const onOverview = view === 'overview'
+    const onSetup = view === 'setup'
+    const onPermissions = view === 'permissions'
+    const dashboard = usePolling(() => api.get(API_PATHS.state), STATE_POLL_MS, onOverview)
+    const setup = usePolling(
+      () => api.get(API_PATHS.setupState),
+      onSetup ? SETUP_POLL_MS : 60000,
+      onOverview || onSetup,
+    )
+    const permissions = usePolling(() => api.get(API_PATHS.setupPermissions), 30000, onPermissions)
+    const models = usePolling(() => api.get(API_PATHS.setupModels), 60000, onSetup)
+    const watchdogPoll = usePolling(() => api.get(API_PATHS.setupWatchdog), 30000, onPermissions)
 
     const hydrated = React.useRef(false)
     React.useEffect(() => {
@@ -3383,6 +3752,15 @@ function build(require) {
       const timer = setTimeout(() => setNote(null), 5000)
       return () => clearTimeout(timer)
     }, [note])
+
+    React.useEffect(() => {
+      if (!detail) return undefined
+      const onKey = event => {
+        if (event.key === 'Escape') setDetail(null)
+      }
+      window.addEventListener('keydown', onKey)
+      return () => window.removeEventListener('keydown', onKey)
+    }, [detail])
 
     function refreshAll() {
       void dashboard.refresh()
@@ -3477,11 +3855,9 @@ function build(require) {
       void setup.refresh()
     }
 
-    async function validateGithub(token, personalToken) {
+    async function validateGithub(token) {
       setWizard(current => ({ ...current, github: { ...current.github, status: 'validating', error: '' } }))
-      const body = { token }
-      if (asText(personalToken).trim().length > 0) body.personalToken = asText(personalToken).trim()
-      const result = await api.post(API_PATHS.setupGithub, body)
+      const result = await api.post(API_PATHS.setupGithub, { token })
       if (!aliveRef.current) return
       if (!result.ok) {
         setWizard(current => ({ ...current, github: { ...current.github, status: 'error', error: result.error } }))
@@ -3510,6 +3886,36 @@ function build(require) {
           },
         }
       })
+      void setup.refresh()
+    }
+
+    async function removeOperatorToken() {
+      setWizard(wizardState => ({ ...wizardState, github: { ...wizardState.github, operatorError: '' } }))
+      const result = await api.post(API_PATHS.setupGithubOperator, {
+        personalToken: '',
+        remove: true,
+        botLogin: asText(wizardRef.current.github.login).trim(),
+      })
+      if (!aliveRef.current) return
+      if (!result.ok) {
+        const path = asText(wizardRef.current.github.operatorTokenFile)
+        const hint = path ? t('github.operatorRemoveHint', { path }) : ''
+        setWizard(wizardState => ({
+          ...wizardState,
+          github: { ...wizardState.github, operatorError: `${result.error || t('common.error')}${hint ? ` ${hint}` : ''}` },
+        }))
+        return
+      }
+      setWizard(wizardState => ({
+        ...wizardState,
+        github: {
+          ...wizardState.github,
+          operatorTokenConfigured: false,
+          operatorTokenFile: '',
+          personalToken: '',
+          operatorError: '',
+        },
+      }))
       void setup.refresh()
     }
 
@@ -3609,7 +4015,35 @@ function build(require) {
       const current = wizardRef.current
       if (current.finish.status === 'saving' || current.finish.status === 'restarting') return
       setWizard(wizardState => ({ ...wizardState, finish: { status: 'saving', error: '', elapsed: 0 } }))
-      const result = await api.put(API_PATHS.setupConfig, { config: buildConfig(current) })
+
+      // Persist the optional operator (personal) PAT first: the Host invites the
+      // bot / accepts pending invitations. A failure is shown but does not block
+      // saving the rest of the configuration.
+      let effective = current
+      const operatorRequest = buildOperatorRequest(current)
+      if (operatorRequest !== undefined) {
+        setWizard(wizardState => ({ ...wizardState, operator: { ...wizardState.operator, status: 'running' } }))
+        const operator = await api.post(API_PATHS.setupGithubOperator, operatorRequest)
+        if (!aliveRef.current) return
+        effective = applyOperatorResult(current, operator)
+        setWizard(wizardState => applyOperatorResult(wizardState, operator))
+        void setup.refresh()
+        if (operator.ok && operator.data && operator.data.restarting === true) {
+          // persistOperatorTokenFile writes config through configEditor, which
+          // restarts the plugin; wait for it before the config PUT below.
+          const ready = await waitForSetupReady()
+          if (!aliveRef.current) return
+          if (!ready) {
+            setWizard(wizardState => ({
+              ...wizardState,
+              finish: { status: 'timeout', error: '', elapsed: RESTART_WAIT_MS / 1000 },
+            }))
+            return
+          }
+        }
+      }
+
+      const result = await api.put(API_PATHS.setupConfig, { config: buildConfig(effective) })
       if (!aliveRef.current) return
       if (!result.ok) {
         setWizard(wizardState => ({ ...wizardState, finish: { status: 'error', error: result.error, elapsed: 0 } }))
@@ -3678,11 +4112,12 @@ function build(require) {
         saving,
         onSetWizard: setWizard,
         onValidateTelegram: token => void validateTelegram(token),
-        onValidateGithub: (token, personalToken) => void validateGithub(token, personalToken),
+        onValidateGithub: token => void validateGithub(token),
         onSave: () => void saveAndWait(),
         onSkipTelegram: skipTelegram,
         onSkipGithub: skipGithub,
         onGenerateSshKey: () => void generateSshKey(),
+        onRemoveOperatorToken: () => void removeOperatorToken(),
         onOpenDashboard: openDashboard,
         onReconfigure: reconfigure,
       })
@@ -3706,6 +4141,7 @@ function build(require) {
         onAction: (action, ticketId) => void runAction(action, ticketId),
         onRefresh: refreshAll,
         onOpenSetup: openSetup,
+        onOpenDetail: (kind, item) => setDetail({ kind, item }),
       })
     }
 
@@ -3759,6 +4195,7 @@ function build(require) {
         ),
       ),
       h('main', { className: 'sa-main' }, content),
+      detail ? h(DetailDrawer, { t, detail, onClose: () => setDetail(null) }) : null,
     )
   }
 
@@ -3791,6 +4228,11 @@ function build(require) {
     )
   }
 
+  function SuperagentPageSafe() {
+    const t = React.useMemo(() => makeTranslator(ctxLocale), [])
+    return h(SafeView, { t, render: () => h(SuperagentPage) })
+  }
+
   const inject = ['slots', 'locale']
 
   // `ctx.locale` is needed by the page; the wrapper records the live service
@@ -3806,7 +4248,7 @@ function build(require) {
       ctx.effect(
         () =>
           ctx.slots.inject('main', () =>
-            ctx.slots.register({ name: 'main', key: PANEL_ID, locale: NS }, SuperagentPage),
+            ctx.slots.register({ name: 'main', key: PANEL_ID, locale: NS }, SuperagentPageSafe),
           ),
         'superagent: main page',
       )
@@ -3836,7 +4278,7 @@ function build(require) {
     internals: {
       // Views are exposed for the offline render smoke test; the loader only
       // reads `inject` and `apply`.
-      views: { OverviewView, SetupView, PermissionsView, ExpandableDetail },
+      views: { OverviewView, SetupView, PermissionsView, ExpandableDetail, DetailDrawer, StageStrip },
       API_PATHS,
       WIZARD_STEPS,
       MAX_WORKERS,
@@ -3847,7 +4289,11 @@ function build(require) {
       stepStates,
       canAdvance,
       behaviorError,
+      TICKET_STAGE_IDS,
+      ticketStageIndex,
       buildConfig,
+      buildOperatorRequest,
+      applyOperatorResult,
       buildModelProviders,
       normalizeWatchdog,
       watchdogStatus,

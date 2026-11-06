@@ -5,7 +5,7 @@
 
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, afterEach, describe, expect, it } from 'vitest'
@@ -882,8 +882,10 @@ describe('telegram source: rich text', () => {
 describe('telegram source: outgoing files', () => {
   it('sends photo and document attachments with captions', async () => {
     const dir = tempDir('telegram-attach')
-    const photo = join(dir, 'pixel.png')
-    const document = join(dir, 'report.pdf')
+    const workDir = join(dir, 'work', 't_1')
+    mkdirSync(workDir, { recursive: true })
+    const photo = join(workDir, 'pixel.png')
+    const document = join(workDir, 'report.pdf')
     writeFileSync(photo, Buffer.from([1, 2, 3, 4]))
     writeFileSync(document, '%PDF-1.4')
     const fake = await startTelegram()
@@ -1363,5 +1365,191 @@ describe('telegram source: files and keyboards switches', () => {
     expect(retried).toEqual([])
     expect(fake.callsOf('answerCallbackQuery')).toHaveLength(0)
     expect(fake.callsOf('editMessageReplyMarkup')).toHaveLength(0)
+  })
+})
+
+describe('telegram source: P0 attachment and replay safety', () => {
+  it('refuses attachments outside stateDir work/downloads and symlinks', async () => {
+    const base = tempDir('telegram-attach-guard')
+    const stateDir = join(base, 'state')
+    const workDir = join(stateDir, 'work', 't_1')
+    mkdirSync(workDir, { recursive: true })
+    mkdirSync(join(stateDir, 'downloads'), { recursive: true })
+    const outsideDir = join(base, 'outside')
+    mkdirSync(outsideDir, { recursive: true })
+    const outside = join(outsideDir, 'secret.txt')
+    writeFileSync(outside, 'top secret')
+    const inside = join(workDir, 'ok.txt')
+    writeFileSync(inside, 'fine')
+    const link = join(workDir, 'link.txt')
+    symlinkSync(outside, link)
+
+    const fake = await startTelegram()
+    const { ctx, loggerWarnings } = makeContext('telegram', { stateDir })
+    const source = createSource(baseConfig(fake.url), ctx) as TelegramSource
+
+    const outcome = await source.send({
+      id: 'attach-guard-1',
+      purpose: 'result',
+      channel: { source: 'telegram', thread: 'telegram:dm:42', to: '42' },
+      text: 'files attached',
+      attachments: [
+        { kind: 'document', path: outside },
+        { kind: 'document', path: link },
+        { kind: 'document', path: inside, name: '../evil name.txt' },
+      ],
+      at: nowIso(),
+    })
+
+    expect(outcome).toBe('sent')
+    expect(fake.callsOf('sendDocument')).toHaveLength(1)
+    expect(fake.callsOf('sendDocument')[0]!.raw).toContain('evil_name.txt')
+    expect(fake.callsOf('sendDocument')[0]!.raw).not.toContain('secret')
+    expect(loggerWarnings).toHaveLength(2)
+  })
+
+  it('prefixes downloads with the chat id so chats cannot overwrite each other', async () => {
+    const dir = tempDir('telegram-unique')
+    let downloadCount = 0
+    const fake = await startTelegram((method, body) => {
+      if (method === 'getUpdates') {
+        return {
+          body: {
+            ok: true,
+            result: [
+              {
+                update_id: 800,
+                message: {
+                  message_id: 500,
+                  date: 1_730_000_000,
+                  from: { id: 42, is_bot: false, first_name: 'Ann' },
+                  chat: { id: 42, type: 'private' },
+                  caption: 'dm',
+                  photo: [{ file_id: 'dm-photo', width: 10, height: 10, file_size: 4 }],
+                },
+              },
+              {
+                update_id: 801,
+                message: {
+                  message_id: 500,
+                  date: 1_730_000_000,
+                  from: { id: 42, is_bot: false, first_name: 'Ann' },
+                  chat: { id: -1001, type: 'supergroup', title: 'Ops' },
+                  caption: '@testbot group',
+                  photo: [{ file_id: 'group-photo', width: 10, height: 10, file_size: 4 }],
+                },
+              },
+            ],
+          },
+        }
+      }
+      if (method === 'getFile') {
+        const id = String(body.file_id)
+        return { body: { ok: true, result: { file_id: id, file_path: `photos/${id}.jpg` } } }
+      }
+      if (method === 'downloadFile') {
+        downloadCount += 1
+        return { raw: `DATA-${downloadCount}` }
+      }
+      return undefined
+    })
+    const { ctx, triggers } = makeContext('telegram', { stateDir: dir })
+    const source = createSource(baseConfig(fake.url, { chats: ['-1001'] }), ctx) as TelegramSource
+
+    await source.pollOnce(new AbortController().signal)
+
+    expect(triggers).toHaveLength(2)
+    const paths = triggers.map(trigger => {
+      const attachments = trigger.meta.attachments as Array<Record<string, unknown>>
+      return String(attachments[0]!.path)
+    })
+    expect(paths[0]).toContain('42-500-')
+    expect(paths[1]).toContain('-1001-500-')
+    expect(paths[0]).not.toBe(paths[1])
+    expect(new Set(paths).size).toBe(2)
+  })
+
+  it('does not replay a command twice when the offset was not persisted', async () => {
+    let pauses = 0
+    const commands: TelegramCommands = {
+      status: async () => 'ok',
+      pause: async () => {
+        pauses += 1
+        return 'paused'
+      },
+      resume: async () => 'resumed',
+      tickets: async () => 'none',
+      stopTicket: async (ticketId: string) => `stopped ${ticketId}`,
+      retryTicket: async (ticketId: string) => `retried ${ticketId}`,
+    }
+    const fake = await startTelegram(method => {
+      if (method === 'getUpdates') {
+        return { body: { ok: true, result: [textMessage({ updateId: 900, messageId: 900, text: '/pause' })] } }
+      }
+      return undefined
+    })
+    const { ctx, kv } = makeContext()
+    const source = createSource(baseConfig(fake.url, { commands }), ctx) as TelegramSource
+
+    await source.pollOnce(new AbortController().signal)
+    expect(pauses).toBe(1)
+
+    // Simulate a crash before the offset write: the same update is replayed.
+    kv.set('telegram:offset', 0)
+    await source.pollOnce(new AbortController().signal)
+    expect(pauses).toBe(1)
+  })
+
+  it('does not replay a sa: callback twice when the offset was not persisted', async () => {
+    const retried: string[] = []
+    const commands: TelegramCommands = {
+      status: async () => 'ok',
+      pause: async () => 'paused',
+      resume: async () => 'resumed',
+      tickets: async () => 'none',
+      stopTicket: async (ticketId: string) => `stopped ${ticketId}`,
+      retryTicket: async (ticketId: string) => {
+        retried.push(ticketId)
+        return 'retried'
+      },
+    }
+    const fake = await startTelegram(method => {
+      if (method === 'getUpdates') {
+        return {
+          body: {
+            ok: true,
+            result: [
+              {
+                update_id: 901,
+                callback_query: {
+                  id: 'cb-replay',
+                  from: { id: 42, is_bot: false, username: 'ann' },
+                  data: 'sa:retry:t_1',
+                  message: {
+                    message_id: 11,
+                    date: 1_730_000_000,
+                    chat: { id: 42, type: 'private' },
+                    from: { id: 999, is_bot: true, username: 'testbot' },
+                  },
+                },
+              },
+            ],
+          },
+        }
+      }
+      return undefined
+    })
+    const { ctx, kv, triggers } = makeContext()
+    const source = createSource(baseConfig(fake.url, { commands }), ctx) as TelegramSource
+
+    await source.pollOnce(new AbortController().signal)
+    expect(retried).toEqual(['t_1'])
+    expect(fake.callsOf('answerCallbackQuery')).toHaveLength(1)
+
+    kv.set('telegram:offset', 0)
+    await source.pollOnce(new AbortController().signal)
+    expect(retried).toEqual(['t_1'])
+    expect(fake.callsOf('answerCallbackQuery')).toHaveLength(1)
+    expect(triggers).toHaveLength(0)
   })
 })

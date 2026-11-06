@@ -20,9 +20,9 @@
  * of other Tickets and of no Ticket do not wait.
  */
 
-import type { ChannelAddress, IsoTime, OutboundMessage, Receipt, SendOutcome } from '../core/model.js'
+import type { ChannelAddress, IsoTime, OutboundMessage, Receipt, SendOutcome, SourceId } from '../core/model.js'
 import type { Clock, OutboxPort, SourceScopePort } from '../core/ports.js'
-import type { AppStore } from '../core/stores.js'
+import type { AppStore, EffectRow } from '../core/stores.js'
 import type { Effects, EffectsLogger } from './effects.js'
 import { Defer } from './effects.js'
 import { channelKey } from './store.js'
@@ -70,10 +70,15 @@ export class Outbox implements OutboxPort {
     this.clock = options.clock ?? { now: options.now ?? (() => new Date().toISOString()) }
     this.logger = options.logger
     if (options.registerHandler !== false) {
+      // Per-source partition: different Sources send concurrently (up to 4),
+      // while one Source keeps a single in-flight request (ordering intact).
       this.effects.handle('reply', payload => this.deliver(payload), {
-        concurrency: 1,
+        concurrency: 4,
         ordered: false,
         retry: { baseMs: 5_000, maxMs: 300_000 },
+        // Per-Source ordering: never claim a message while an earlier reply of
+        // the same Source is still pending; other Sources proceed in parallel.
+        canRun: row => this.isHeadOfSource(row),
       })
     }
   }
@@ -91,6 +96,27 @@ export class Outbox implements OutboxPort {
     }
     this.store.receipts.save(receipt)
     this.effects.enqueue('reply', message.id, { message } satisfies ReplyPayload)
+  }
+
+  /**
+   * Claim predicate: skip a message while an earlier pending reply of the same
+   * Ticket+conversation exists (mirrors {@link earlierWaiting}); other Tickets,
+   * ticket-less messages and other Sources proceed in parallel.
+   */
+  private isHeadOfSource(row: EffectRow): boolean {
+    const receipt = this.store.receipts.get(row.key)
+    if (receipt === undefined || receipt.status !== 'pending' || receipt.ticketId === undefined) return true
+    const key = channelKey(receipt.channel)
+    for (const other of this.store.effects.all()) {
+      if (other.kind !== 'reply' || other.seq >= row.seq) continue
+      const earlier = this.store.receipts.get(other.key)
+      if (earlier === undefined || earlier.status !== 'pending') continue
+      if (earlier.ticketId !== receipt.ticketId) continue
+      if (channelKey(earlier.channel) !== key) continue
+      if (earlier.failures >= 3) continue
+      return false
+    }
+    return true
   }
 
   /** Send one queued message; the `reply` effect handler. */

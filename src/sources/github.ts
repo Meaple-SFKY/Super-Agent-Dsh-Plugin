@@ -44,6 +44,7 @@ import {
   sleepWithSignal,
   type GithubCheckRun,
   type GithubComment,
+  type GithubInvitation,
   type GithubIssue,
   type GithubPage,
   type GithubPullRequest,
@@ -64,6 +65,18 @@ const AUTO_REPOSITORIES_REFRESH_MS = 10 * 60_000
 const AUTO_REPOSITORIES_RETRY_MS = 30_000
 /** Discovery is capped so one very large account cannot blow the poll budget. */
 const AUTO_REPOSITORIES_LIMIT = 200
+/** Adaptive polling: a quiet repository backs off to 5–15 minutes. */
+const QUIET_INTERVAL_MIN_MS = 5 * 60_000
+const QUIET_INTERVAL_MAX_MS = 15 * 60_000
+/** Above this wildcard size, quiet repositories are pinned to the slow cadence. */
+const WILDCARD_SOFT_CAP = 10
+/** `notifications: 'auto'` switches to the cheap notification stream from here. */
+const NOTIFICATIONS_AUTO_THRESHOLD = 8
+/** A notification keeps its repository "active" (fast polling) this long. */
+const NOTIFICATIONS_ACTIVE_MS = 5 * 60_000
+/** Reserve quota before entering a global cooldown. */
+const RATE_LIMIT_MIN_REMAINING = 100
+const COOLDOWN_MAX_MS = 15 * 60_000
 const FAILED_CONCLUSIONS = new Set([
   'failure',
   'timed_out',
@@ -133,6 +146,14 @@ export interface GithubConfig {
   allowedLogins?: string[]
   /** Bots whose events are admitted (as inferred candidates). */
   botLogins?: string[]
+  /**
+   * Which repository invitations the bot may accept automatically:
+   * `off`, `allowlist` (default; inviter/owner must be in allowedLogins or
+   * collaborators) or `all`.
+   */
+  acceptInvitations?: 'off' | 'allowlist' | 'all'
+  /** Logins invited as repository collaborators (also trusted inviters). */
+  collaborators?: string[]
   /** Admit unaddressed new Issues (mentions are always admitted). */
   observeIssues?: boolean
   /** Admit unaddressed new Pull Requests (mentions are always admitted). */
@@ -143,6 +164,16 @@ export interface GithubConfig {
   observeCi?: boolean
   /** Poll interval in seconds (10..3600, default 60). */
   pollSeconds?: number
+  /**
+   * Cheap cross-repository notification stream:
+   * `auto` (default; enabled for large wildcard sets), `on` or `off`.
+   * When GitHub rejects it, repository polling is used as before.
+   */
+  notifications?: 'auto' | 'off' | 'on'
+  /** Maximum characters of GitHub text copied into a Trigger (default 16000). */
+  maxTextChars?: number
+  /** Per-repository adaptive cadence (default true; disable for tests/debug). */
+  adaptivePolling?: boolean
   /** GitHub API base URL; only changed in tests. */
   apiBaseUrl?: string
   /** Lifecycle callbacks injected by the runtime. */
@@ -157,11 +188,16 @@ interface NormalizedGithubConfig {
   allowSelf: boolean
   allowedLogins: string[]
   botLogins: string[]
+  acceptInvitations: 'off' | 'allowlist' | 'all'
+  collaborators: string[]
   observeIssues: boolean
   observePulls: boolean
   observeComments: boolean
   observeCi: boolean
   pollSeconds: number
+  notifications: 'auto' | 'off' | 'on'
+  maxTextChars: number
+  adaptivePolling: boolean
   apiBaseUrl?: string
   callbacks?: GithubCallbacks
 }
@@ -203,11 +239,20 @@ export function normalizeGithubConfig(config: GithubConfig = {}): NormalizedGith
     allowSelf: config.allowSelf === true,
     allowedLogins: stringList(config.allowedLogins),
     botLogins: stringList(config.botLogins),
+    acceptInvitations:
+      config.acceptInvitations === 'off' || config.acceptInvitations === 'all'
+        ? config.acceptInvitations
+        : 'allowlist',
+    collaborators: stringList(config.collaborators),
     observeIssues: config.observeIssues === true,
     observePulls: config.observePulls === true,
     observeComments: config.observeComments === true,
     observeCi: config.observeCi === true,
     pollSeconds: clampNumber(config.pollSeconds ?? 60, 10, 3600),
+    notifications:
+      config.notifications === 'off' || config.notifications === 'on' ? config.notifications : 'auto',
+    maxTextChars: clampNumber(config.maxTextChars ?? 16_000, 1_000, 64_000),
+    adaptivePolling: config.adaptivePolling !== false,
     ...(config.apiBaseUrl?.trim() ? { apiBaseUrl: config.apiBaseUrl.trim().replace(/\/+$/, '') } : {}),
     ...(config.callbacks ? { callbacks: config.callbacks } : {}),
   }
@@ -268,6 +313,7 @@ const KV = {
   cursors: (repo: string): string => `github:cursors:${repo}`,
   pulls: (repo: string): string => `github:pulls:${repo}`,
   ci: (repo: string): string => `github:ci:${repo}`,
+  reviews: (repo: string): string => `github:reviews:${repo}`,
 }
 
 interface CiSnapshot {
@@ -338,6 +384,14 @@ function describeCiReadError(error: unknown): string {
     return error.status === 0 ? 'network error' : `HTTP ${error.status}${error.details ? `: ${error.details}` : ''}`
   }
   return error instanceof Error ? error.message : String(error)
+}
+
+/** Extract `owner/repo` from a notification subject API URL. */
+function repoFromNotification(item: { subject?: { url?: string } }): string | undefined {
+  const url = item.subject?.url
+  if (!url) return undefined
+  const match = /\/repos\/([^/]+\/[^/]+)\/(?:issues|pulls|commits)\//.exec(url)
+  return match?.[1]
 }
 
 function sameName(left: string | undefined, right: string | undefined): boolean {
@@ -451,6 +505,7 @@ function failureTag(errors: string[]): string | undefined {
 }
 
 export interface GithubPollResult {
+  /** Repositories actually polled this round (quiet ones are skipped). */
   repos: number
   emitted: number
   filtered: number
@@ -459,6 +514,17 @@ export interface GithubPollResult {
   warnings: string[]
   /** Repositories dropped from the wildcard set because they returned 404/410. */
   removed: string[]
+  /** HTTP requests made this round (including 304s). */
+  requests: number
+  /** Conditional requests answered 304 (free on the primary rate limit). */
+  notModified: number
+  /** Latest primary rate-limit snapshot. */
+  rateLimitRemaining?: number
+  rateLimitResetAt?: number
+  /** When the Source is cooling down after rate limiting, the wake-up time. */
+  cooldownUntil?: number
+  /** Which polling path handled the round. */
+  notifications: 'on' | 'off' | 'fallback'
 }
 
 interface RepoPollResult {
@@ -487,8 +553,18 @@ export class GithubSource implements Source {
   private autoRepositoryLastError: string | undefined
   /** Explicit-list repositories already warned about a 404, so we warn once. */
   private readonly warnedGoneRepositories = new Set<string>()
+  /** Per-repository adaptive cadence (quiet repositories back off). */
+  private readonly repoPollState = new Map<string, { nextPollAt: number; quiet: number }>()
+  private readonly notificationsActiveUntil = new Map<string, number>()
+  private notificationsFallback = false
+  private cooldownUntil = 0
+  private rateLimitFailures = 0
+  /** Last cumulative API counters, for per-round deltas. */
+  private lastStats = { requests: 0, notModified: 0 }
   /** Invitations already accepted (or tolerated as gone), to avoid re-PATCHing. */
   private readonly acceptedInvitations = new Set<number>()
+  /** Untrusted invitations already logged, to avoid log spam. */
+  private readonly warnedInvitations = new Set<number>()
   /** Whether the start-up scan of pending invitations has run. */
   private invitationsChecked = false
 
@@ -533,7 +609,9 @@ export class GithubSource implements Source {
         failures = result.errors.length > 0 ? failures + 1 : 0
         if (signal.aborted) break
         this.report(failures >= 3 ? 'error' : 'ready', this.healthDetail(result))
-        await this.sleep(this.config.pollSeconds * 1000, signal)
+        const now = Date.parse(this.ctx.now())
+        const sleepMs = this.nextSleepMs(result, Number.isFinite(now) ? now : Date.now())
+        await this.sleep(sleepMs, signal)
       } catch (error) {
         if (signal.aborted) break
         failures += 1
@@ -590,6 +668,29 @@ export class GithubSource implements Source {
    */
   async pollOnce(signal: AbortSignal): Promise<GithubPollResult> {
     const api = this.getApi()
+    const roundAt = this.ctx.now()
+    const now = Date.parse(roundAt)
+    const clock = Number.isFinite(now) ? now : Date.now()
+    const statsBefore = api.stats()
+    if (this.cooldownUntil > clock) {
+      // Global rate-limit cooldown: make no requests at all this round.
+      return {
+        repos: 0,
+        emitted: 0,
+        filtered: 0,
+        errors: [],
+        warnings: [],
+        removed: [],
+        requests: 0,
+        notModified: 0,
+        ...(statsBefore.rateLimit.remaining !== undefined
+          ? { rateLimitRemaining: statsBefore.rateLimit.remaining }
+          : {}),
+        ...(statsBefore.rateLimit.resetAt !== undefined ? { rateLimitResetAt: statsBefore.rateLimit.resetAt } : {}),
+        cooldownUntil: this.cooldownUntil,
+        notifications: this.notificationsFallback ? 'fallback' : 'off',
+      }
+    }
     if (!this.login) {
       const user = await api.getAuthenticatedUser({ signal })
       this.login = user.login
@@ -616,20 +717,30 @@ export class GithubSource implements Source {
       warnings.push(`repository discovery: retrying after error: ${this.autoRepositoryLastError}`)
     }
     const repositories = this.effectiveRepositories()
+    // Cheap cross-repository activity hint before the per-repository fan-out.
+    const notificationMode: 'on' | 'off' | 'fallback' = this.notificationsEnabled(repositories.length)
+      ? await this.pollNotifications(api, signal, clock)
+      : 'off'
     const result: GithubPollResult = {
-      repos: repositories.length,
+      repos: 0,
       emitted: 0,
       filtered: 0,
       errors,
       warnings,
       removed: [],
+      requests: 0,
+      notModified: 0,
+      notifications: notificationMode,
     }
     for (const repo of repositories) {
       if (signal.aborted) throw abortError()
+      if (!this.repoDue(repo, clock)) continue
+      let repoResult: RepoPollResult | undefined
       try {
-        const repoResult = await this.pollRepo(api, repo, signal)
+        repoResult = await this.pollRepo(api, repo, signal)
         result.emitted += repoResult.emitted
         result.filtered += repoResult.filtered
+        this.noteRepositoryPolled(repo, clock, repoResult.emitted, false)
       } catch (error) {
         if (signal.aborted || isAbortError(error)) throw error
         if (error instanceof RepositoryGoneError) {
@@ -638,11 +749,14 @@ export class GithubSource implements Source {
             result.removed.push(repo)
             this.ctx.logger.info('github: discovered repository disappeared; refreshing discovery', { repo })
           }
+          this.repoPollState.delete(repo)
           continue
         }
         this.ctx.logger.warn('github: repository poll failed', { repo, error: describeError(error) })
         result.errors.push(`${repo}: ${describeError(error)}`)
+        this.noteRepositoryPolled(repo, clock, 0, true)
       }
+      void repoResult
     }
     if (result.removed.length > 0) {
       // The deleted repository is already out of the cached set; refresh now so
@@ -654,12 +768,152 @@ export class GithubSource implements Source {
         result.warnings.push(`repository discovery: ${describeError(error)}`)
       }
     }
-    // Discovery may have changed the set (or removed repositories).
     result.repos = this.effectiveRepositories().length
+    const statsAfter = api.stats()
+    result.requests = statsAfter.requests - statsBefore.requests
+    result.notModified = statsAfter.notModified - statsBefore.notModified
+    const rate = statsAfter.rateLimit
+    if (rate.remaining !== undefined) result.rateLimitRemaining = rate.remaining
+    if (rate.resetAt !== undefined) result.rateLimitResetAt = rate.resetAt
+    this.applyRateLimitSignals(result, rate, clock)
     return result
   }
 
-  /** One short line for the panel; several repositories are summarised. */
+  /** Global cooldown logic: reserve quota, then exponential backoff on 403/429. */
+  private applyRateLimitSignals(
+    result: GithubPollResult,
+    rate: { remaining?: number; resetAt?: number },
+    now: number,
+  ): void {
+    const rateLimited = result.errors.some(
+      error => /\b(403|429)\b/.test(error) && /rate limit|secondary rate|abuse/i.test(error),
+    )
+    if (rate.remaining !== undefined && rate.remaining <= RATE_LIMIT_MIN_REMAINING) {
+      const until = rate.resetAt ?? now + 60_000
+      this.cooldownUntil = Math.max(this.cooldownUntil, Math.min(until, now + COOLDOWN_MAX_MS))
+      this.rateLimitFailures = Math.max(1, this.rateLimitFailures + 1)
+      this.ctx.logger.warn('github: primary rate limit is nearly exhausted; cooling down', {
+        remaining: rate.remaining,
+        resetAt: new Date(until).toISOString(),
+      })
+    } else if (rateLimited) {
+      this.rateLimitFailures += 1
+      const backoff = Math.min(COOLDOWN_MAX_MS, 60_000 * 2 ** Math.min(this.rateLimitFailures - 1, 4))
+      this.cooldownUntil = Math.max(this.cooldownUntil, now + backoff)
+      this.ctx.logger.warn('github: rate limited; backing off globally', {
+        backoffMs: backoff,
+        failures: this.rateLimitFailures,
+      })
+    } else if (result.requests > 0) {
+      this.rateLimitFailures = 0
+    }
+    if (this.cooldownUntil > now) result.cooldownUntil = this.cooldownUntil
+  }
+
+  private baseIntervalMs(): number {
+    const configured = clampNumber(this.config.pollSeconds * 1000, 10_000, 3_600_000)
+    // Wildcard soft cap: above 10 repositories even an active repository is
+    // polled at most every 2 minutes, so 16+ repositories cannot exhaust the
+    // hourly quota by all being busy at once.
+    if (this.wantsAutoRepositories() && this.effectiveRepositories().length > WILDCARD_SOFT_CAP) {
+      return Math.max(configured, 120_000)
+    }
+    return configured
+  }
+
+  private repoDue(repo: string, now: number): boolean {
+    if (!this.config.adaptivePolling) return true
+    const activeUntil = this.notificationsActiveUntil.get(repo)
+    if (activeUntil !== undefined && activeUntil > now) return true
+    const state = this.repoPollState.get(repo)
+    return state === undefined || now >= state.nextPollAt
+  }
+
+  /**
+   * Quiet repositories back off to 5–15 minutes; anything that produced an
+   * event returns to the configured fast interval. Above the wildcard soft cap,
+   * quiet repositories are pinned to the slowest cadence.
+   */
+  private noteRepositoryPolled(repo: string, now: number, emitted: number, failed: boolean): void {
+    if (!this.config.adaptivePolling) return
+    const state = this.repoPollState.get(repo) ?? { nextPollAt: 0, quiet: 0 }
+    const base = this.baseIntervalMs()
+    let interval: number
+    if (emitted > 0) {
+      state.quiet = 0
+      interval = base
+    } else {
+      state.quiet = Math.min(state.quiet + 1, 6)
+      interval = Math.min(QUIET_INTERVAL_MAX_MS, Math.max(QUIET_INTERVAL_MIN_MS, base * 2 ** state.quiet))
+      if (failed) interval = Math.min(interval, QUIET_INTERVAL_MIN_MS)
+      if (this.wantsAutoRepositories() && this.effectiveRepositories().length > WILDCARD_SOFT_CAP) {
+        interval = Math.min(QUIET_INTERVAL_MAX_MS, Math.max(interval, QUIET_INTERVAL_MAX_MS))
+      }
+    }
+    this.repoPollState.set(repo, { nextPollAt: now + interval, quiet: state.quiet })
+  }
+
+  private notificationsEnabled(repoCount: number): boolean {
+    if (this.config.notifications === 'off' || this.notificationsFallback) return false
+    if (this.config.notifications === 'on') return true
+    return this.wantsAutoRepositories() && repoCount >= NOTIFICATIONS_AUTO_THRESHOLD
+  }
+
+  /**
+   * Poll `GET /notifications` once and mark its repositories active, so only
+   * repositories with real activity are polled on the fast cadence. A 403/404
+   * means the endpoint is unavailable for this token: fall back permanently to
+   * repository polling for this process.
+   */
+  private async pollNotifications(api: GithubApi, signal: AbortSignal, now: number): Promise<'on' | 'fallback'> {
+    const stored = this.ctx.kv.get<{ since?: string; etag?: string }>('github:notifications') ?? {}
+    try {
+      const page = await api.listNotifications({
+        ...(stored.since ? { since: stored.since } : {}),
+        ...(stored.etag ? { etag: stored.etag } : {}),
+        signal,
+      })
+      if (!page.notModified) {
+        const activeUntil = now + NOTIFICATIONS_ACTIVE_MS
+        for (const item of page.items) {
+          const repo = repoFromNotification(item)
+          if (repo) this.notificationsActiveUntil.set(repo, activeUntil)
+        }
+        this.ctx.kv.set('github:notifications', {
+          since: new Date(now - CURSOR_LAG_MS).toISOString(),
+          ...(page.etag ? { etag: page.etag } : {}),
+        })
+      }
+      return 'on'
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) throw error
+      if (error instanceof GithubApiError && (error.status === 403 || error.status === 404)) {
+        this.notificationsFallback = true
+        this.ctx.logger.warn('github: notifications are unavailable for this token; using repository polling', {
+          status: error.status,
+        })
+        return 'fallback'
+      }
+      this.ctx.logger.warn('github: notifications poll failed; using repository polling this round', {
+        error: describeError(error),
+      })
+      return 'on'
+    }
+  }
+
+  private nextSleepMs(result: GithubPollResult, now: number): number {
+    if (result.cooldownUntil !== undefined && result.cooldownUntil > now) {
+      return Math.min(COOLDOWN_MAX_MS, result.cooldownUntil - now)
+    }
+    let next = now + this.config.pollSeconds * 1000
+    for (const state of this.repoPollState.values()) next = Math.min(next, state.nextPollAt)
+    if (this.notificationsEnabled(this.effectiveRepositories().length)) {
+      next = Math.min(next, now + this.config.pollSeconds * 1000)
+    }
+    return Math.max(1_000, next - now)
+  }
+
+  /** One short line for the panel; several repositories are summarised. */  /** One short line for the panel; several repositories are summarised. */
   private healthDetail(result: GithubPollResult): string {
     const auto = this.wantsAutoRepositories() ? ' (auto)' : ''
     const repositories = this.effectiveRepositories()
@@ -676,6 +930,14 @@ export class GithubSource implements Source {
       parts.push(`${result.errors.length} repo failed${tag ? ` (${tag})` : ''}${firstFailedRepo ? `: ${firstFailedRepo}` : ''}`)
     }
     if (result.warnings.length > 0) parts.push(`${result.warnings.length} warning(s)`)
+    parts.push(`req=${result.requests}(304=${result.notModified})`)
+    if (result.rateLimitRemaining !== undefined) {
+      const reset = result.rateLimitResetAt !== undefined
+        ? `@${new Date(result.rateLimitResetAt).toISOString().slice(11, 16)}`
+        : ''
+      parts.push(`quota=${result.rateLimitRemaining}${reset}`)
+    }
+    if (result.cooldownUntil !== undefined) parts.push('cooldown')
     return sanitizeHealthDetail(parts.join('; '))
   }
 
@@ -789,10 +1051,12 @@ export class GithubSource implements Source {
     signal: AbortSignal,
     options: { force?: boolean } = {},
   ): Promise<number> {
+    // `off` never even lists invitations (saves quota and cannot be abused).
+    if (this.config.acceptInvitations === 'off') return 0
     if (this.invitationsChecked && !options.force) return 0
     this.invitationsChecked = true
     let accepted = 0
-    let page: GithubPage<{ id: number; repository?: { full_name?: string } }>
+    let page: GithubPage<GithubInvitation>
     try {
       page = await api.listRepositoryInvitations({ signal, maxPages: 2, perPage: 100 })
     } catch (error) {
@@ -809,6 +1073,17 @@ export class GithubSource implements Source {
     for (const invitation of page.items) {
       if (signal.aborted) throw abortError()
       if (!invitation || typeof invitation.id !== 'number' || this.acceptedInvitations.has(invitation.id)) continue
+      if (this.config.acceptInvitations === 'allowlist' && !this.invitationTrusted(invitation)) {
+        if (!this.warnedInvitations.has(invitation.id)) {
+          this.warnedInvitations.add(invitation.id)
+          this.ctx.logger.info('github: skipped repository invitation from an untrusted inviter', {
+            invitationId: invitation.id,
+            ...(invitation.repository?.full_name ? { repo: invitation.repository.full_name } : {}),
+            ...(invitation.inviter?.login ? { inviter: invitation.inviter.login } : {}),
+          })
+        }
+        continue
+      }
       const repository = invitation.repository?.full_name
       try {
         const result = await api.acceptRepositoryInvitation(invitation.id, { signal })
@@ -848,6 +1123,24 @@ export class GithubSource implements Source {
   }
 
   /**
+   * `allowlist` mode: only invitations from a trusted login (token account,
+   * allowedLogins or configured collaborators) or into a trusted owner's
+   * repository are accepted; anything else is skipped and logged.
+   */
+  private invitationTrusted(invitation: {
+    repository?: { owner?: { login?: string } }
+    inviter?: { login?: string }
+  }): boolean {
+    const trusted = new Set<string>()
+    if (this.login) trusted.add(this.login.toLowerCase())
+    for (const login of this.config.allowedLogins) trusted.add(login.toLowerCase())
+    for (const login of this.config.collaborators) trusted.add(login.toLowerCase())
+    const inviter = invitation.inviter?.login?.toLowerCase()
+    const owner = invitation.repository?.owner?.login?.toLowerCase()
+    return Boolean((inviter && trusted.has(inviter)) || (owner && trusted.has(owner)))
+  }
+
+  /**
    * A repository read answered 404/410. Wildcard-discovered repositories are
    * dropped from the resolved set (the next refresh decides whether it was
    * renamed); explicit entries stay configured and only warn once.
@@ -880,6 +1173,7 @@ export class GithubSource implements Source {
       this.ctx.kv.delete(KV.cursors(repo))
       this.ctx.kv.delete(KV.pulls(repo))
       this.ctx.kv.delete(KV.ci(repo))
+      this.ctx.kv.delete(KV.reviews(repo))
     } catch {
       // State cleanup is best effort; polling must continue.
     }
@@ -936,7 +1230,19 @@ export class GithubSource implements Source {
         if (issue.pull_request || !this.isNewItem(issue.created_at, issuesSince)) continue
         receive(this.issueTrigger(repo, issue))
       }
-      this.advance(cursors.issues, roundStartedAt, page, page.items.length)
+      if (page.truncated && page.items.length > 0) {
+        // desc order returns the newest items first; when the page cap stopped
+        // us, move the cursor to the oldest item we saw so the next round reads
+        // the older remainder instead of re-reading the same newest page.
+        const oldest = page.items.reduce((min, item) => {
+          const at = Date.parse(item.updated_at)
+          return Number.isFinite(at) && at < min ? at : min
+        }, Number.POSITIVE_INFINITY)
+        if (Number.isFinite(oldest)) cursors.issues.since = new Date(oldest).toISOString()
+        delete cursors.issues.etag
+      } else {
+        this.advance(cursors.issues, roundStartedAt, page, page.items.length)
+      }
       this.saveCursors(repo, cursors)
     })
 
@@ -985,10 +1291,16 @@ export class GithubSource implements Source {
         // the user's own PRs are reviewed too (single-account setups).
         if (this.config.allowSelf || !this.isSelf(pull.user.login)) reviewCandidates.push(pull)
       }
+      const reviewCursors = this.loadReviewCursors(repo)
       for (const pull of reviewCandidates.slice(0, MAX_REVIEW_PULLS)) {
+        const key = String(pull.number)
+        const stored = reviewCursors[key]
         let reviews: GithubPage<GithubReview>
         try {
-          reviews = await api.listPullReviews(repo, pull.number, { signal })
+          reviews = await api.listPullReviews(repo, pull.number, {
+            signal,
+            ...(stored?.etag ? { etag: stored.etag } : {}),
+          })
         } catch (error) {
           if (signal.aborted || isAbortError(error)) throw error
           // A deleted PR 404s this endpoint; the repository itself is fine.
@@ -996,15 +1308,22 @@ export class GithubSource implements Source {
           throw error
         }
         if (reviews.notModified) continue
-        let read = 0
+        // Per-PR cursor: only reviews newer than the last one seen for this PR
+        // are fetched/translated, and the ETag makes unchanged PRs free.
+        const since = stored?.since ?? reviewSince
+        let newest = since
         for (const review of reviews.items) {
           const at = review.submitted_at ?? pull.updated_at
-          if (!this.isNewItem(at, reviewSince)) continue
+          if (!this.isNewItem(at, since)) continue
           receive(this.reviewTrigger(repo, pull, review))
-          read += 1
+          if (Date.parse(at) > Date.parse(newest)) newest = at
         }
-        this.advance(cursors.reviews, roundStartedAt, { notModified: false, truncated: false }, read)
+        reviewCursors[key] = {
+          since: newest,
+          ...(reviews.etag ? { etag: reviews.etag } : {}),
+        }
       }
+      this.saveReviewCursors(repo, reviewCursors)
       this.advance(cursors.pulls, roundStartedAt, page, page.items.length)
       this.saveCursors(repo, cursors)
       this.saveTrackedPulls(repo, trackedPulls)
@@ -1120,14 +1439,14 @@ export class GithubSource implements Source {
     const mention = this.mentionsSelf(issue.body)
     if (!mention && !this.config.observeIssues) return undefined
     const thread = threadKeyFor(repo, issue.number)
-    const text = issue.body?.trim() ? `${issue.title}\n\n${issue.body}` : issue.title
+    const budget = this.budgetText(issue.body?.trim() ? `${issue.title}\n\n${issue.body}` : issue.title)
     return makeTrigger(`github:issue:${repo}#${issue.number}`, GITHUB_SOURCE, {
       kind: 'issue',
       at: issue.created_at,
       thread: { key: thread, source: GITHUB_SOURCE, label: `#${issue.number} ${issue.title}` },
       actor: this.actorOf(issue.user),
       addressed: mention ? 'mention' : 'none',
-      text,
+      text: budget.text,
       channel: { source: GITHUB_SOURCE, thread, to: `${repo}#${issue.number}` },
       meta: {
         repo,
@@ -1135,6 +1454,7 @@ export class GithubSource implements Source {
         isPr: false,
         url: issue.html_url,
         author: issue.user.login,
+        ...(budget.truncated ? { textTruncated: true } : {}),
         ...(issue.labels?.length
           ? { labels: issue.labels.map(label => label.name).filter((name): name is string => Boolean(name)) }
           : {}),
@@ -1148,14 +1468,14 @@ export class GithubSource implements Source {
     const mention = this.mentionsSelf(pull.body)
     if (!mention && !this.config.observePulls) return undefined
     const thread = threadKeyFor(repo, pull.number)
-    const text = pull.body?.trim() ? `${pull.title}\n\n${pull.body}` : pull.title
+    const budget = this.budgetText(pull.body?.trim() ? `${pull.title}\n\n${pull.body}` : pull.title)
     return makeTrigger(`github:pull:${repo}#${pull.number}`, GITHUB_SOURCE, {
       kind: 'pull',
       at: pull.created_at,
       thread: { key: thread, source: GITHUB_SOURCE, label: `#${pull.number} ${pull.title}` },
       actor: this.actorOf(pull.user),
       addressed: mention ? 'mention' : 'none',
-      text,
+      text: budget.text,
       channel: { source: GITHUB_SOURCE, thread, to: `${repo}#${pull.number}` },
       meta: {
         repo,
@@ -1163,6 +1483,7 @@ export class GithubSource implements Source {
         isPr: true,
         url: pull.html_url,
         author: pull.user.login,
+        ...(budget.truncated ? { textTruncated: true } : {}),
         head: pull.head.ref,
         base: pull.base.ref,
         draft: pull.draft === true,
@@ -1182,13 +1503,14 @@ export class GithubSource implements Source {
     const isPr = inline || /\/pull\//.test(comment.html_url ?? '')
     const thread = threadKeyFor(repo, number)
     const at = comment.updated_at ?? comment.created_at
+    const budget = this.budgetText(comment.body ?? '')
     return makeTrigger(`github:comment:${repo}:${comment.id}:${at}`, GITHUB_SOURCE, {
       kind: 'comment',
       at,
       thread: { key: thread, source: GITHUB_SOURCE, label: `#${number}` },
       actor: this.actorOf(comment.user),
       addressed: mention ? 'mention' : 'none',
-      text: comment.body ?? '',
+      text: budget.text,
       channel: {
         source: GITHUB_SOURCE,
         thread,
@@ -1202,6 +1524,7 @@ export class GithubSource implements Source {
         commentId: comment.id,
         url: comment.html_url,
         author: comment.user.login,
+        ...(budget.truncated ? { textTruncated: true } : {}),
         kind: inline ? 'review-comment' : 'issue-comment',
         ...(comment.path ? { path: comment.path } : {}),
         ...(comment.line !== undefined ? { line: comment.line } : {}),
@@ -1216,19 +1539,21 @@ export class GithubSource implements Source {
     if (!mention && !this.config.observeComments) return undefined
     const thread = threadKeyFor(repo, pull.number)
     const at = review.submitted_at ?? pull.updated_at
+    const budget = this.budgetText(review.body?.trim() ? review.body : `[review ${review.state}]`)
     return makeTrigger(`github:review:${repo}:${review.id}:${at}`, GITHUB_SOURCE, {
       kind: 'review',
       at,
       thread: { key: thread, source: GITHUB_SOURCE, label: `#${pull.number} ${pull.title}` },
       actor: this.actorOf(review.user),
       addressed: mention ? 'mention' : 'none',
-      text: review.body?.trim() ? review.body : `[review ${review.state}]`,
+      text: budget.text,
       channel: { source: GITHUB_SOURCE, thread, to: `${repo}#${pull.number}` },
       meta: {
         repo,
         number: pull.number,
         isPr: true,
         reviewId: review.id,
+        ...(budget.truncated ? { textTruncated: true } : {}),
         reviewState: review.state,
         url: review.html_url,
         author: review.user.login,
@@ -1303,6 +1628,14 @@ export class GithubSource implements Source {
       name: user.login,
       bot: user.type === 'Bot' || user.login.endsWith('[bot]'),
     }
+  }
+
+  /** GitHub text enters Trigger.text through a hard character budget. */
+  private budgetText(text: string): { text: string; truncated: boolean } {
+    const limit = this.config.maxTextChars
+    if (text.length <= limit) return { text, truncated: false }
+    const dropped = text.length - limit
+    return { text: `${text.slice(0, limit)}\n… [truncated ${dropped} chars]`, truncated: true }
   }
 
   private mentionsSelf(body: string | null | undefined): boolean {
@@ -1416,6 +1749,28 @@ export class GithubSource implements Source {
     }
     if (page.etag) cursor.etag = page.etag
     else delete cursor.etag
+  }
+
+  private loadReviewCursors(repo: string): Record<string, { since: string; etag?: string }> {
+    const stored = this.ctx.kv.get<Record<string, { since?: unknown; etag?: unknown }>>(KV.reviews(repo))
+    if (!stored || typeof stored !== 'object') return {}
+    const cursors: Record<string, { since: string; etag?: string }> = {}
+    for (const [key, value] of Object.entries(stored)) {
+      if (!value || typeof value !== 'object') continue
+      if (typeof value.since !== 'string') continue
+      cursors[key] = {
+        since: value.since,
+        ...(typeof value.etag === 'string' ? { etag: value.etag } : {}),
+      }
+    }
+    return cursors
+  }
+
+  private saveReviewCursors(repo: string, cursors: Record<string, { since: string; etag?: string }>): void {
+    const entries = Object.entries(cursors)
+      .sort((left, right) => Date.parse(right[1].since) - Date.parse(left[1].since))
+      .slice(0, 100)
+    this.ctx.kv.set(KV.reviews(repo), Object.fromEntries(entries))
   }
 
   private loadTrackedPulls(repo: string): TrackedPulls {

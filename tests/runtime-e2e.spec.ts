@@ -95,6 +95,16 @@ async function deliverCandidate(harness: Harness, text: string, id = `tr_${Date.
 }
 
 describe('runtime end to end', () => {
+  it('wakes assessment from ingest without a manual pass (event-driven fast path)', async () => {
+    const harness = await startRuntime()
+    const router = routerAgent(harness)
+    const disposition = harness.runtime.ingest(makeTrigger({ text: 'please fix the failing test in owner/repo' }))
+    expect(disposition).toBe('stored')
+    // passIntervalMs is 60 s in this harness: only the wake path can deliver.
+    await until(() => router.followups.length > 0, 500, 'router followup after wake')
+    expect(router.allText().join('\n')).toContain('[superagent candidate]')
+  })
+
   it('creates the router session with the router preset, prompt and tools', async () => {
     const harness = await startRuntime()
     const router = routerAgent(harness)

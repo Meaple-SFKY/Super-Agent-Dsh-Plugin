@@ -16,7 +16,7 @@
  * default under `stateDir` or an absolute path the user explicitly supplied.
  */
 
-import { chmod, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
@@ -33,6 +33,7 @@ export const SETUP_PERMISSIONS_PATH = '/superagent/api/setup/permissions'
 export const SETUP_SSH_KEY_PATH = '/superagent/api/setup/github/ssh-key'
 export const SETUP_MODELS_PATH = '/superagent/api/setup/models'
 export const SETUP_WATCHDOG_PATH = '/superagent/api/setup/watchdog'
+export const SETUP_OPERATOR_PATH = '/superagent/api/setup/github/operator'
 
 export const SETUP_PATHS = {
   state: SETUP_STATE_PATH,
@@ -43,6 +44,7 @@ export const SETUP_PATHS = {
   sshKey: SETUP_SSH_KEY_PATH,
   models: SETUP_MODELS_PATH,
   watchdog: SETUP_WATCHDOG_PATH,
+  operator: SETUP_OPERATOR_PATH,
 } as const
 
 // ---------------------------------------------------------------------------
@@ -74,6 +76,9 @@ export interface SetupAccountGithub {
   allowSelf: boolean
   /** GitHub logins invited as admin when a ticket creates a repository (wizard prefill). */
   collaborators: string[]
+  /** Personal (operator) PAT configured for invitations/bootstrap. */
+  operatorTokenConfigured: boolean
+  operatorTokenFile?: string
   tokenFile?: string
 }
 
@@ -177,6 +182,10 @@ export interface SetupApi {
   permissions(): SetupApiResult
   saveTelegram(body: unknown): Promise<SetupApiResult>
   saveGithub(body: unknown): Promise<SetupApiResult>
+  saveOperatorToken(body: unknown): Promise<SetupApiResult>
+  removeOperatorToken(): Promise<SetupApiResult>
+  persistOperatorTokenFile(operatorFile: string): boolean
+  persistOperatorTokenClear(): boolean
   prepareConfig(body: unknown): Promise<{ result: SetupApiResult; patch?: SetupConfigPatch }>
   commitConfigSoon(patch: SetupConfigPatch): void
   listModels(): Promise<SetupApiResult>
@@ -208,6 +217,30 @@ export interface TelegramHelpers {
 export interface GithubHelpers {
   validate(token: string, options: { timeoutMs: number }): Promise<{ login: string }>
   listRepositories(token: string, options: { timeoutMs: number }): Promise<SetupRepository[]>
+  /** Invite `login` to `repo` (operator token). */
+  addCollaborator?(
+    token: string,
+    repo: string,
+    login: string,
+    permission: 'pull' | 'triage' | 'push' | 'maintain' | 'admin',
+    options: { timeoutMs: number },
+  ): Promise<{ alreadyCollaborator: boolean }>
+  /** Pending repository invitations of the authenticated (bot) account. */
+  listInvitations?(
+    token: string,
+    options: { timeoutMs: number },
+  ): Promise<Array<{ id: number; repository: string }>>
+  acceptInvitation?(
+    token: string,
+    invitationId: number,
+    options: { timeoutMs: number },
+  ): Promise<{ status: string }>
+  /** Accept the pending invitation for one repository (matched by full name). */
+  acceptForRepo?(
+    token: string,
+    repo: string,
+    options: { timeoutMs: number },
+  ): Promise<{ status: string; invitationId?: number }>
 }
 
 export interface SetupDeps {
@@ -254,6 +287,7 @@ export interface SetupDeps {
 const TOKEN_KIND = { telegram: 'telegram-token', github: 'github-token' } as const
 const KV_TELEGRAM = 'superagent.setup.telegram'
 const KV_GITHUB = 'superagent.setup.github'
+const KV_OPERATOR = 'superagent.setup.githubOperator'
 const KV_RESTART = 'superagent.setup.restartPending'
 const MAX_TOKEN_CHARS = 512
 const DEFAULT_TIMEOUT_MS = 15_000
@@ -288,9 +322,34 @@ async function defaultGithubHelpers(): Promise<GithubHelpers | undefined> {
         token: string,
         options?: { timeoutMs?: number },
       ) => Promise<Array<{ fullName: string; private: boolean; pushedAt: string | null; archived: boolean; fork: boolean }>>
+      addGithubCollaborator?: (
+        token: string,
+        repo: string,
+        username: string,
+        permission?: 'pull' | 'triage' | 'push' | 'maintain' | 'admin',
+        options?: { timeoutMs?: number },
+      ) => Promise<{ alreadyCollaborator: boolean }>
+      listRepositoryInvitations?: (
+        token: string,
+        options?: { timeoutMs?: number },
+      ) => Promise<Array<{ id: number; repository: string }>>
+      acceptRepositoryInvitation?: (
+        token: string,
+        invitationId: number,
+        options?: { timeoutMs?: number },
+      ) => Promise<{ status: string }>
+      acceptInvitationForRepo?: (
+        token: string,
+        repo: string,
+        options?: { timeoutMs?: number },
+      ) => Promise<{ status: string; invitationId?: number }>
     }
     const validate = module.validateGithubToken
     const list = module.listGithubRepositories
+    const addCollaborator = module.addGithubCollaborator
+    const listInvitations = module.listRepositoryInvitations
+    const acceptInvitation = module.acceptRepositoryInvitation
+    const acceptForRepo = module.acceptInvitationForRepo
     if (typeof validate !== 'function' || typeof list !== 'function') return undefined
     return {
       async validate(token, options) {
@@ -300,6 +359,40 @@ async function defaultGithubHelpers(): Promise<GithubHelpers | undefined> {
       async listRepositories(token, options) {
         return list(token, { timeoutMs: options.timeoutMs })
       },
+      ...(typeof addCollaborator === 'function'
+        ? {
+            async addCollaborator(token: string, repo: string, login: string, permission: 'push' | 'admin' | 'pull' | 'triage' | 'maintain', options: { timeoutMs: number }) {
+              return addCollaborator(token, repo, login, permission, { timeoutMs: options.timeoutMs })
+            },
+          }
+        : {}),
+      ...(typeof listInvitations === 'function'
+        ? {
+            async listInvitations(token: string, options: { timeoutMs: number }) {
+              const invitations = await listInvitations(token, { timeoutMs: options.timeoutMs })
+              return invitations.map(invitation => ({ id: invitation.id, repository: invitation.repository }))
+            },
+          }
+        : {}),
+      ...(typeof acceptInvitation === 'function'
+        ? {
+            async acceptInvitation(token: string, invitationId: number, options: { timeoutMs: number }) {
+              const result = await acceptInvitation(token, invitationId, { timeoutMs: options.timeoutMs })
+              return { status: result.status }
+            },
+          }
+        : {}),
+      ...(typeof acceptForRepo === 'function'
+        ? {
+            async acceptForRepo(token: string, repo: string, options: { timeoutMs: number }) {
+              const result = await acceptForRepo(token, repo, { timeoutMs: options.timeoutMs })
+              return {
+                status: result.status,
+                ...(result.invitationId !== undefined ? { invitationId: result.invitationId } : {}),
+              }
+            },
+          }
+        : {}),
     }
   } catch {
     return undefined
@@ -907,6 +1000,12 @@ export class SetupService implements SetupApi {
           collaborators: Array.isArray(githubConfig.collaborators)
             ? githubConfig.collaborators.filter((entry): entry is string => typeof entry === 'string')
             : [],
+          operatorTokenConfigured: await this.fileConfigured(this.operatorTokenPath().path),
+          ...(this.operatorTokenPath().configured ? { operatorTokenFile: this.operatorTokenPath().path } : {
+            ...(await this.fileConfigured(this.defaultOperatorTokenFile())
+              ? { operatorTokenFile: this.defaultOperatorTokenFile() }
+              : {}),
+          }),
           ...(githubConfigured ? { tokenFile: githubFile } : {}),
         },
       },
@@ -1033,6 +1132,259 @@ export class SetupService implements SetupApi {
         invalid ? 'invalid_token' : 'validation_failed',
         message || `${kind} token validation failed`,
       )
+    }
+  }
+
+  // -- personal (operator) PAT ---------------------------------------------
+
+  /** Default file for the personal PAT used to invite/accept repositories. */
+  defaultOperatorTokenFile(): string {
+    return join(this.deps.stateDir, 'secrets', 'github-operator-token')
+  }
+
+  /** Path of the configured (or default) operator PAT. */
+  private operatorTokenPath(): { path: string; configured: boolean } {
+    const sources = isRecord(this.deps.currentConfig()?.sources) ? (this.deps.currentConfig()!.sources as Record<string, unknown>) : {}
+    const github = isRecord(sources.github) ? sources.github : {}
+    const configured = typeof github.operatorTokenFile === 'string' ? github.operatorTokenFile.trim() : ''
+    return configured
+      ? { path: configured, configured: true }
+      : { path: this.defaultOperatorTokenFile(), configured: false }
+  }
+
+  private async readTokenFile(path: string): Promise<string | undefined> {
+    try {
+      const token = (await readFile(path, 'utf8')).trim()
+      return token.length > 0 ? token : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Save a personal (operator) PAT and use it to bootstrap the bot account:
+   * invite the bot as a push collaborator on the selected repositories, then
+   * let the bot accept the pending invitations. Per-repository failures are
+   * warnings (the token is still saved); the response never contains tokens.
+   */
+  async saveOperatorToken(body: unknown): Promise<SetupApiResult> {
+    try {
+      if (!isRecord(body)) throw new SetupError(400, 'invalid_request', 'request body must be a JSON object')
+      if (body.remove === true) return this.removeOperatorToken()
+      const token =
+        typeof body.personalToken === 'string'
+          ? body.personalToken.trim()
+          : typeof body.token === 'string'
+            ? body.token.trim()
+            : ''
+      if (token.length === 0) throw new SetupError(400, 'invalid_token', 'operator token is required')
+      if (token.length > MAX_TOKEN_CHARS) throw new SetupError(400, 'invalid_token', 'operator token is implausibly long')
+
+      const helpers = await (this.deps.loadGithubHelpers ?? defaultGithubHelpers)()
+      if (!helpers) throw new SetupError(501, 'validation_unavailable', 'GitHub token validation is unavailable in this build')
+
+      let login: string
+      try {
+        login = (await helpers.validate(token, { timeoutMs: this.timeoutMs })).login
+      } catch (error) {
+        const message = this.sanitize(errorMessage(error))
+        const name = error instanceof Error ? error.name : ''
+        throw new SetupError(name.endsWith('TokenValidationError') ? 400 : 502, 'invalid_token', message)
+      }
+
+      const config = this.deps.currentConfig() ?? {}
+      const sources = isRecord(config.sources) ? config.sources : {}
+      const github = isRecord(sources.github) ? sources.github : {}
+      const requestedRepositories = Array.isArray(body.repositories)
+        ? body.repositories.filter((entry): entry is string => typeof entry === 'string' && /^[\w.-]+\/[\w.-]+$/.test(entry))
+        : Array.isArray(github.repositories)
+          ? github.repositories.filter((entry): entry is string => typeof entry === 'string' && /^[\w.-]+\/[\w.-]+$/.test(entry))
+          : []
+
+      const botLogin =
+        typeof body.botLogin === 'string' && body.botLogin.trim()
+          ? body.botLogin.trim()
+          : await this.resolveBotLogin(github, helpers)
+      if (!botLogin) {
+        throw new SetupError(
+          400,
+          'bot_login_unknown',
+          'save the bot token first (or set sources.github.login) so the bot account can be invited',
+        )
+      }
+
+      const warnings: string[] = []
+      const invited: Array<{ repo: string; login: string; status: 'invited' | 'already' }> = []
+      if (requestedRepositories.length === 0) {
+        warnings.push('no repositories selected; the operator token was saved but the bot was not invited anywhere')
+      }
+      for (const repo of requestedRepositories.slice(0, 200)) {
+        const add = helpers.addCollaborator
+        if (!add) {
+          warnings.push('collaborator helpers are unavailable in this build; add the bot manually')
+          break
+        }
+        try {
+          const result = await add(token, repo, botLogin, 'push', { timeoutMs: this.timeoutMs })
+          invited.push({ repo, login: botLogin, status: result.alreadyCollaborator ? 'already' : 'invited' })
+        } catch (error) {
+          warnings.push(`could not invite the bot to ${repo}: ${this.sanitize(errorMessage(error))}`)
+        }
+      }
+
+      const accepted: Array<{ repo: string; status: string; invitationId?: number }> = []
+      const botToken = await this.botToken(github)
+      if (!botToken) {
+        if (invited.length > 0) warnings.push('bot token is not available; the bot cannot accept invitations automatically')
+      } else {
+        for (const repo of invited.map(entry => entry.repo)) {
+          try {
+            const result = helpers.acceptForRepo
+              ? await helpers.acceptForRepo(botToken, repo, { timeoutMs: this.timeoutMs })
+              : await this.acceptWithList(helpers, botToken, repo)
+            accepted.push({
+              repo,
+              status: result?.status ?? 'none',
+              ...(result?.invitationId !== undefined ? { invitationId: result.invitationId } : {}),
+            })
+          } catch (error) {
+            warnings.push(`could not accept the invitation for ${repo}: ${this.sanitize(errorMessage(error))}`)
+          }
+        }
+      }
+
+      const operatorFile = this.resolveTokenFile(body.tokenFile, 'github') === this.defaultTokenFile('github')
+        ? this.defaultOperatorTokenFile()
+        : this.operatorTargetFile(body.tokenFile)
+      await this.writeSecret(operatorFile, token)
+      this.cache(KV_OPERATOR, { login, at: this.deps.kv.get<unknown>(KV_GITHUB) ?? null })
+
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          operator: login,
+          login,
+          operatorTokenConfigured: true,
+          operatorTokenFile: operatorFile,
+          invited,
+          accepted,
+          ...(warnings.length > 0 ? { warnings } : {}),
+        },
+      }
+    } catch (error) {
+      return this.failure(error)
+    }
+  }
+
+  /** Remove the saved personal PAT (file + configured path) — tolerant of missing files. */
+  async removeOperatorToken(): Promise<SetupApiResult> {
+    try {
+      const target = this.operatorTokenPath().path
+      let removed = false
+      try {
+        await rm(target, { force: true })
+        removed = true
+      } catch (error) {
+        this.logger.warn('could not delete the operator token file', { error: this.sanitize(errorMessage(error)) })
+      }
+      try {
+        this.deps.kv.delete(KV_OPERATOR)
+      } catch {
+        // best effort
+      }
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          removed,
+          operatorTokenConfigured: false,
+          operatorTokenFile: target,
+          restarting: this.persistOperatorTokenClear(),
+        },
+      }
+    } catch (error) {
+      return this.failure(error)
+    }
+  }
+
+  /** Clear `sources.github.operatorTokenFile` in the config (response-first restart). */
+  persistOperatorTokenClear(): boolean {
+    try {
+      const editor = this.deps.configEditor()
+      const entry = this.deps.hostEntry()
+      if (!editor || entry === undefined) return false
+      const sources = isRecord(this.deps.currentConfig()?.sources) ? (this.deps.currentConfig()!.sources as Record<string, unknown>) : {}
+      const github = isRecord(sources.github) ? sources.github : {}
+      if (github.operatorTokenFile === '' || github.operatorTokenFile === undefined) return true
+      this.commitConfigSoon({ sources: { github: { operatorTokenFile: '' } } })
+      return true
+    } catch (error) {
+      this.logger.warn('could not clear the operator token path', { error: this.sanitize(errorMessage(error)) })
+      return false
+    }
+  }
+
+  /** Validate a body-supplied operator token file (absolute) or fall back to default. */
+  private operatorTargetFile(raw: unknown): string {
+    if (raw === undefined || raw === null || raw === '') return this.defaultOperatorTokenFile()
+    if (typeof raw !== 'string') throw new SetupError(400, 'invalid_token_file', 'tokenFile must be a string')
+    const value = raw.trim()
+    if (value.length === 0) return this.defaultOperatorTokenFile()
+    if (value.includes('\0')) throw new SetupError(400, 'invalid_token_file', 'tokenFile contains a NUL byte')
+    if (!isAbsolute(value)) throw new SetupError(400, 'invalid_token_file', 'tokenFile must be an absolute path')
+    return value
+  }
+
+  private async resolveBotLogin(
+    github: Record<string, unknown>,
+    helpers: GithubHelpers,
+  ): Promise<string | undefined> {
+    if (typeof github.login === 'string' && github.login.trim()) return github.login.trim()
+    const cached = this.cached<{ login?: string }>(KV_GITHUB)
+    if (typeof cached?.login === 'string' && cached.login) return cached.login
+    const botToken = await this.botToken(github)
+    if (!botToken) return undefined
+    try {
+      return (await helpers.validate(botToken, { timeoutMs: this.timeoutMs })).login
+    } catch {
+      return undefined
+    }
+  }
+
+  private async botToken(github: Record<string, unknown>): Promise<string | undefined> {
+    const configured = typeof github.tokenFile === 'string' && github.tokenFile ? github.tokenFile : undefined
+    return this.readTokenFile(configured ?? this.defaultTokenFile('github'))
+  }
+
+  private async acceptWithList(
+    helpers: GithubHelpers,
+    botToken: string,
+    repo: string,
+  ): Promise<{ status: string; invitationId?: number } | undefined> {
+    if (!helpers.listInvitations || !helpers.acceptInvitation) return undefined
+    const invitations = await helpers.listInvitations(botToken, { timeoutMs: this.timeoutMs })
+    const lower = repo.toLowerCase()
+    const match = invitations.find(invitation => invitation.repository.toLowerCase() === lower)
+    if (!match) return { status: 'none' }
+    const result = await helpers.acceptInvitation(botToken, match.id, { timeoutMs: this.timeoutMs })
+    return { status: result.status, invitationId: match.id }
+  }
+
+  /** Point `sources.github.operatorTokenFile` at the saved file (response-first restart). */
+  persistOperatorTokenFile(operatorFile: string): boolean {
+    try {
+      const editor = this.deps.configEditor()
+      const entry = this.deps.hostEntry()
+      if (!editor || entry === undefined) return false
+      const sources = isRecord(this.deps.currentConfig()?.sources) ? (this.deps.currentConfig()!.sources as Record<string, unknown>) : {}
+      const github = isRecord(sources.github) ? sources.github : {}
+      if (github.operatorTokenFile === operatorFile) return true
+      this.commitConfigSoon({ sources: { github: { operatorTokenFile: operatorFile } } })
+      return true
+    } catch (error) {
+      this.logger.warn('could not persist the operator token path', { error: this.sanitize(errorMessage(error)) })
+      return false
     }
   }
 
@@ -1163,6 +1515,18 @@ export class SetupService implements SetupApi {
         }
         if (!isAbsolute(source.tokenFile)) {
           throw new SetupError(400, 'invalid_config', `sources.${sourceId}.tokenFile must be an absolute path`)
+        }
+      }
+      if (source.operatorTokenFile !== undefined) {
+        if (typeof source.operatorTokenFile !== 'string' || source.operatorTokenFile.trim().length === 0) {
+          throw new SetupError(400, 'invalid_config', `sources.${sourceId}.operatorTokenFile must be a non-empty string`)
+        }
+        if (!isAbsolute(source.operatorTokenFile)) {
+          throw new SetupError(
+            400,
+            'invalid_config',
+            `sources.${sourceId}.operatorTokenFile must be an absolute path`,
+          )
         }
       }
     }

@@ -224,6 +224,8 @@ describe('guardian Config schema', () => {
     expect(resolved.sources.github.repositories).toEqual([])
     expect(resolved.sources.github.allowSelf).toBe(false)
     expect(resolved.sources.github.collaborators).toEqual([])
+    expect(resolved.sources.github.operatorTokenFile).toBe('')
+    expect(resolved.sources.github.acceptInvitations).toBe('allowlist')
     expect(resolved.executor.gitSshKeyFile).toBe('')
     expect(resolved.executor.gitName).toBe('')
     expect(resolved.executor.gitEmail).toBe('')
@@ -233,6 +235,12 @@ describe('guardian Config schema', () => {
 
     expect(Config({ sources: { github: { allowSelf: true } } }).sources.github.allowSelf).toBe(true)
     expect(Config({ language: 'en' }).language).toBe('en')
+    const operator = Config({
+      sources: { github: { operatorTokenFile: '/tmp/operator-token', acceptInvitations: 'off' } },
+    })
+    expect(operator.sources.github.operatorTokenFile).toBe('/tmp/operator-token')
+    expect(operator.sources.github.acceptInvitations).toBe('off')
+    expect(() => Config({ sources: { github: { acceptInvitations: 'sometimes' } } })).toThrow()
     const telegram = Config({ sources: { telegram: { richText: false, files: false, keyboards: false } } })
     expect(telegram.sources.telegram.richText).toBe(false)
     expect(telegram.sources.telegram.files).toBe(false)
@@ -443,5 +451,59 @@ describe('guardian lifecycle', () => {
     await ctx.dispose()
     await waitFor(() => stop.mock.calls.length > 0)
     expect(guardian.bootState().status).toBe('stopped')
+  })
+})
+
+describe('Config ↔ source contract', () => {
+  const root = process.cwd()
+
+  async function sourceFields(file: string, interfaceName: string): Promise<string[]> {
+    const text = await readFile(join(root, file), 'utf8')
+    const start = text.indexOf(`export interface ${interfaceName} {`)
+    if (start < 0) throw new Error(`interface ${interfaceName} not found in ${file}`)
+    const end = text.indexOf('\n}', start)
+    const body = text.slice(start, end)
+    return [...body.matchAll(/^ {2}([A-Za-z][A-Za-z0-9_]*)\??:/gm)].map(match => match[1]!)
+  }
+
+  async function schemaFields(blockStart: string): Promise<string[]> {
+    const text = await readFile(join(root, 'src/index.ts'), 'utf8')
+    const start = text.indexOf(blockStart)
+    if (start < 0) throw new Error(`schema block ${blockStart} not found`)
+    const end = text.indexOf('    }).default({}),', start)
+    const body = text.slice(start, end)
+    return [...body.matchAll(/^ {6}([A-Za-z][A-Za-z0-9_]*):/gm)].map(match => match[1]!)
+  }
+
+  it('exposes every Telegram source field in the Config schema', async () => {
+    const source = await sourceFields('src/sources/telegram.ts', 'TelegramConfig')
+    const schema = await schemaFields('    telegram: Schema.object({')
+    // Injected by the runtime / test-only fields are intentionally not settings.
+    const ignored = new Set(['apiBaseUrl', 'commands'])
+    const missing = source.filter(field => !ignored.has(field) && !schema.includes(field))
+    expect(missing).toEqual([])
+  })
+
+  it('exposes every GitHub source field in the Config schema', async () => {
+    const source = await sourceFields('src/sources/github.ts', 'GithubConfig')
+    const schema = await schemaFields('    github: Schema.object({')
+    const ignored = new Set(['apiBaseUrl', 'callbacks'])
+    const missing = source.filter(field => !ignored.has(field) && !schema.includes(field))
+    expect(missing).toEqual([])
+  })
+
+  it('defaults the notification/polling knobs and no longer advertises quietHours', async () => {
+    const guardian = await loadGuardian()
+    const Config = guardian.Config as unknown as (value: unknown) => Record<string, any>
+    const resolved = Config({})
+    expect(resolved.sources.telegram.pollSeconds).toBe(1)
+    expect(resolved.sources.telegram.pollTimeoutSeconds).toBe(25)
+    expect(resolved.sources.telegram.maxDownloadBytes).toBe(20 * 1024 * 1024)
+    expect(resolved.sources.github.botLogins).toEqual([])
+    expect(resolved.sources.github.notifications).toBe('auto')
+    expect(resolved.sources.github.maxTextChars).toBe(16_000)
+    expect(resolved.sources.github.adaptivePolling).toBe(true)
+    expect(resolved.sources.github.acceptInvitations).toBe('allowlist')
+    expect('quietHours' in resolved.quiet).toBe(false)
   })
 })

@@ -13,7 +13,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { Sessions, type HostAgentRegistry, userMessage } from '../src/app/sessions.js'
-import { Executor } from '../src/app/executor.js'
+import { Executor, runWithConcurrency } from '../src/app/executor.js'
 import type { Assignment, Ticket, Trigger } from '../src/core/model.js'
 import type { Engine, Store } from '../src/core/ports.js'
 import { makeHarness, makeTrigger } from './core-fixtures.js'
@@ -359,6 +359,7 @@ function makeSessions(
   options: {
     defaultModel?: () => { provider: string; model: string } | undefined
     configuredModel?: (role: 'router' | 'worker') => { provider: string; model: string; reasoningEffort?: string } | undefined
+    maxWorkers?: number
   } = {},
 ): Sessions {
   return new Sessions({
@@ -370,6 +371,7 @@ function makeSessions(
     createTimeoutMs: 2_000,
     ...(options.defaultModel ? { defaultModel: options.defaultModel } : {}),
     ...(options.configuredModel ? { configuredModel: options.configuredModel as never } : {}),
+    ...(options.maxWorkers !== undefined ? { maxWorkers: options.maxWorkers } : {}),
   })
 }
 
@@ -774,5 +776,60 @@ describe('configured model overrides durable selection on resume (task-39 follow
     expect(keptAgent.modelSelection).toEqual({ provider: 'old', model: 'old-model' })
     expect(keptAgent.modelSelections).toHaveLength(0)
     await keep.runtime.stop()
+  })
+})
+
+describe('worker lifecycle guards (task-56)', () => {
+  it('refuses admission when every live worker is busy', async () => {
+    const host = createFakeHost()
+    const harness = makeHarness()
+    const dir = tempDir()
+    const sessions = makeSessions(host, harness.store, quietLogger(), { maxWorkers: 1 })
+    await sessions.ensureWorker('t_busy', dir)
+    host.agents.liveAgent('superagent-worker-t_busy')!.status = 'running'
+    expect(sessions.admitWorker()).toBe(false)
+    expect(sessions.liveWorkerCount()).toBe(1)
+  })
+
+  it('evicts an idle worker to make room when the pool is full', async () => {
+    const host = createFakeHost()
+    const harness = makeHarness()
+    const dir = tempDir()
+    const sessions = makeSessions(host, harness.store, quietLogger(), { maxWorkers: 1 })
+    await sessions.ensureWorker('t_idle', dir)
+    expect(sessions.admitWorker()).toBe(true)
+    await until(() => host.agents.liveAgent('superagent-worker-t_idle') === undefined, 1_000)
+    await sessions.ensureWorker('t_next', dir)
+    expect(host.agents.liveAgent('superagent-worker-t_next')).toBeDefined()
+  })
+
+  it('sweeps idle workers past their TTL without touching running ones', async () => {
+    const host = createFakeHost()
+    const harness = makeHarness()
+    const dir = tempDir()
+    const sessions = makeSessions(host, harness.store, quietLogger(), { maxWorkers: 3 })
+    await sessions.ensureWorker('t_ttl', dir)
+    await sessions.ensureWorker('t_running', dir)
+    host.agents.liveAgent('superagent-worker-t_running')!.status = 'running'
+    await new Promise(resolve => setTimeout(resolve, 15))
+    const evicted = sessions.sweepIdle(1)
+    expect(evicted).toEqual(['t_ttl'])
+    await until(() => host.agents.liveAgent('superagent-worker-t_ttl') === undefined, 1_000)
+    expect(host.agents.liveAgent('superagent-worker-t_running')).toBeDefined()
+  })
+
+  it('runWithConcurrency bounds parallelism and processes every item', async () => {
+    const seen: number[] = []
+    let active = 0
+    let maxActive = 0
+    await runWithConcurrency([1, 2, 3, 4, 5], 2, async item => {
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      await new Promise(resolve => setTimeout(resolve, 10))
+      active -= 1
+      seen.push(item)
+    })
+    expect(seen.sort()).toEqual([1, 2, 3, 4, 5])
+    expect(maxActive).toBe(2)
   })
 })

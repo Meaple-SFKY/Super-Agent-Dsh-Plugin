@@ -48,6 +48,10 @@ interface Wizard {
     allowSelf: boolean
     operator: string
     personalToken: string
+    operatorTokenConfigured: boolean
+    operatorTokenFile: string
+    operatorError: string
+    acceptInvitations: string
     sshKeyFile: string
     sshKeyPublic: string
     sshKeyGenerated: boolean
@@ -66,15 +70,20 @@ interface Wizard {
     routerModel: string
     workerModel: string
   }
+  operator: { status: string; invited: string[]; accepted: string[]; warnings: string[]; error: string }
   finish: { status: string; error: string; elapsed: number }
 }
 
 interface Internals {
+  TICKET_STAGE_IDS: string[]
+  ticketStageIndex: (stage: string, kind?: string) => number
   views: {
     OverviewView: (props: Record<string, unknown>) => unknown
     SetupView: (props: Record<string, unknown>) => unknown
     PermissionsView: (props: Record<string, unknown>) => unknown
     ExpandableDetail: (props: Record<string, unknown>) => unknown
+    DetailDrawer: (props: Record<string, unknown>) => unknown
+    StageStrip: (props: Record<string, unknown>) => unknown
   }
   API_PATHS: Record<string, string>
   WIZARD_STEPS: string[]
@@ -85,6 +94,8 @@ interface Internals {
   stepLabels: (t: (key: string) => string) => string[]
   stepStates: (wizard: Wizard) => string[]
   canAdvance: (step: number, wizard: Wizard) => boolean
+  buildOperatorRequest: (wizard: Wizard) => { personalToken: string; repositories: string[]; botLogin: string } | undefined
+  applyOperatorResult: (wizard: Wizard, result: unknown) => Wizard
   buildModelProviders: (payload: unknown) => Array<{ id: string; name: string; models: Array<{ value: string; label: string }> }>
   encodeModelSelection: (selection: unknown) => string
   decodeModelSelection: (value: string) => { provider: string; model: string; reasoningEffort?: string } | undefined
@@ -120,6 +131,8 @@ interface Internals {
         allowedLogins?: string[]
         collaborators?: string[]
         login?: string
+        operatorTokenFile?: string
+        acceptInvitations?: string
       }
     }
     policy: { mode: string }
@@ -439,6 +452,11 @@ describe('src/client/main.js', () => {
     expect(source).toContain('behavior.routerModel')
     expect(source).toContain('behavior.workerModel')
     expect(source).toContain('ModelSelect')
+    expect(source).toContain('setupGithubOperator')
+    expect(source).toContain('${API}/setup/github/operator')
+    expect(source).toContain('buildOperatorRequest')
+    expect(source).toContain('applyOperatorResult')
+    expect(source).toContain('github.acceptInvitations')
     expect(source).toContain('telegram.capabilities')
     expect(source).toContain('telegram.richTextHint')
     expect(source).toContain('sshKeyRestarting')
@@ -534,6 +552,10 @@ describe('setup wizard state machine', () => {
     expect(wizard.telegram.keyboards).toBe(true)
     expect(wizard.github.operator).toBe('')
     expect(wizard.github.personalToken).toBe('')
+    expect(wizard.github.operatorTokenConfigured).toBe(false)
+    expect(wizard.github.operatorTokenFile).toBe('')
+    expect(wizard.github.acceptInvitations).toBe('allowlist')
+    expect(wizard.operator.status).toBe('idle')
     expect(wizard.github.sshKeyFile).toBe('')
     expect(wizard.github.sshKeyPublic).toBe('')
     expect(wizard.github.sshKeyGenerated).toBe(false)
@@ -572,6 +594,9 @@ describe('setup wizard state machine', () => {
             allowSelf: true,
             allowedLogins: ['alice'],
             collaborators: ['alice', 'bob'],
+            operatorTokenConfigured: true,
+            operatorTokenFile: '/home/me/.dsh/state/superagent/secrets/github-operator-token',
+            acceptInvitations: 'off',
           },
         },
         git: {
@@ -593,6 +618,9 @@ describe('setup wizard state machine', () => {
     expect(configured.github.allowSelf).toBe(false)
     expect(configured.behavior.language).toBe('en')
     expect(configured.github.operator).toBe('alice')
+    expect(configured.github.operatorTokenConfigured).toBe(true)
+    expect(configured.github.operatorTokenFile).toBe('/home/me/.dsh/state/superagent/secrets/github-operator-token')
+    expect(configured.github.acceptInvitations).toBe('off')
     expect(configured.github.sshKeyFile).toBe('/home/me/.ssh/superagent_bot')
     expect(configured.github.sshKeyGenerated).toBe(true)
     expect(configured.github.sshKeyPublic).toBe('ssh-ed25519 AAAA-TEST user@example')
@@ -678,6 +706,75 @@ describe('setup wizard state machine', () => {
     expect(missing.behavior.workerModel).toBe('')
   })
 
+  it('builds the operator request and clears the personal token only on success', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    const wizard = validatedWizard(module)
+
+    expect(internals.buildOperatorRequest(wizard)).toBeUndefined()
+    wizard.github = {
+      ...wizard.github,
+      personalToken: 'refreshed-token',
+      operator: 'alice',
+      login: 'acme-superagent',
+      selected: ['acme/widgets'],
+    }
+    expect(internals.buildOperatorRequest(wizard)).toEqual({
+      token: 'refreshed-token',
+      repositories: ['acme/widgets'],
+      botLogin: 'acme-superagent',
+    })
+
+    const success = internals.applyOperatorResult(wizard, {
+      ok: true,
+      data: {
+        invited: [{ repo: 'acme/widgets', login: 'acme-superagent', status: 'invited' }],
+        accepted: [{ repo: 'acme/widgets', status: 'accepted' }],
+        warnings: [],
+        operatorTokenFile: '/home/me/.dsh/state/superagent/secrets/github-operator-token',
+      },
+    })
+    expect(success.github.personalToken).toBe('')
+    expect(success.github.operatorTokenConfigured).toBe(true)
+    expect(success.github.operatorTokenFile).toBe('/home/me/.dsh/state/superagent/secrets/github-operator-token')
+    expect(success.operator.status).toBe('done')
+    expect(success.operator.invited).toEqual(['acme-superagent → acme/widgets (invited)'])
+    expect(success.operator.accepted).toEqual(['acme/widgets (accepted)'])
+    expect(success.operator.error).toBe('')
+
+    const warned = internals.applyOperatorResult(wizard, {
+      ok: true,
+      data: { invited: [], accepted: [], warnings: ['cannot invite: missing admin'], operatorTokenFile: '/tmp/op' },
+    })
+    expect(warned.operator.status).toBe('warn')
+    expect(warned.github.personalToken).toBe('')
+    expect(warned.operator.warnings).toEqual(['cannot invite: missing admin'])
+
+    const failed = internals.applyOperatorResult(wizard, { ok: false, error: 'invalid operator token' })
+    expect(failed.github.personalToken).toBe('refreshed-token')
+    expect(failed.operator.status).toBe('error')
+    expect(failed.operator.error).toContain('invalid operator token')
+  })
+
+  it('never writes the personal token to config and carries invitation settings', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    const wizard = validatedWizard(module)
+    wizard.github = {
+      ...wizard.github,
+      personalToken: 'refreshed-token',
+      operatorTokenFile: ' /tmp/operator-token ',
+      acceptInvitations: 'all',
+    }
+    const config = internals.buildConfig(wizard)
+    expect(JSON.stringify(config)).not.toContain('refreshed-token')
+    expect(config.sources.github.operatorTokenFile).toBe('/tmp/operator-token')
+    expect(config.sources.github.acceptInvitations).toBe('all')
+
+    wizard.github = { ...wizard.github, acceptInvitations: 'nonsense' }
+    expect(internals.buildConfig(wizard).sources.github.acceptInvitations).toBe('allowlist')
+  })
+
   it('gates each step on its verification result', async () => {
     const module = await loadModule()
     const internals = internalsOf(module)
@@ -731,6 +828,7 @@ describe('setup wizard state machine', () => {
       enabled: true,
       repositories: ['acme/widgets', 'acme/docs'],
       allowSelf: false,
+      acceptInvitations: 'allowlist',
       login: 'agent-account',
       tokenFile: '/tmp/superagent/secrets/github-token',
       allowedLogins: ['alice'],
@@ -932,6 +1030,84 @@ describe('permissions localization', () => {
     expect(tree).toContain('Future title')
     expect(tree).toContain(internals.dictionaries.zh['permissions.required'])
     expect(tree).toContain(internals.dictionaries.zh['common.restartRequired'])
+  })
+})
+
+describe('ticket detail and eight stages', () => {
+  it('maps runtime stages onto eight read-only labels', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    expect(internals.TICKET_STAGE_IDS).toHaveLength(8)
+    expect(internals.TICKET_STAGE_IDS).toEqual([
+      'received',
+      'evaluated',
+      'decided',
+      'queued',
+      'working',
+      'reporting',
+      'attention',
+      'closed',
+    ])
+    expect(internals.ticketStageIndex('working')).toBe(4)
+    expect(internals.ticketStageIndex('queued')).toBe(3)
+    expect(internals.ticketStageIndex('waiting')).toBe(6)
+    expect(internals.ticketStageIndex('open')).toBe(2)
+    expect(internals.ticketStageIndex('working', 'blocked')).toBe(6)
+    expect(internals.ticketStageIndex('working', 'ready')).toBe(5)
+    expect(internals.ticketStageIndex('unknown')).toBe(0)
+  })
+
+  it('renders a read-only dialog with all eight stage labels', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    const react = renderableReact()
+    const t = (key: string) => key
+
+    react.reset()
+    const ticket = JSON.stringify(
+      internals.views.DetailDrawer({
+        t,
+        detail: {
+          kind: 'ticket',
+          item: { id: 't_1', title: 'Fix the flaky test', stage: 'working', lastReport: 'progress', at: '2026-01-01T00:00:00.000Z' },
+        },
+        onClose: () => undefined,
+      }),
+    )
+    expect(ticket).toContain('dialog')
+    expect(ticket).toContain('aria-modal')
+    expect(ticket).toContain('Fix the flaky test')
+    expect(ticket).toContain('detail.readonly')
+    expect(ticket).toContain('stage.working')
+
+    react.reset()
+    const stages = JSON.stringify(internals.views.StageStrip({ t, stage: 'working', kind: undefined }))
+    for (const stage of internals.TICKET_STAGE_IDS) expect(stages).toContain(`stage.${stage}`)
+
+    react.reset()
+    const decision = JSON.stringify(
+      internals.views.DetailDrawer({
+        t,
+        detail: { kind: 'decision', item: { id: 't_2', title: 'Needs approval', kind: 'blocked', question: 'Deploy?', at: '2026-01-01T00:00:00.000Z' } },
+        onClose: () => undefined,
+      }),
+    )
+    expect(decision).toContain('detail.decision')
+    expect(decision).toContain('Deploy?')
+    expect(decision).toContain('blocked')
+  })
+
+  it('gates polling by view and skips unchanged snapshots', async () => {
+    const source = await readFile(join(root, 'src', 'client', 'main.js'), 'utf8')
+    expect(source).toContain('function usePolling(load, intervalMs, enabled = true)')
+    expect(source).toContain('JSON.stringify(previous.data) === JSON.stringify(result.data)')
+    expect(source).toContain("const onOverview = view === 'overview'")
+    expect(source).toContain('STATE_POLL_MS, onOverview')
+    expect(source).toContain('onSetup ? SETUP_POLL_MS : 60000')
+    expect(source).toContain('30000, onPermissions')
+    expect(source).toContain('60000, onSetup')
+    expect(source).toContain('SafeView')
+    expect(source).toContain('overview.detail')
   })
 })
 

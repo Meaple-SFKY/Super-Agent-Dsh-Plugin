@@ -15,12 +15,12 @@ import type { AddressInfo } from 'node:net'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { registerWorkerTools } from '../src/tools/worker.js'
+import { registerWorkerTools, workerToolDefinitions } from '../src/tools/worker.js'
 import type { ToolDeps } from '../src/tools/shared.js'
 import { Sessions, type HostAgentRegistry } from '../src/app/sessions.js'
 import type { Ticket, Trigger } from '../src/core/model.js'
 import type { Context } from '@deepseek-ai/cordis'
-import { makeHarness, makeTrigger } from './core-fixtures.js'
+import { makeHarness, makePolicy, makeTrigger } from './core-fixtures.js'
 import { createFakeHost, textOf } from './runtime-host.js'
 
 const dirs: string[] = []
@@ -65,7 +65,15 @@ interface FakeGithubBehaviour {
   defaultBranch?: string
   /** Login returned by GET /user (default octocat). */
   userLogin?: string
+  /** Map a Bearer token to the /user login (multi-account tests). */
+  userLogins?: Record<string, string>
   createRepositoryResponse?: (body: Record<string, unknown>) => { status: number; body: unknown }
+  /** Pending invitations returned by GET /user/repository_invitations. */
+  invitations?: Array<Record<string, unknown>>
+  /** Status for PUT /repos/:repo/collaborators/:login (default 204). */
+  collaboratorStatus?: number
+  /** Status for PATCH /user/repository_invitations/:id (default 204). */
+  acceptInvitationStatus?: number
   issues?: Array<Record<string, unknown>>
   issueDetail?: Record<string, unknown>
   createIssueResponse?: (body: Record<string, unknown>) => { status: number; body: unknown }
@@ -147,7 +155,9 @@ async function startFakeGithub(behaviour: FakeGithubBehaviour): Promise<FakeGith
         return
       }
       if (request.method === 'GET' && path === '/user') {
-        json(200, { login, id: 1, name: login })
+        const bearer = String(request.headers.authorization ?? '').replace(/^Bearer\s+/i, '')
+        const userLogin = behaviour.userLogins?.[bearer] ?? login
+        json(200, { login: userLogin, id: 1, name: userLogin })
         return
       }
       if (request.method === 'POST' && path === '/user/repos') {
@@ -169,6 +179,17 @@ async function startFakeGithub(behaviour: FakeGithubBehaviour): Promise<FakeGith
           default_branch: behaviour.defaultBranch ?? 'main',
           owner: { login },
         })
+        return
+      }
+      const invitationMatch = /^\/user\/repository_invitations\/(\d+)$/.exec(path)
+      if (request.method === 'PATCH' && invitationMatch) {
+        const status = behaviour.acceptInvitationStatus ?? 204
+        response.writeHead(status)
+        response.end()
+        return
+      }
+      if (request.method === 'GET' && path === '/user/repository_invitations') {
+        json(200, behaviour.invitations ?? [])
         return
       }
       const repoMatch = /^\/repos\/([^/]+)\/([^/]+)(.*)$/.exec(path)
@@ -401,11 +422,20 @@ interface WorkerHarness {
 async function makeWorker(options: {
   github?: ToolDeps['github']
   repository?: string
+  /** Override the policy repositories allowlist (defaults to `[repository]`). */
+  repositories?: string[]
   secretFile?: string
   cwdStateDir?: boolean
 }): Promise<WorkerHarness> {
   const host = createFakeHost()
   const harness = makeHarness()
+  const policy = makePolicy()
+  const repositories = options.repositories ?? (options.repository ? [options.repository] : undefined)
+  if (repositories) {
+    const githubPolicy = policy.sources.github ?? { allowed: [] }
+    policy.sources.github = { ...githubPolicy, allowed: githubPolicy.allowed ?? [], repositories }
+  }
+  harness.policy.set(policy)
   const stateDir = tempDir('worker-github')
   const logger = { debug: () => undefined, info: () => undefined, warn: () => undefined, error: () => undefined }
   const sessions = new Sessions({
@@ -665,7 +695,7 @@ describe('superagent_github tool', () => {
   })
 
   it('requires a repository and a body where the action needs one', async () => {
-    const harness = await makeWorker({})
+    const harness = await makeWorker({ repositories: ['octo/repo'] })
     const github = await startFakeGithub({ pulls: [] })
     setGithub(harness, { token: 'ghp_validation012345678901234567890', apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
     const noRepo = (await harness.host.executeTool(harness.worker, 'superagent_github', {
@@ -681,6 +711,41 @@ describe('superagent_github tool', () => {
     })).value as Record<string, unknown>
     expect(noBody).toMatchObject({ ok: false, error: 'body_required' })
     expect(textOf({ content: [{ type: 'text', text: 'x' }] })).toBe('x')
+  })
+  it('rejects repositories outside the configured allowlist before any API call', async () => {
+    const github = await startFakeGithub({ pulls: [] })
+    const harness = await makeWorker({ repository: 'octo/repo', repositories: ['owner/repo'] })
+    setGithub(harness, { token: 'ghp_allowlist0000000000000000000000', apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
+
+    const result = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'get_issue',
+      repo: 'octo/repo',
+      number: 1,
+    })).value as Record<string, unknown>
+
+    expect(result).toMatchObject({ ok: false, error: 'repo_not_allowed' })
+    expect(github.requests).toHaveLength(0)
+  })
+
+  it('allows wildcard repositories only when the owner is the token account or an operator', async () => {
+    const github = await startFakeGithub({ pulls: [], userLogin: 'octocat' })
+    const allowed = await makeWorker({ repository: 'octocat/repo', repositories: ['*'] })
+    setGithub(allowed, { token: 'ghp_wildcard00000000000000000000000', apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
+    const accepted = (await allowed.host.executeTool(allowed.worker, 'superagent_github', {
+      action: 'get_issue',
+      repo: 'octocat/repo',
+      number: 1,
+    })).value as Record<string, unknown>
+    expect(accepted).toMatchObject({ ok: true, action: 'get_issue', repo: 'octocat/repo' })
+
+    const rejected = await makeWorker({ repository: 'evil/repo', repositories: ['*'] })
+    setGithub(rejected, { token: 'ghp_wildcardevil0000000000000000000', apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
+    const denied = (await rejected.host.executeTool(rejected.worker, 'superagent_github', {
+      action: 'get_issue',
+      repo: 'evil/repo',
+      number: 1,
+    })).value as Record<string, unknown>
+    expect(denied).toMatchObject({ ok: false, error: 'repo_not_allowed' })
   })
 })
 
@@ -760,16 +825,21 @@ describe('superagent_github create_repository', () => {
     expect(JSON.stringify(result)).not.toContain('ghp_repofail')
   })
 
-  it('invites requested collaborators as admin after creating the repository', async () => {
+  it('invites only configured collaborators (ignoring model input) after creating the repository', async () => {
     const github = await startFakeGithub({ pulls: [], defaultBranch: 'main', userLogin: 'octocat' })
     const harness = await makeWorker({})
     const token = 'ghp_invite000000000000000000000000'
-    setGithub(harness, { token, apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
+    setGithub(harness, {
+      token,
+      apiBaseUrl: github.baseUrl,
+      timeoutMs: 2_000,
+      collaborators: ['alice', 'bob'],
+    })
 
     const result = (await harness.host.executeTool(harness.worker, 'superagent_github', {
       action: 'create_repository',
       name: 'team-project',
-      collaborators: ['alice', '@bob', 'alice'],
+      collaborators: ['mallory'],
     })).value as Record<string, unknown>
 
     expect(result).toMatchObject({
@@ -790,6 +860,34 @@ describe('superagent_github create_repository', () => {
       expect(put.authorization).toBe(`Bearer ${token}`)
     }
     expect(JSON.stringify(result)).not.toContain(token)
+  })
+
+  it('does not invite collaborators for an existing repository', async () => {
+    const github = await startFakeGithub({
+      pulls: [],
+      userLogin: 'octocat',
+      createRepositoryResponse: () => ({
+        status: 422,
+        body: { message: 'Repository creation failed.', errors: [{ message: 'name already exists on this account' }] },
+      }),
+    })
+    const harness = await makeWorker({})
+    setGithub(harness, {
+      token: 'ghp_existingcollab000000000000000000',
+      apiBaseUrl: github.baseUrl,
+      timeoutMs: 2_000,
+      collaborators: ['alice'],
+    })
+
+    const result = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'create_repository',
+      name: 'already-there',
+    })).value as Record<string, unknown>
+
+    expect(result.ok).toBe(true)
+    expect(result.created).toBe(false)
+    expect(result.collaborators).toBeUndefined()
+    expect(github.requests.filter(entry => entry.method === 'PUT')).toHaveLength(0)
   })
 
   it('uses the configured collaborators by default and sends no invitation when none are configured', async () => {
@@ -831,12 +929,16 @@ describe('superagent_github create_repository', () => {
     })
     const harness = await makeWorker({})
     const token = 'ghp_invitefail00000000000000000000'
-    setGithub(harness, { token, apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
+    setGithub(harness, {
+      token,
+      apiBaseUrl: github.baseUrl,
+      timeoutMs: 2_000,
+      collaborators: ['good', 'blocked'],
+    })
 
     const result = (await harness.host.executeTool(harness.worker, 'superagent_github', {
       action: 'create_repository',
       name: 'half-invited',
-      collaborators: ['good', 'blocked'],
     })).value as Record<string, unknown>
 
     expect(result.ok).toBe(true)
@@ -978,7 +1080,7 @@ describe('superagent_github issue / pull / review / search actions (task-39)', (
     expect(files.ok).toBe(true)
     const listFiles = files.files as Array<Record<string, unknown>>
     expect(listFiles.map(file => file.filename)).toEqual(['src/a.ts', 'src/b.ts'])
-    expect(String(listFiles[0]!.patch).length).toBeLessThanOrEqual(1201)
+    expect(String(listFiles[0]!.patch).length).toBeLessThanOrEqual(801)
     expect(String(listFiles[0]!.patch).endsWith('…')).toBe(true)
     expect(github.requests.some(entry => entry.path.includes('/pulls/4/files'))).toBe(true)
   })
@@ -1159,5 +1261,164 @@ describe('superagent_report files (task-39)', () => {
     })
     const report = harness.harness.store.tickets.get(harness.ticket.id)!.latestReport!
     expect(report.files).toHaveLength(10)
+  })
+})
+
+describe('create_repository operator auto-accept (task-52)', () => {
+  it('invites the operator and accepts the repository invitation with the operator PAT', async () => {
+    const operatorTokenFile = join(tempDir('operator-pat'), 'github-operator-token')
+    writeFileSync(operatorTokenFile, 'ghp_operator_secret', { mode: 0o600 })
+    const github = await startFakeGithub({
+      pulls: [],
+      userLogin: 'bot-user',
+      invitations: [
+        {
+          id: 77,
+          repository: { full_name: 'bot-user/cine-project', private: true, html_url: 'https://github.com/bot-user/cine-project' },
+          permissions: 'push',
+          inviter: { login: 'operator-user' },
+          created_at: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+      inviteResponse: () => ({ status: 201 }),
+      acceptInvitationStatus: 204,
+    })
+    const harness = await makeWorker({})
+    setGithub(harness, {
+      token: 'ghp_bot_token',
+      collaborators: ['operator-user'],
+      login: 'bot-user',
+      operatorTokenFile,
+      apiBaseUrl: github.baseUrl,
+      timeoutMs: 2_000,
+    })
+
+    const result = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'create_repository',
+      name: 'cine-project',
+    })).value as Record<string, unknown>
+
+    expect(result).toMatchObject({
+      ok: true,
+      action: 'create_repository',
+      repo: 'bot-user/cine-project',
+      created: true,
+      collaborators: [{ login: 'operator-user', status: 'invited' }],
+      operator: { status: 'accepted', invitationId: 77 },
+    })
+    const invite = github.requests.find(entry => entry.method === 'PUT' && entry.path.includes('/collaborators/operator-user'))
+    expect(invite?.authorization).toBe('Bearer ghp_bot_token')
+    const listInvites = github.requests.find(entry => entry.method === 'GET' && entry.path.startsWith('/user/repository_invitations'))
+    expect(listInvites?.authorization).toBe('Bearer ghp_operator_secret')
+    const accept = github.requests.find(entry => entry.method === 'PATCH' && entry.path.includes('/user/repository_invitations/77'))
+    expect(accept?.authorization).toBe('Bearer ghp_operator_secret')
+    expect(JSON.stringify(result)).not.toContain('ghp_operator_secret')
+    expect(JSON.stringify(result)).not.toContain('ghp_bot_token')
+  })
+
+  it('warns when the operator has no pending invitation but still succeeds', async () => {
+    const operatorTokenFile = join(tempDir('operator-pat-none'), 'github-operator-token')
+    writeFileSync(operatorTokenFile, 'ghp_operator_secret', { mode: 0o600 })
+    const github = await startFakeGithub({ pulls: [], userLogin: 'bot-user', invitations: [] })
+    const harness = await makeWorker({})
+    setGithub(harness, {
+      token: 'ghp_bot_token',
+      collaborators: ['operator-user'],
+      login: 'bot-user',
+      operatorTokenFile,
+      apiBaseUrl: github.baseUrl,
+      timeoutMs: 2_000,
+    })
+    const result = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'create_repository',
+      name: 'cine-project',
+    })).value as Record<string, unknown>
+    expect(result.ok).toBe(true)
+    expect(result.operator).toEqual({ status: 'none' })
+    const warnings = result.warnings as string[]
+    expect(warnings.some(line => line.includes('no pending invitation'))).toBe(true)
+    expect(github.requests.some(entry => entry.method === 'PATCH')).toBe(false)
+  })
+})
+
+describe('create_repository operator derivation (task-52)', () => {
+  it('derives the operator login from the personal PAT when collaborators are not configured', async () => {
+    const operatorTokenFile = join(tempDir('operator-pat-derive'), 'github-operator-token')
+    writeFileSync(operatorTokenFile, 'ghp_operator_secret', { mode: 0o600 })
+    const github = await startFakeGithub({
+      pulls: [],
+      userLogin: 'bot-user',
+      invitations: [
+        {
+          id: 88,
+          repository: { full_name: 'bot-user/derived-project', private: true, html_url: 'https://github.com/bot-user/derived-project' },
+          permissions: 'push',
+          inviter: { login: 'operator-user' },
+          created_at: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+      inviteResponse: () => ({ status: 201 }),
+      acceptInvitationStatus: 204,
+      userLogins: { ghp_operator_secret: 'operator-user' },
+    })
+    const harness = await makeWorker({})
+    setGithub(harness, {
+      token: 'ghp_bot_token',
+      login: 'bot-user',
+      operatorTokenFile,
+      apiBaseUrl: github.baseUrl,
+      timeoutMs: 2_000,
+    })
+    const result = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'create_repository',
+      name: 'derived-project',
+    })).value as Record<string, unknown>
+    expect(result.ok).toBe(true)
+    expect(result.collaborators).toEqual([{ login: 'operator-user', status: 'invited' }])
+    expect(result.operator).toEqual({ status: 'accepted', invitationId: 88 })
+    // The login derivation validates the personal token once against /user.
+    const userCall = github.requests.find(entry => entry.method === 'GET' && entry.path === '/user')
+    expect(userCall?.authorization).toBe('Bearer ghp_operator_secret')
+  })
+})
+
+describe('large-output and schema caching (task-56)', () => {
+  it('truncates pull files structurally instead of cutting the JSON text', async () => {
+    const pullFiles = Array.from({ length: 12 }, (_, index) => ({
+      filename: `src/file-${index}.ts`,
+      status: 'modified',
+      additions: 10,
+      deletions: 2,
+      changes: 12,
+      patch: 'y'.repeat(1500),
+    }))
+    const github = await startFakeGithub({
+      pulls: [{ number: 7, head: 'agent/t_x', base: 'main' }],
+      pullFiles,
+    })
+    const harness = await makeWorker({ repository: 'octo/repo' })
+    setGithub(harness, { token: 'ghp_actions000000000000000000000000', apiBaseUrl: github.baseUrl, timeoutMs: 2_000 })
+    const result = (await harness.host.executeTool(harness.worker, 'superagent_github', {
+      action: 'get_pull_files',
+      number: 7,
+      limit: 30,
+    })).value as Record<string, unknown>
+    expect(result.ok).toBe(true)
+    const files = result.files as Array<Record<string, unknown>>
+    expect(files.length).toBeLessThan(12)
+    expect(result.truncated).toBe(true)
+    expect(result.fileCount).toBe(files.length)
+    for (const file of files) expect(String(file.patch).length).toBeLessThanOrEqual(801)
+    // The returned payload is still valid JSON.
+    expect(() => JSON.parse(JSON.stringify(result))).not.toThrow()
+  })
+
+  it('compiles tool definitions once per ToolDeps object', async () => {
+    const harness = await makeWorker({ repository: 'octo/repo' })
+    const first = workerToolDefinitions(harness.deps)
+    const second = workerToolDefinitions(harness.deps)
+    expect(second).toBe(first)
+    // Registration closes over the same definitions for every worker session.
+    expect(workerToolDefinitions({ ...harness.deps }).length).toBe(first.length)
   })
 })

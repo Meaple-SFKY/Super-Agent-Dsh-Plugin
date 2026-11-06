@@ -18,7 +18,23 @@ import type { EffectsPort, EngineForExecutor, Store } from '../core/ports.js'
 import type { Sessions } from './sessions.js'
 import type { AppLogger } from './support.js'
 import { errorMessage, nowIso, withTimeout } from './support.js'
+import { Defer } from './effects.js'
 import { renderAssignmentMessage, renderDeliveryMessage, renderStatusRequest } from '../prompts/index.js'
+
+/** Run `fn` over `items` with at most `limit` concurrent tasks (stable order aside). */
+export async function runWithConcurrency<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  const concurrency = Math.max(1, Math.min(limit, items.length))
+  let next = 0
+  const workers = Array.from({ length: concurrency }, async () => {
+    for (;;) {
+      const index = next++
+      const item = items[index]
+      if (item === undefined) return
+      await fn(item)
+    }
+  })
+  await Promise.all(workers)
+}
 
 export interface ExecutorConfig {
   /** Shell command run inside the ticket directory after preparation. */
@@ -47,6 +63,8 @@ export interface ExecutorOptions {
   stateDir: string
   now?: () => IsoTime
   config?: ExecutorConfig
+  /** How many interrupted tickets restart in parallel (default 3). */
+  recoveryConcurrency?: number
   /** Injectable command runner (tests). Must reject on a non-zero exit. */
   runCommand?: (
     command: string,
@@ -183,6 +201,11 @@ export class Executor {
     this.launching.add(guardKey)
     try {
       const directory = this.directoryFor(ticket.id)
+      // Hard worker-slot admission: never create an unbounded number of agent
+      // trees; Defer makes the effect retry once a slot frees up.
+      if (!this.options.sessions.hasWorker(ticket.id) && !this.options.sessions.admitWorker()) {
+        throw new Defer(`no free worker slot (max ${this.options.config ? 'configured' : 'default'} workers)`, 2000)
+      }
       const repo = this.resolveRepository(ticket)
       await this.prepareWorkspace({ ticket, directory, repo })
       const agent = await this.options.sessions.ensureWorker(ticket.id, directory)
@@ -267,50 +290,53 @@ export class Executor {
   async recover(): Promise<{ interrupted: number; relaunched: number }> {
     let interrupted = 0
     let relaunched = 0
-    for (const ticket of this.options.store.tickets.open()) {
-      const running = ticket.assignments.filter(assignment => assignment.state === 'running')
-      for (const assignment of running) {
+    const tickets = this.options.store.tickets.open()
+    // Bounded parallel recovery: a restart with many interrupted assignments
+    // should not serialize N git clones; the launch guard keeps duplicates safe.
+    await runWithConcurrency(tickets, this.options.recoveryConcurrency ?? 3, async ticket => {
+        const running = ticket.assignments.filter(assignment => assignment.state === 'running')
+        for (const assignment of running) {
+          try {
+            this.options.engine().assignmentInterrupted(ticket.id, assignment.id)
+            interrupted += 1
+          } catch (error) {
+            this.logger.error('could not mark the assignment interrupted', {
+              ticketId: ticket.id,
+              assignmentId: assignment.id,
+              error: errorMessage(error),
+            })
+          }
+        }
+        const fresh = this.options.store.tickets.get(ticket.id)
+        if (!fresh || fresh.state === 'ended') return
+        const pending = fresh.assignments.filter(assignment => assignment.state === 'pending').pop()
+        if (!pending) {
+          if (running.length > 0) {
+            this.logger.warn('interrupted assignment has no replacement; the engine did not queue a retry', {
+              ticketId: ticket.id,
+            })
+          }
+          return
+        }
         try {
-          this.options.engine().assignmentInterrupted(ticket.id, assignment.id)
-          interrupted += 1
+          await this.launch(fresh, pending)
+          relaunched += 1
         } catch (error) {
-          this.logger.error('could not mark the assignment interrupted', {
-            ticketId: ticket.id,
-            assignmentId: assignment.id,
-            error: errorMessage(error),
-          })
-        }
-      }
-      const fresh = this.options.store.tickets.get(ticket.id)
-      if (!fresh || fresh.state === 'ended') continue
-      const pending = fresh.assignments.filter(assignment => assignment.state === 'pending').pop()
-      if (!pending) {
-        if (running.length > 0) {
-          this.logger.warn('interrupted assignment has no replacement; the engine did not queue a retry', {
-            ticketId: ticket.id,
-          })
-        }
-        continue
-      }
-      try {
-        await this.launch(fresh, pending)
-        relaunched += 1
-      } catch (error) {
-        this.logger.warn('recovery launch failed; enqueuing a durable launch effect', {
-          ticketId: ticket.id,
-          assignmentId: pending.id,
-          error: errorMessage(error),
-        })
-        try {
-          this.options.effects?.enqueue('launch', `launch:${ticket.id}:${pending.id}`, {
+          this.logger.warn('recovery launch failed; enqueuing a durable launch effect', {
             ticketId: ticket.id,
             assignmentId: pending.id,
+            error: errorMessage(error),
           })
-        } catch (enqueueError) {
-          this.logger.error('could not enqueue the recovery launch effect', { error: errorMessage(enqueueError) })
+          try {
+            this.options.effects?.enqueue('launch', `launch:${ticket.id}:${pending.id}`, {
+              ticketId: ticket.id,
+              assignmentId: pending.id,
+            })
+          } catch (enqueueError) {
+            this.logger.error('could not enqueue the recovery launch effect', { error: errorMessage(enqueueError) })
+          }
         }
-      }
-    }
+    })
     if (interrupted > 0 || relaunched > 0) this.logger.info('restart recovery complete', { interrupted, relaunched })
     return { interrupted, relaunched }
   }

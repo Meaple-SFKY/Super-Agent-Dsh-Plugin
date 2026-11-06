@@ -38,6 +38,8 @@ export interface EffectHandlerOptions {
   ordered?: boolean
   /** Backoff for this kind; defaults to the queue-wide retry settings. */
   retry?: { baseMs?: number; maxMs?: number }
+  /** Extra claim predicate (e.g. per-Source ordering); false defers to a later pass. */
+  canRun?: (row: EffectRow) => boolean
 }
 
 export interface EffectsOptions {
@@ -53,7 +55,7 @@ export interface EffectsOptions {
   retry?: { baseMs?: number; maxMs?: number }
   /** Per-kind backoff, e.g. replies retry from 5 s where reports retry from 2 s. */
   retryByKind?: Partial<Record<EffectKind, { baseMs?: number; maxMs?: number }>>
-  /** How often `start()` pumps. Defaults to 2 seconds. */
+  /** Fallback pump interval; wake()/next-due scheduling normally beats it. Defaults to 5 s. */
   intervalMs?: number
 }
 
@@ -84,13 +86,14 @@ interface RegisteredHandler {
   handler: EffectHandler
   concurrency: number
   ordered: boolean
+  canRun?: (row: EffectRow) => boolean
   retryBaseMs: number
   retryMaxMs: number
 }
 
 const DEFAULT_RETRY_BASE_MS = 2_000
 const DEFAULT_RETRY_MAX_MS = 60_000
-const DEFAULT_INTERVAL_MS = 2_000
+const DEFAULT_INTERVAL_MS = 5_000
 /** Kinds whose later rows wait for an earlier failed row. */
 const DEFAULT_ORDERED: EffectKind[] = ['relay', 'notice']
 
@@ -116,6 +119,7 @@ export class Effects implements EffectsPort {
   private readonly retryMaxMs: number
   private readonly intervalMs: number
   private readonly retryByKind: Partial<Record<EffectKind, { baseMs?: number; maxMs?: number }>>
+  private readonly defaultConcurrencyByKind: Partial<Record<EffectKind, number>>
   private readonly handlers = new Map<EffectKind, RegisteredHandler>()
   private readonly inFlight = new Set<string>()
   private readonly failures = new Map<EffectKind, number>()
@@ -123,6 +127,7 @@ export class Effects implements EffectsPort {
   private pumping: Promise<void> | undefined
   private pumpRequested = false
   private timer: ReturnType<typeof setInterval> | undefined
+  private dueTimer: ReturnType<typeof setTimeout> | undefined
   private stopping = false
 
   constructor(options: EffectsOptions) {
@@ -133,6 +138,7 @@ export class Effects implements EffectsPort {
     this.retryMaxMs = options.retry?.maxMs ?? DEFAULT_RETRY_MAX_MS
     this.intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS
     this.retryByKind = options.retryByKind ?? {}
+    this.defaultConcurrencyByKind = options.concurrency ?? {}
 
     for (const [kind, handler] of Object.entries(options.handlers ?? {})) {
       if (handler !== undefined) {
@@ -146,8 +152,9 @@ export class Effects implements EffectsPort {
     const perKind = options.retry ?? this.retryByKind[kind]
     this.handlers.set(kind, {
       handler,
-      concurrency: Math.max(1, options.concurrency ?? 1),
+      concurrency: Math.max(1, options.concurrency ?? this.defaultConcurrencyByKind[kind] ?? 1),
       ordered: options.ordered ?? DEFAULT_ORDERED.includes(kind),
+      ...(options.canRun ? { canRun: options.canRun } : {}),
       retryBaseMs: perKind?.baseMs ?? this.retryBaseMs,
       retryMaxMs: perKind?.maxMs ?? this.retryMaxMs,
     })
@@ -188,12 +195,56 @@ export class Effects implements EffectsPort {
     void this.pumpSafely()
   }
 
+  /**
+   * Ask the pump to run now. Call this after a committed command (Source
+   * receive, Engine decision, tool action) instead of waiting for the next
+   * interval: it is the event-driven fast path. Safe to call from anywhere;
+   * coalesces multiple wakes into one pump.
+   */
+  wake(delayMs = 0): void {
+    if (this.stopping) return
+    if (this.dueTimer !== undefined) clearTimeout(this.dueTimer)
+    this.dueTimer = setTimeout(() => {
+      this.dueTimer = undefined
+      void this.pumpSafely()
+    }, Math.max(0, delayMs))
+    this.dueTimer.unref?.()
+  }
+
+  /** Schedule one pump for the earliest future `dueAt` (retries/Defer). */
+  private scheduleNextDue(): void {
+    if (this.stopping) return
+    if (this.dueTimer !== undefined) return
+    const now = Date.now()
+    let earliest: number | undefined
+    for (const row of this.store.effects.all()) {
+      const due = Date.parse(row.dueAt)
+      if (!Number.isFinite(due)) continue
+      if (earliest === undefined || due < earliest) earliest = due
+    }
+    if (earliest === undefined) return
+    const delay = Math.max(0, Math.min(earliest - now, this.intervalMs))
+    if (delay === 0) {
+      this.wake(0)
+      return
+    }
+    this.dueTimer = setTimeout(() => {
+      this.dueTimer = undefined
+      void this.pumpSafely()
+    }, delay)
+    this.dueTimer.unref?.()
+  }
+
   /** Stop the pump, await in-flight handlers, keep pending rows. */
   async drain(): Promise<void> {
     this.stopping = true
     if (this.timer !== undefined) {
       clearInterval(this.timer)
       this.timer = undefined
+    }
+    if (this.dueTimer !== undefined) {
+      clearTimeout(this.dueTimer)
+      this.dueTimer = undefined
     }
     while (this.pumping !== undefined) {
       await this.pumping.catch(() => undefined)
@@ -219,6 +270,7 @@ export class Effects implements EffectsPort {
       await this.pumping
     } finally {
       this.pumping = undefined
+      this.scheduleNextDue()
     }
     if (this.pumpRequested) {
       this.pumpRequested = false
@@ -280,7 +332,9 @@ export class Effects implements EffectsPort {
           const inFlightCount = [...this.inFlight].filter(id => id.startsWith(`${kind}\u0000`)).length
           const available = Math.max(0, registered.concurrency - inFlightCount)
           if (available === 0) continue
-          claimable = kindRows.filter(row => row.dueAt <= now).slice(0, available)
+          claimable = kindRows
+            .filter(row => row.dueAt <= now && (registered.canRun?.(row) ?? true))
+            .slice(0, available)
         }
         for (const row of claimable) {
           this.inFlight.add(rowId(row.kind, row.key))

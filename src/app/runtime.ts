@@ -12,10 +12,9 @@
  * optional Telegram notice), and `stop()` always completes.
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { IncomingMessage, ServerResponse } from 'node:http'
 import { fileURLToPath } from 'node:url'
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -28,6 +27,7 @@ import type {
   OutboundMessage,
   Policy,
   PolicyRule,
+  ReceiveDisposition,
   SendOutcome,
   SourceId,
   Ticket,
@@ -54,15 +54,7 @@ import { Executor } from './executor.js'
 import { Assessor } from './assessor.js'
 import { Watchdog } from './watchdog.js'
 import { registerApi, API_HEADER, API_VERSION, type ApiActionRequest, type ApiActionValue, type ApiDeps, type ApiState } from './api.js'
-import {
-  SETUP_MODELS_PATH,
-  SETUP_SSH_KEY_PATH,
-  SETUP_WATCHDOG_PATH,
-  SetupService,
-  type ConfigEditorLike,
-  type LlmLike,
-  type ProcessResult,
-} from './setup.js'
+import { SetupService, type ConfigEditorLike, type LlmLike, type ProcessResult, type WatchdogScriptName } from './setup.js'
 import { registerRouterTools } from '../tools/router.js'
 import { registerWorkerTools } from '../tools/worker.js'
 import { preloadPrompts } from '../prompts/index.js'
@@ -97,6 +89,10 @@ export interface GithubSourceConfig {
   observeCi?: boolean
   /** GitHub logins invited as admin when a ticket creates a repository. */
   collaborators?: string[]
+  /** How repository invitations addressed to the bot account are handled. */
+  acceptInvitations?: 'off' | 'allowlist' | 'all'
+  /** Personal PAT file (0600) the operator stores for repo invitations/bootstrap. */
+  operatorTokenFile?: string
   [key: string]: unknown
 }
 
@@ -121,6 +117,8 @@ export interface RuntimeConfig {
     gitSshKeyFile?: string
     /** Worker reasoning effort for the selected model (adapter-defined id). */
     reasoningEffort?: string
+    /** Dispose an idle Worker session after this many ms (default 15 min). */
+    idleTtlMs?: number
     prepareTimeoutMs?: number
     gitTimeoutMs?: number
   }
@@ -158,6 +156,14 @@ export function validateConfig(raw: unknown): { config?: RuntimeConfig; problem?
   }
   if (config.language !== undefined && config.language !== 'zh' && config.language !== 'en') {
     return { problem: { error: 'configuration.language must be zh or en' } }
+  }
+  const operatorTokenFile = config.sources?.github?.operatorTokenFile
+  if (operatorTokenFile !== undefined && typeof operatorTokenFile === 'string' && operatorTokenFile.trim().length > 0) {
+    if (!operatorTokenFile.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(operatorTokenFile)) {
+      return { problem: { error: 'configuration.sources.github.operatorTokenFile must be an absolute path' } }
+    }
+  } else if (operatorTokenFile !== undefined && typeof operatorTokenFile !== 'string') {
+    return { problem: { error: 'configuration.sources.github.operatorTokenFile must be a string' } }
   }
   const gitSshKeyFile = config.executor?.gitSshKeyFile
   if (gitSshKeyFile !== undefined && typeof gitSshKeyFile === 'string' && gitSshKeyFile.trim().length > 0) {
@@ -199,6 +205,9 @@ export function validateConfig(raw: unknown): { config?: RuntimeConfig; problem?
   }
   if (config.executor?.reasoningEffort !== undefined && typeof config.executor.reasoningEffort !== 'string') {
     return { problem: { error: 'configuration.executor.reasoningEffort must be a string' } }
+  }
+  if (config.executor?.idleTtlMs !== undefined && (!Number.isInteger(config.executor.idleTtlMs) || config.executor.idleTtlMs < 0)) {
+    return { problem: { error: 'configuration.executor.idleTtlMs must be a non-negative integer' } }
   }
   const maxWorkers = config.executor?.maxWorkers
   if (maxWorkers !== undefined && (!Number.isInteger(maxWorkers) || maxWorkers < 1)) {
@@ -550,6 +559,31 @@ interface EffectStat {
 
 const SAFE_MODE_THRESHOLD = 5
 
+/**
+ * A state-directory lock older than this (or whose recorded PID is dead) is
+ * considered stale and removed at startup. Aligned with the guardian's 30 s
+ * plugin-start budget: a crashed previous instance must never block boot for
+ * the full lock lease of `proper-lockfile`.
+ */
+export const STATE_LOCK_STALE_MS = 30_000
+const STATE_LOCK_UPDATE_MS = 10_000
+const STATE_PID_FILE = 'runtime.pid'
+
+interface LockPidRecord {
+  pid: number
+  at: string
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
 export class Runtime {
   private readonly ctx: Context
   private readonly rawConfig: unknown
@@ -572,13 +606,13 @@ export class Runtime {
   private apiDispose?: () => void
   private apiDeps?: ApiDeps
   private setupService?: SetupService
-  private sshKeyRouteDispose?: () => void
-  private watchdogRouteDispose?: () => void
   /** Serialized heartbeat writes; awaited during shutdown so teardown is clean. */
   private heartbeatQueue: Promise<void> = Promise.resolve()
 
   private readonly timers = new Set<ReturnType<typeof setInterval>>()
   private modelWarned = false
+  private wakeScheduled = false
+  private wakeTimer?: ReturnType<typeof setTimeout>
   private stopped = false
   private stopping?: Promise<void>
   private passBusy = false
@@ -685,6 +719,8 @@ export class Runtime {
     const effects = createEffects({
       store: this.store,
       logger: this.logger,
+      intervalMs: 5_000,
+      concurrency: { assessment: 2, launch: 2, delivery: 2 },
     })
     this.effects = effects
 
@@ -723,6 +759,7 @@ export class Runtime {
       defaultModel: role => this.agentOptionsFor(role),
       configuredModel: role => this.configuredAgentOptionsFor(role),
       maxWorkers: config.executor?.maxWorkers ?? 2,
+      idleTtlMs: config.executor?.idleTtlMs ?? 900_000,
       createTimeoutMs: 60_000,
       decorate: (agentCtx, info) => this.decorateAgent(agentCtx, info),
       onTurnEnd: info => this.onTurnEnd(info),
@@ -760,6 +797,7 @@ export class Runtime {
 
     this.watchdog = new Watchdog({
       store: this.store,
+      stateDir: config.stateDir,
       executor: this.executor,
       engine: () => this.engine!,
       effects,
@@ -814,9 +852,6 @@ export class Runtime {
     } catch (error) {
       this.logger.warn('could not register the management API', { error: errorMessage(error) })
     }
-    this.registerSshKeyRoute()
-    this.registerModelsRoute()
-    this.registerWatchdogRoute()
 
     // Router session: required for assessments and replies, retried in the background.
     await this.ensureRouter()
@@ -850,14 +885,19 @@ export class Runtime {
 
   private async afterStart(): Promise<void> {
     if (this.stopped) return
-    await this.sources?.startAll()
-    if (this.stopped) return
-    try {
-      await this.executor!.recover()
-    } catch (error) {
-      this.health.fail('executor', error)
-      this.logger.warn('restart recovery failed', { error: errorMessage(error) })
-    }
+    // Sources and restart recovery are independent: start both in parallel so a
+    // slow git clone during recovery does not delay polling (and vice versa).
+    await Promise.allSettled([
+      this.sources?.startAll(),
+      (async () => {
+        try {
+          await this.executor!.recover()
+        } catch (error) {
+          this.health.fail('executor', error)
+          this.logger.warn('restart recovery failed', { error: errorMessage(error) })
+        }
+      })(),
+    ])
     this.writeHeartbeat()
   }
 
@@ -1042,6 +1082,11 @@ export class Runtime {
               ...(typeof github.tokenFile === 'string' ? { tokenFile: github.tokenFile } : {}),
               ...(typeof github.tokenEnv === 'string' ? { tokenEnv: github.tokenEnv } : {}),
               ...(typeof github.apiBaseUrl === 'string' ? { apiBaseUrl: github.apiBaseUrl } : {}),
+              ...(Array.isArray(github.collaborators) ? { collaborators: github.collaborators.map(String) } : {}),
+              ...(typeof github.login === 'string' && github.login ? { login: github.login } : {}),
+              ...(typeof github.operatorTokenFile === 'string' && github.operatorTokenFile
+                ? { operatorTokenFile: github.operatorTokenFile }
+                : {}),
             },
           }
         : {}),
@@ -1056,6 +1101,10 @@ export class Runtime {
       this.engine.executor.turnEnded(info.ticketId, info.assignmentId)
     } catch (error) {
       this.logger.warn('could not record the turn end', { error: errorMessage(error) })
+    }
+    const ticket = this.store?.tickets.get(info.ticketId)
+    if (ticket?.ends) {
+      void this.sessions?.disposeWorker(info.ticketId, 'ticket ended').catch(() => undefined)
     }
   }
 
@@ -1127,6 +1176,8 @@ export class Runtime {
         await fn(payload)
         this.effectStats.set(kind, { failures: 0 })
         this.health.set(`effects:${kind}`, 'ready')
+        // The handler may have committed more work (delivery, reply, next launch).
+        this.requestWake()
       } catch (error) {
         const previous = this.effectStats.get(kind)
         const failures = (previous?.failures ?? 0) + 1
@@ -1142,13 +1193,19 @@ export class Runtime {
   }
 
   private installTimers(): void {
-    const passInterval = Math.max(500, this.config?.passIntervalMs ?? 2_000)
+    const passInterval = Math.max(500, this.config?.passIntervalMs ?? 5_000)
     this.every(passInterval, () => {
       void this.pass('timer').catch(() => undefined)
     })
     const heartbeatInterval = Math.max(5_000, this.config?.heartbeatIntervalMs ?? 30_000)
     this.every(heartbeatInterval, () => this.writeHeartbeat())
     this.watchdog?.start()
+    // Idle worker sessions are released after the TTL so long-running hosts do
+    // not accumulate one Cordis plugin tree + session writer per historical ticket.
+    this.every(60_000, () => {
+      const disposed = this.sessions?.sweepIdle(this.config?.executor?.idleTtlMs ?? 900_000) ?? []
+      if (disposed.length > 0) this.logger.info('disposed idle worker sessions (TTL)', { tickets: disposed })
+    })
   }
 
   private every(ms: number, run: () => void): void {
@@ -1162,6 +1219,32 @@ export class Runtime {
     }, ms)
     timer.unref?.()
     this.timers.add(timer)
+  }
+
+  /**
+   * Event-driven fast path: a committed command asked for progress.
+   * Coalesces bursts into one microtask, then pumps effects and runs one Engine
+   * pass. The 5 s interval remains as a fallback (retries, expiries).
+   */
+  requestWake(): void {
+    if (this.stopped || this.safeMode) return
+    if (this.wakeScheduled) return
+    this.wakeScheduled = true
+    this.wakeTimer = setTimeout(() => {
+      this.wakeScheduled = false
+      this.wakeTimer = undefined
+      if (this.stopped) return
+      this.effects?.wake()
+      void this.pass('wake').catch(() => undefined)
+    }, 0)
+    this.wakeTimer.unref?.()
+  }
+
+  /** Accept one Trigger into the Engine and wake the pipeline (used by Sources). */
+  ingest(trigger: Trigger): ReceiveDisposition {
+    const disposition = this.engine?.sources.receive(trigger) ?? 'filtered'
+    if (disposition === 'stored') this.requestWake()
+    return disposition
   }
 
   /** One Engine pass, guarded against re-entry and never throwing. */
@@ -1443,136 +1526,8 @@ export class Runtime {
     }
   }
 
-  /**
-   * `POST /superagent/api/setup/github/ssh-key`: generate (or return) the bot
-   * SSH key pair. Registered from the runtime because docs/002's setup routes
-   * live here; same loopback + `x-superagent-request` fence as every other
-   * management route, and the plugin persists `executor.gitSshKeyFile` after
-   * responding (the config write restarts the plugin).
-   */
-  private registerSshKeyRoute(): void {
-    const webServer = this.ctx.get('webServer') as
-      | {
-          register?: (route: {
-            kind: 'exact' | 'prefix'
-            path: string
-            handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>
-          }) => () => void
-        }
-      | undefined
-    const setup = this.setupService
-    if (!webServer?.register || !setup) return
-    const loopback = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
-    try {
-      this.sshKeyRouteDispose = webServer.register({
-        kind: 'exact',
-        path: SETUP_SSH_KEY_PATH,
-        handler: async (req, res) => {
-          const reply = (status: number, body: Record<string, unknown>): void => {
-            try {
-              const text = JSON.stringify(body)
-              res.writeHead(status, {
-                'content-type': 'application/json; charset=utf-8',
-                'cache-control': 'no-store',
-                'content-length': Buffer.byteLength(text),
-              })
-              res.end(text)
-            } catch {
-              try {
-                res.end()
-              } catch {
-                // client already gone
-              }
-            }
-          }
-          try {
-            const address = req.socket?.remoteAddress
-            if (!address || !loopback.has(address) || req.headers[API_HEADER] !== '1') {
-              reply(403, { ok: false, error: 'forbidden' })
-              return
-            }
-            if (req.method !== 'POST') {
-              reply(405, { ok: false, error: 'method not allowed' })
-              return
-            }
-            const result = await setup.generateGithubSshKey()
-            const body: Record<string, unknown> = { ...result.body }
-            if (body.ok === true && typeof body.keyFile === 'string') {
-              body.restarting = setup.persistGitSshKey(body.keyFile)
-            }
-            reply(result.status, body)
-          } catch (error) {
-            this.logger.warn('setup ssh-key endpoint failed', { error: errorMessage(error) })
-            reply(500, { ok: false, error: 'internal_error', description: 'ssh key generation failed' })
-          }
-        },
-      })
-    } catch (error) {
-      this.logger.warn('could not register the setup ssh-key route', { error: errorMessage(error) })
-    }
-  }
-
-  /** `GET /superagent/api/setup/models`: providers + models from the DSH llm service. */
-  private registerModelsRoute(): void {
-    const webServer = this.ctx.get('webServer') as
-      | {
-          register?: (route: {
-            kind: 'exact' | 'prefix'
-            path: string
-            handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>
-          }) => () => void
-        }
-      | undefined
-    const setup = this.setupService
-    if (!webServer?.register || !setup) return
-    const loopback = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
-    try {
-      webServer.register({
-        kind: 'exact',
-        path: SETUP_MODELS_PATH,
-        handler: async (req, res) => {
-          const reply = (status: number, body: Record<string, unknown>): void => {
-            try {
-              const text = JSON.stringify(body)
-              res.writeHead(status, {
-                'content-type': 'application/json; charset=utf-8',
-                'cache-control': 'no-store',
-                'content-length': Buffer.byteLength(text),
-              })
-              res.end(text)
-            } catch {
-              try {
-                res.end()
-              } catch {
-                // client already gone
-              }
-            }
-          }
-          try {
-            const address = req.socket?.remoteAddress
-            if (!address || !loopback.has(address) || req.headers[API_HEADER] !== '1') {
-              reply(403, { ok: false, error: 'forbidden' })
-              return
-            }
-            if (req.method !== 'GET' && req.method !== 'HEAD') {
-              reply(405, { ok: false, error: 'method not allowed' })
-              return
-            }
-            const result = await setup.listModels()
-            reply(result.status, result.body)
-          } catch (error) {
-            this.logger.warn('setup models endpoint failed', { error: errorMessage(error) })
-            reply(500, { ok: false, error: 'internal_error', description: 'could not list models' })
-          }
-        },
-      })
-    } catch (error) {
-      this.logger.warn('could not register the setup models route', { error: errorMessage(error) })
-    }
-  }
-
   /** Resolve a repo script from the package root (source `src/app` or bundled `lib`). */
-  private resolveBundleScript(name: 'watchdog.mjs' | 'install-launchd.sh' | 'uninstall.sh'): string | undefined {
+  private resolveBundleScript(name: WatchdogScriptName): string | undefined {
     const candidates = [
       new URL(`../../scripts/${name}`, import.meta.url),
       new URL(`../scripts/${name}`, import.meta.url),
@@ -1588,113 +1543,6 @@ export class Runtime {
       }
     }
     return undefined
-  }
-
-  /** `GET/POST /superagent/api/setup/watchdog`: login-item watchdog status/toggle. */
-  private registerWatchdogRoute(): void {
-    const webServer = this.ctx.get('webServer') as
-      | {
-          register?: (route: {
-            kind: 'exact' | 'prefix'
-            path: string
-            handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>
-          }) => () => void
-        }
-      | undefined
-    const setup = this.setupService
-    if (!webServer?.register || !setup) return
-    const loopback = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
-    const readBody = (req: IncomingMessage): Promise<Record<string, unknown>> =>
-      new Promise((resolve, reject) => {
-        let size = 0
-        const chunks: Buffer[] = []
-        const timer = setTimeout(() => reject(new Error('request body timed out')), 5_000)
-        timer.unref?.()
-        req.on('data', (chunk: Buffer | string) => {
-          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-          size += buffer.length
-          if (size > 64 * 1024) {
-            clearTimeout(timer)
-            reject(new Error('request body too large'))
-            return
-          }
-          chunks.push(buffer)
-        })
-        req.on('end', () => {
-          clearTimeout(timer)
-          const text = Buffer.concat(chunks).toString('utf8').trim()
-          if (!text) {
-            resolve({})
-            return
-          }
-          try {
-            const parsed = JSON.parse(text) as unknown
-            resolve(parsed !== null && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {})
-          } catch (error) {
-            reject(new Error(`invalid JSON body: ${error instanceof Error ? error.message : String(error)}`))
-          }
-        })
-        req.on('error', reject)
-      })
-    try {
-      this.watchdogRouteDispose = webServer.register({
-        kind: 'exact',
-        path: SETUP_WATCHDOG_PATH,
-        handler: async (req, res) => {
-          const reply = (status: number, body: Record<string, unknown>): void => {
-            try {
-              const text = JSON.stringify(body)
-              res.writeHead(status, {
-                'content-type': 'application/json; charset=utf-8',
-                'cache-control': 'no-store',
-                'content-length': Buffer.byteLength(text),
-              })
-              res.end(text)
-            } catch {
-              try {
-                res.end()
-              } catch {
-                // client already gone
-              }
-            }
-          }
-          try {
-            const address = req.socket?.remoteAddress
-            if (!address || !loopback.has(address) || req.headers[API_HEADER] !== '1') {
-              reply(403, { ok: false, error: 'forbidden' })
-              return
-            }
-            if (req.method === 'GET' || req.method === 'HEAD') {
-              const result = await setup.getWatchdog(true)
-              reply(result.status, result.body)
-              return
-            }
-            if (req.method !== 'POST') {
-              reply(405, { ok: false, error: 'method not allowed' })
-              return
-            }
-            let body: Record<string, unknown>
-            try {
-              body = await readBody(req)
-            } catch (error) {
-              reply(400, { ok: false, error: 'invalid_body', description: errorMessage(error) })
-              return
-            }
-            if (typeof body.enabled !== 'boolean') {
-              reply(400, { ok: false, error: 'invalid_request', description: 'body must be { enabled: boolean }' })
-              return
-            }
-            const result = await setup.setWatchdog(body.enabled)
-            reply(result.status, result.body)
-          } catch (error) {
-            this.logger.warn('setup watchdog endpoint failed', { error: errorMessage(error) })
-            reply(500, { ok: false, error: 'internal_error', description: 'watchdog operation failed' })
-          }
-        },
-      })
-    } catch (error) {
-      this.logger.warn('could not register the setup watchdog route', { error: errorMessage(error) })
-    }
   }
 
   // -- management API ------------------------------------------------------
@@ -1872,7 +1720,19 @@ export class Runtime {
 
   // -- lock ----------------------------------------------------------------
 
+  /**
+   * Take the state-directory lock with fast stale recovery.
+   *
+   * `proper-lockfile` leaves `<stateDir>.lock` behind after a crash. The lock
+   * used to be considered stale only after 120 s; we now record our PID in
+   * `<stateDir>/runtime.pid` and treat a lock as stale immediately when that
+   * PID is dead (or is our own PID from a previous in-process runtime), or
+   * after {@link STATE_LOCK_STALE_MS} when no PID is recorded. A live foreign
+   * PID fails fast with a clear message instead of waiting for the lease.
+   */
   private async acquireLock(stateDir: string): Promise<() => Promise<void>> {
+    const lockPath = `${stateDir}.lock`
+    const pidPath = join(stateDir, STATE_PID_FILE)
     try {
       const module = (await import('proper-lockfile')) as unknown as {
         default?: { lock: LockFn }
@@ -1880,12 +1740,17 @@ export class Runtime {
       }
       const lock = module.default?.lock ?? module.lock
       if (!lock) throw new Error('proper-lockfile has no lock()')
-      for (let attempt = 0; attempt < 5; attempt++) {
+
+      this.recoverStaleLock(lockPath, pidPath)
+
+      let release: (() => Promise<void>) | undefined
+      let lastError: unknown
+      for (let attempt = 0; attempt < 3 && release === undefined; attempt++) {
         try {
-          return await lock(stateDir, {
+          release = await lock(stateDir, {
             realpath: false,
-            stale: 120_000,
-            update: 30_000,
+            stale: STATE_LOCK_STALE_MS,
+            update: STATE_LOCK_UPDATE_MS,
             retries: 0,
             onCompromised: (error: Error) => {
               this.logger.error('state directory lock compromised; entering safe mode', { error: errorMessage(error) })
@@ -1893,17 +1758,106 @@ export class Runtime {
             },
           })
         } catch (error) {
-          if (attempt === 4) throw error
-          await new Promise(resolve => {
-            const timer = setTimeout(resolve, 300 * (attempt + 1))
-            timer.unref?.()
-          })
+          lastError = error
+          // A racing previous instance may have released (or stale-removed) the
+          // lock between the preflight and this attempt: recover once more.
+          if (attempt < 2) {
+            await new Promise(resolve => {
+              const timer = setTimeout(resolve, 250)
+              timer.unref?.()
+            })
+            try {
+              this.recoverStaleLock(lockPath, pidPath)
+            } catch (recoverError) {
+              throw recoverError
+            }
+          }
         }
       }
+      if (!release) throw lastError ?? new Error('lock is held by another process')
+      try {
+        writeFileSync(
+          pidPath,
+          JSON.stringify({ pid: process.pid, at: this.clock.now() } satisfies LockPidRecord),
+          { mode: 0o600 },
+        )
+      } catch (error) {
+        this.logger.warn('could not record the runtime PID file', { error: errorMessage(error) })
+      }
+      return async () => {
+        try {
+          rmSync(pidPath, { force: true })
+        } catch {
+          // best effort
+        }
+        await release?.()
+      }
     } catch (error) {
-      throw new Error(`could not lock the SuperAgent state directory ${stateDir}: ${errorMessage(error)}`)
+      const detail = errorMessage(error)
+      const pid = this.readLockPid(pidPath)
+      const suffix = pid ? ` (pid ${pid.pid})` : ''
+      throw new Error(
+        `could not lock the SuperAgent state directory ${stateDir}${suffix}: ${detail}. ` +
+          'Stop the other SuperAgent instance or remove a stale lock manually.',
+      )
     }
-    throw new Error(`could not lock the SuperAgent state directory ${stateDir}`)
+  }
+
+  /** Remove a stale lock, or throw a clear conflict for a live foreign owner. */
+  private recoverStaleLock(lockPath: string, pidPath: string): void {
+    if (!existsSync(lockPath)) return
+    const record = this.readLockPid(pidPath)
+    if (record) {
+      const alive = isProcessAlive(record.pid)
+      if (alive && record.pid !== process.pid) {
+        throw new Error(
+          `state directory is locked by a running SuperAgent process (pid ${record.pid}); stop it first`,
+        )
+      }
+      this.logger.warn('removing a stale state-directory lock', {
+        pid: record.pid,
+        reason: record.pid === process.pid ? 'same process (previous runtime)' : 'pid is not running',
+      })
+      this.removeLock(lockPath, pidPath)
+      return
+    }
+    let ageMs = 0
+    try {
+      ageMs = Date.now() - statSync(lockPath).mtimeMs
+    } catch {
+      ageMs = STATE_LOCK_STALE_MS
+    }
+    if (ageMs >= STATE_LOCK_STALE_MS) {
+      this.logger.warn('removing a stale state-directory lock without a PID record', { ageMs })
+      this.removeLock(lockPath, pidPath)
+      return
+    }
+    throw new Error(
+      `state directory is locked by an unknown process (lock age ${Math.round(ageMs)}ms, ` +
+        `stale after ${STATE_LOCK_STALE_MS}ms); retry shortly or remove ${lockPath}`,
+    )
+  }
+
+  private readLockPid(pidPath: string): LockPidRecord | undefined {
+    try {
+      const raw = JSON.parse(readFileSync(pidPath, 'utf8')) as Partial<LockPidRecord>
+      return typeof raw.pid === 'number' && Number.isInteger(raw.pid) ? { pid: raw.pid, at: String(raw.at ?? '') } : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  private removeLock(lockPath: string, pidPath: string): void {
+    try {
+      rmSync(lockPath, { recursive: true, force: true })
+    } catch (error) {
+      this.logger.warn('could not remove the stale state-directory lock', { error: errorMessage(error) })
+    }
+    try {
+      rmSync(pidPath, { force: true })
+    } catch {
+      // best effort
+    }
   }
 
   // -- stop ----------------------------------------------------------------
@@ -1920,6 +1874,10 @@ export class Runtime {
     this.logger.info('SuperAgent runtime stopping')
     for (const timer of this.timers) clearInterval(timer)
     this.timers.clear()
+    if (this.wakeTimer !== undefined) {
+      clearTimeout(this.wakeTimer)
+      this.wakeTimer = undefined
+    }
     try {
       this.watchdog?.stop()
     } catch {
@@ -1931,8 +1889,6 @@ export class Runtime {
       ['executor', () => this.executor?.stop()],
       ['sessions', async () => this.sessions?.stop('runtime stopped')],
       ['api', () => this.apiDispose?.()],
-      ['setup-ssh-route', () => this.sshKeyRouteDispose?.()],
-      ['setup-watchdog-route', () => this.watchdogRouteDispose?.()],
       ['store', () => (this.ownsStore ? this.store?.close() : undefined)],
     ]
     for (const [name, run] of steps) {

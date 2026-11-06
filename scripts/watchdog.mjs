@@ -60,6 +60,8 @@ const DEFAULT_MAX_RESTARTS = 5
 const DEFAULT_RESET_AFTER_SECONDS = 1_800
 const BACKOFF_SECONDS = [60, 120, 240, 480, 900]
 const LOG_FILE = 'watchdog.log'
+const WATCHDOG_STATUS_FILE = 'watchdog-status.json'
+const DEFAULT_MAX_LOG_BYTES = 2 * 1024 * 1024
 const STATE_FILE = 'watchdog-state.json'
 const STATUS_FILE = 'superagent-status.json'
 const HEARTBEAT_FILE = 'superagent-heartbeat.json'
@@ -73,6 +75,8 @@ function parseArgs(argv) {
     restartCommand: undefined,
     notifyCommand: process.env.SUPERAGENT_WATCHDOG_NOTIFY,
     log: undefined,
+    statusFile: undefined,
+    maxLogBytes: DEFAULT_MAX_LOG_BYTES,
     staleSeconds: DEFAULT_STALE_SECONDS,
     graceSeconds: DEFAULT_GRACE_SECONDS,
     maxRestarts: DEFAULT_MAX_RESTARTS,
@@ -104,6 +108,12 @@ function parseArgs(argv) {
         break
       case '--log':
         options.log = value(arg, argv[++index])
+        break
+      case '--status-file':
+        options.statusFile = value(arg, argv[++index])
+        break
+      case '--max-log-bytes':
+        options.maxLogBytes = Number.parseInt(value(arg, argv[++index]), 10)
         break
       case '--stale-seconds':
         options.staleSeconds = Number.parseInt(value(arg, argv[++index]), 10)
@@ -148,6 +158,9 @@ function help() {  return [
     '  --process-pattern <text>  pgrep -f pattern of the DSH process (default: "DeepSeek Harness")',
     '  --restart-cmd <command>   Shell command that starts DSH (default: open -a "DeepSeek Harness")',
     '  --notify-cmd <command>    Command run with SUPERAGENT_WATCHDOG_MESSAGE on notable events',
+    '  --log <path>              Watchdog log file (default: <stateDir>/watchdog.log)',
+    '  --status-file <path>      Runtime status JSON (default: <stateDir>/watchdog-status.json)',
+    '  --max-log-bytes <n>       Rotate the log at this size (default: 2 MiB, keep one .1 backup)',
     '  --stale-seconds <n>       Heartbeat freshness bound (default: 180)',
     '  --grace-seconds <n>       Minimum delay between restarts (default: 120)',
     '  --max-restarts <n>        Consecutive restart cap (default: 5)',
@@ -165,17 +178,68 @@ function isAbsolutePath(value) {
   return typeof value === 'string' && value.length > 0 && isAbsolute(value)
 }
 
+/** Rotate the log once it exceeds `maxLogBytes`; keep one `.1` backup. */
+async function rotateLogIfNeeded(path, maxLogBytes) {
+  if (!Number.isFinite(maxLogBytes) || maxLogBytes <= 0) return
+  try {
+    const info = await stat(path)
+    if (info.size < maxLogBytes) return
+    await rename(path, `${path}.1`)
+  } catch {
+    // Missing file or a rotation race: appending still works.
+  }
+}
+
+function logPath(options) {
+  return options.log ?? join(options.stateDir, LOG_FILE)
+}
+
+function statusPath(options) {
+  return options.statusFile ?? join(options.stateDir, WATCHDOG_STATUS_FILE)
+}
+
 /** Append one line to the watchdog log; never throw. */
 async function log(options, level, message) {
   const line = `${new Date().toISOString()} ${level} pid=${process.pid} ${message}\n`
   try {
-    const path = options.log ?? join(options.stateDir, LOG_FILE)
+    const path = logPath(options)
     await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+    await rotateLogIfNeeded(path, options.maxLogBytes)
     await appendFile(path, line, { mode: 0o600 })
   } catch {
     // No log file: fall back to stderr so launchd still records something.
   }
   if (!options.json) process.stderr.write(line)
+}
+
+/** Publish the watchdog's own state for the panel/SETUP/troubleshooting. */
+async function writeWatchdogStatus(options, result) {
+  try {
+    const path = statusPath(options)
+    const existing = (await readJson(path)) ?? {}
+    const stored = (await readJson(join(options.stateDir, STATE_FILE))) ?? {}
+    const now = new Date().toISOString()
+    const installed = typeof existing.installed === 'boolean' ? existing.installed : undefined
+    const body = {
+      ...existing,
+      ...(installed === undefined ? {} : { installed }),
+      plugin: 'dsh-superagent-personal',
+      at: now,
+      checkedAt: now,
+      status: result.action,
+      code: result.code,
+      reason: result.reason ?? null,
+      pid: process.pid,
+      stateDir: options.stateDir,
+      log: logPath(options),
+      restarts: Number.isInteger(stored.restarts) ? stored.restarts : 0,
+      lastRestartAt: typeof stored.lastRestartAt === 'string' ? stored.lastRestartAt : null,
+      dryRun: options.dryRun === true,
+    }
+    await writeJson(path, body)
+  } catch {
+    // Status is best effort; the log already has the decision.
+  }
 }
 
 async function readJson(path) {
@@ -408,7 +472,7 @@ async function main() {
     process.stdout.write(`${help()}\n`)
     return
   }
-  for (const key of ['staleSeconds', 'graceSeconds', 'maxRestarts', 'resetAfterSeconds', 'interval']) {
+  for (const key of ['staleSeconds', 'graceSeconds', 'maxRestarts', 'resetAfterSeconds', 'interval', 'maxLogBytes']) {
     if (!Number.isInteger(options[key]) || options[key] < 0) {
       process.stderr.write(`invalid numeric option: --${key.replace(/[A-Z]/g, m => `-${m.toLowerCase()}`)}\n`)
       process.exitCode = 2
@@ -425,13 +489,16 @@ async function main() {
   const runOnce = async () => {
     try {
       const result = await check(options)
+      await writeWatchdogStatus(options, result)
       if (options.json) process.stdout.write(`${JSON.stringify({ ...result, at: new Date().toISOString() })}\n`)
       process.exitCode = result.code
       return result
     } catch (error) {
       await log(options, 'error', `watchdog check failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`)
+      const result = { code: 1, action: 'error', reason: String(error) }
+      await writeWatchdogStatus(options, result)
       process.exitCode = 1
-      return { code: 1, action: 'error', reason: String(error) }
+      return result
     }
   }
 
@@ -441,6 +508,11 @@ async function main() {
   }
 
   await log(options, 'info', `watchdog ${VERSION} started (interval ${options.interval}s, dry-run=${options.dryRun})`)
+  await writeWatchdogStatus(options, {
+    action: 'started',
+    code: 0,
+    reason: `loop interval ${options.interval}s`,
+  })
   let stopped = false
   const stop = () => {
     stopped = true

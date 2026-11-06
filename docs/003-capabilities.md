@@ -30,6 +30,7 @@
 | 文件 | **已启用（默认开）** | 接收文档/图片并落盘供 Worker 读取（`maxDownloadBytes` 默认 20MB）；发送走 Bot API `sendDocument`。面板/Config 开关 `files`。 |
 | 图片 | **已启用（默认开）** | 入站图片落盘，Worker/Router 用 `read_image`（来自 `tool-fs`）查看；出站 `sendPhoto`。 |
 | 内联按钮 / callback | **已启用（默认开，安全默认不触发）** | 消息可带 `reply_markup`；按钮点击只有 `observeCallbacks: true` 时才转成候选 Trigger（默认 false，避免误触接单）。Config 开关 `keyboards`。 |
+| 群聊观察 / 回复 / 回灌 | **已启用** | `chats` 指定群；`observeAllChatMessages` 收未 @ 消息，`replyToMessages` 在原消息下回复，`processBacklog` 首次回灌 24h，`pollTimeoutSeconds`/`pollSeconds`/`maxDownloadBytes` 控制轮询与附件上限。 |
 | Thread topic（论坛 topic） | **已启用** | 群 topic 的 `message_thread_id` 会编码进 Thread key（`telegram:chat:<id>:topic:<topic>`），回复也带 `message_thread_id`。 |
 | 本地命令 | **已启用** | `/status`、`/pause`、`/resume`、`/tickets`、`/stop`、`/retry`、`/help` 由 Source 直接解析，不占模型调用。 |
 | Bot 主动发起会话 | **不支持（Telegram 限制）** | bot 不能先私聊用户；首次需要用户点 Start / 发消息。向导会给出 `https://t.me/<bot>` 链接。 |
@@ -46,6 +47,8 @@
 | PR merge | **API 已支持，工具按需** | `github-api.mergePull` 已存在；`superagent_github` 提供 `merge_pull`（merge/squash/rebase），仅 Worker scope。 |
 | CI / Checks / Actions | **已启用（默认只读）** | 轮询 check-runs，403/404 时回退 Actions runs；只报摘要，不刷屏。PAT 只需 Actions: Read（Checks: Read 可选）。 |
 | 搜索 | **已启用** | `superagent_github` 的 `search`（issues/PR）与 Source 的搜索辅助；用于找相关上下文。 |
+| 通知流 / 自适应轮询 | **已启用（默认 auto）** | `notifications: auto` 在 token 可读 `GET /notifications` 时优先通知流，否则回退仓库轮询；`adaptivePolling` 优先轮询通知涉及的仓库；`maxTextChars` 限制 Issue/PR 文本长度。 |
+| 个人 PAT 邀请/接受邀请 | **已启用（可选）** | `operatorTokenFile`（本机 0600）+ `acceptInvitations`；向导在保存前调用 `/setup/github/operator`，per-repo 失败只记 warning。 |
 | 创建仓库 | **已启用（Worker）** | `create_repository`（默认 private），自动邀请 `sources.github.collaborators` 为 admin；bot 新建仓库后个人账号作为 collaborator。 |
 | 分支 / 提交 | **已启用** | Worker 通过 git（专用 bot SSH key）push 分支、开 PR；commit 身份由 `executor.gitName/gitEmail` 推导。 |
 | 自建仓库邀请 bot | **需一次手动（或提供个人 PAT 后自动）** | 现有仓库需把 bot 加为 Write collaborator；提供个人 PAT 时可由工具/向导辅助接受邀请。 |

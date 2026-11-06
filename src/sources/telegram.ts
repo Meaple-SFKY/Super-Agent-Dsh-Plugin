@@ -30,7 +30,8 @@ import type {
   ThreadRef,
   Trigger,
 } from '../core/model.js'
-import { join } from 'node:path'
+import { lstat, realpath } from 'node:fs/promises'
+import { basename, join, sep } from 'node:path'
 
 import type { Source, SourceContext, SourceHealthState, SourceKind } from './kind.js'
 import { makeTrigger } from './kind.js'
@@ -52,6 +53,10 @@ import {
 export const TELEGRAM_SOURCE = 'telegram'
 const OFFSET_KEY = 'telegram:offset'
 const DEFAULT_ENV = 'SUPERAGENT_TELEGRAM_TOKEN'
+/** Persistent crash-replay guard for local commands and inline buttons. */
+const ACTION_DEDUPE_KEY = 'telegram:seen-actions'
+const ACTION_DEDUPE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const ACTION_DEDUPE_MAX = 500
 const COMMAND_UNAVAILABLE = '命令处理暂不可用（runtime 尚未接线）。'
 const HELP_TEXT = [
   '/status — 运行状态与待处理',
@@ -558,7 +563,12 @@ export class TelegramSource implements Source {
       if (command.target && this.bot?.username && command.target !== this.bot.username.toLowerCase()) {
         return 'filtered'
       }
-      await this.runCommand(command, message, isPrivate)
+      // Persist the update id before running side effects: a crash between the
+      // command and the offset write must not execute /stop or /retry twice.
+      if (!this.actionAlreadyDone('command', update.update_id)) {
+        this.rememberAction('command', update.update_id)
+        await this.runCommand(command, message, isPrivate)
+      }
       return 'command'
     }
     // Unknown slash commands are not conversation: ignore them instead of
@@ -663,6 +673,10 @@ export class TelegramSource implements Source {
     // `keyboards: false` they are ignored entirely.
     if (callback.data?.startsWith('sa:')) {
       if (!this.config.keyboards) return 'ignored'
+      // Button callbacks are at-least-once across crashes: remember the click
+      // before running its side effect.
+      if (this.actionAlreadyDone('callback', callback.id)) return 'command'
+      this.rememberAction('callback', callback.id)
       return this.handleInlineAction(callback, api, signal)
     }
     if (!callback.data || !this.config.observeCallbacks) return 'ignored'
@@ -821,7 +835,13 @@ export class TelegramSource implements Source {
         }
         const fallbackName = file.file_path.split('/').pop() ?? `${item.kind}-${message.message_id}`
         const name = safeFileName(item.name ?? fallbackName)
-        const destination = join(this.ctx.stateDir, 'downloads', `${message.message_id}-${name}`)
+        // chatId prefix: message ids are only unique inside one chat, so this
+        // prevents one chat's download from overwriting another's.
+        const destination = join(
+          this.ctx.stateDir,
+          'downloads',
+          `${String(message.chat.id)}-${message.message_id}-${name}`,
+        )
         const downloaded = await api.downloadFile(file.file_path, destination, {
           maxBytes: this.config.maxDownloadBytes,
           signal,
@@ -972,11 +992,19 @@ export class TelegramSource implements Source {
     }
     for (let index = 0; index < attachments.length; index += 1) {
       const attachment = attachments[index]!
+      const safePath = await this.allowedAttachmentPath(attachment.path)
+      if (!safePath) {
+        this.ctx.logger.warn('telegram: outgoing attachment rejected (outside state work/downloads or symlink)', {
+          kind: attachment.kind,
+          name: attachment.name ?? attachment.path,
+        })
+        continue
+      }
       try {
         const options = {
           chatId,
-          path: attachment.path,
-          ...(attachment.name ? { name: attachment.name } : {}),
+          path: safePath,
+          name: safeFileName(attachment.name ?? basename(safePath)),
           ...(attachment.caption ? { caption: attachment.caption } : {}),
           ...(attachment.mime ? { mime: attachment.mime } : {}),
           ...(topicId !== undefined ? { messageThreadId: topicId } : {}),
@@ -1001,6 +1029,82 @@ export class TelegramSource implements Source {
       throw firstError
     }
     return 'failed'
+  }
+
+  /**
+   * Outgoing attachments must be regular files inside the state work/ or
+   * downloads/ trees after symlink resolution. Anything else is refused, so a
+   * prompt-injected worker cannot exfiltrate arbitrary local files.
+   */
+  private async allowedAttachmentPath(path: string): Promise<string | undefined> {
+    try {
+      const info = await lstat(path)
+      if (info.isSymbolicLink() || !info.isFile()) return undefined
+      const resolved = await realpath(path)
+      // Resolve the allowed roots too: on macOS /tmp is a symlink to
+      // /private/tmp, so a plain string prefix check would reject valid files.
+      for (const candidate of [join(this.ctx.stateDir, 'work'), join(this.ctx.stateDir, 'downloads')]) {
+        let root: string
+        try {
+          root = await realpath(candidate)
+        } catch {
+          continue
+        }
+        if (resolved === root || resolved.startsWith(`${root}${sep}`)) return resolved
+      }
+      return undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Crash-replay guard for local commands and inline buttons
+  // -----------------------------------------------------------------------
+
+  private actionDedupeState(): Record<string, number> {
+    try {
+      const stored = this.ctx.kv.get<Record<string, number>>(ACTION_DEDUPE_KEY)
+      if (!stored || typeof stored !== 'object') return {}
+      const state: Record<string, number> = {}
+      for (const [key, value] of Object.entries(stored)) {
+        if (typeof value === 'number' && Number.isFinite(value)) state[key] = value
+      }
+      return state
+    } catch {
+      return {}
+    }
+  }
+
+  private actionAlreadyDone(kind: 'command' | 'callback', id: number | string): boolean {
+    const key = `${kind}:${String(id)}`
+    const state = this.actionDedupeState()
+    const at = state[key]
+    if (typeof at !== 'number') return false
+    const now = this.nowMs()
+    return now - at <= ACTION_DEDUPE_TTL_MS
+  }
+
+  private rememberAction(kind: 'command' | 'callback', id: number | string): void {
+    try {
+      const key = `${kind}:${String(id)}`
+      const now = this.nowMs()
+      const state = this.actionDedupeState()
+      state[key] = now
+      // Drop expired entries and keep the map bounded.
+      const entries = Object.entries(state)
+        .filter(([, at]) => now - at <= ACTION_DEDUPE_TTL_MS)
+        .sort((left, right) => right[1] - left[1])
+        .slice(0, ACTION_DEDUPE_MAX)
+      this.ctx.kv.set(ACTION_DEDUPE_KEY, Object.fromEntries(entries))
+    } catch (error) {
+      this.ctx.logger.debug('telegram: could not persist action dedupe key', { error: describeError(error) })
+    }
+  }
+
+  private nowMs(): number {
+    const parsed = Date.parse(this.ctx.now())
+    return Number.isFinite(parsed) ? parsed : Date.now()
   }
 
   /** Inline keyboard for messages that ask the owner to act on a Ticket. */

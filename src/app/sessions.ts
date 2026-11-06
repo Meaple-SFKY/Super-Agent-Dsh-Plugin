@@ -126,6 +126,8 @@ export interface SessionsOptions {
   disposeTimeoutMs?: number
   /** Idle live workers kept around (LRU-disposed beyond this). */
   maxWorkers?: number
+  /** Dispose workers that stay idle for longer than this (0 disables the TTL). */
+  idleTtlMs?: number
   /** Register role tools / extra prompt context in the agent's own scope. */
   decorate?: (agentCtx: Context, info: SessionInfo) => void
   /** Called whenever an agent transitioned to `idle` (turn ended). */
@@ -732,6 +734,47 @@ export class Sessions {
         error: errorMessage(error),
       })
     }
+  }
+
+  /** Live worker session count (including running ones). */
+  liveWorkerCount(): number {
+    return this.workers.size
+  }
+
+  /**
+   * Admission control before creating a new Worker session. A free slot is
+   * granted immediately; otherwise one idle session is evicted (its slot is
+   * released asynchronously, bounded by the launch guard). A busy pool refuses
+   * the launch so the caller can Defer instead of growing without bound.
+   */
+  admitWorker(): boolean {
+    const max = this.options.maxWorkers ?? 2
+    if (this.workers.size < max) return true
+    const idle = [...this.workers.entries()]
+      .filter(([, record]) => record.agent.status !== 'running')
+      .sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt)
+    const candidate = idle[0]
+    if (!candidate) return false
+    void this.disposeWorker(candidate[0], 'worker cap (admission)').catch(() => undefined)
+    return true
+  }
+
+  /**
+   * Dispose idle workers older than the TTL. Returns the evicted ticket ids;
+   * disposal itself runs asynchronously (safe while a launch is in flight).
+   */
+  sweepIdle(ttlMs?: number): TicketId[] {
+    const ttl = ttlMs ?? this.options.idleTtlMs ?? 0
+    if (ttl <= 0) return []
+    const cutoff = Date.now() - ttl
+    const expired = [...this.workers.entries()]
+      .filter(([, record]) => record.agent.status !== 'running' && record.lastUsedAt < cutoff)
+      .map(([ticketId]) => ticketId)
+    for (const ticketId of expired) {
+      this.logger.info('disposing an idle worker session (TTL)', { ticketId, ttlMs: ttl })
+      void this.disposeWorker(ticketId, 'idle TTL').catch(() => undefined)
+    }
+    return expired
   }
 
   /** Keep the number of live worker sessions bounded by disposing idle ones (LRU). */

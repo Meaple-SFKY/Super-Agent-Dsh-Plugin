@@ -212,6 +212,32 @@ describe('install and operations scripts', () => {
     expect(watchdog).not.toContain('GITHUB_TOKEN')
   })
 
+  it('ships slim runtime assets: no sourcemaps and no internal docs', async () => {
+    const pkg = JSON.parse(await readText('package.json')) as { files?: string[] }
+    const files = pkg.files ?? []
+    expect(files).toContain('lib/**/*.js')
+    expect(files).toContain('lib/**/*.d.ts')
+    expect(files).not.toContain('lib')
+    expect(files).not.toContain('docs')
+    expect(files).toContain('SETUP.md')
+    expect(files).toContain('README.md')
+    expect(files.filter(entry => entry.startsWith('docs/'))).toEqual([
+      'docs/000-architecture.md',
+      'docs/001-interfaces.md',
+      'docs/002-setup-api.md',
+      'docs/003-capabilities.md',
+    ])
+    // Internal QA notes must not reach an installed bundle.
+    expect(files.some(entry => entry.includes('verification') || entry.includes('dsh-api-notes'))).toBe(false)
+
+    const client = await readText('lib/client.js')
+    expect(client).toContain('__ModuleLoader__')
+    expect(client.length).toBeLessThan(150_000)
+    const source = await readText('src/client/main.js')
+    expect(client.length).toBeLessThan(source.length)
+    expect(files.some(entry => entry.endsWith('.map'))).toBe(false)
+  })
+
   it('ships the capability matrix and Telegram capability switches', async () => {
     const docs = await readText('docs/003-capabilities.md')
     for (const section of ['Goal', 'read_image', 'Workflow', 'Agent Team', 'Telegram', 'GitHub']) {

@@ -154,7 +154,7 @@ https://github.com/<owner>/<repo>/releases/download/v0.1.1/dsh-superagent-person
 - 同一 profile 混用 link 与 tarball 时，先 `remove_bundle` 再安装目标版本；
 - 若发布到 npm，需要把 `private` 改成 `false` 并 `npm publish`，然后 Install bundle 直接填包名即可。
 
-### 2.4 配置（面板向导，推荐）
+### 2.5 配置（面板向导，推荐）
 
 装好 bundle 并重启 DSH 后，打开左侧栏 **Superagent → 设置**，按向导三步完成，**不需要手改 YAML**：
 
@@ -258,15 +258,27 @@ node scripts/watchdog.mjs --state-dir "$HOME/.dsh/state/superagent" --dry-run
 | `sources.telegram.enabled` | `false` | 是否收 Telegram |
 | `sources.telegram.tokenEnv` / `tokenFile` | — | 二选一，指向 token |
 | `sources.telegram.allowedUserIds` | `[]` | 允许发起工作的数字 id；空 = 谁都接不了 |
+| `sources.telegram.chats` | `[]` | 要监听的群 chat id（只处理 @） |
+| `sources.telegram.richText` / `files` / `keyboards` | `true` | 富文本 / 收发文件 / 内联按钮；关闭只影响机器人 |
+| `sources.telegram.observeCallbacks` / `observeAllChatMessages` / `replyToMessages` / `processBacklog` | `false` | 按钮点击成为候选 / 群聊未 @ 也收 / 原消息下回复 / 首次回灌 24h |
+| `sources.telegram.pollTimeoutSeconds` / `pollSeconds` / `maxDownloadBytes` | `25` / `1` / `20 MiB` | 长轮询超时 / 空轮询后等待 / 附件上限 |
 | `sources.github.tokenEnv` / `tokenFile` | — | 二选一 |
 | `sources.github.repositories` | `[]` | `owner/name` 列表；`["*"]` 表示自动发现你可访问的全部仓库（每 10 分钟刷新） |
 | `sources.github.login` | — | token 所属账号，用于识别 @ |
 | `sources.github.allowSelf` | `false` | 允许 token 所属账号自己的 Issue/PR/评论触发工作。用自己账号当 agent 时打开；专用机器账号保持关闭（agent 自身输出仍按 marker 过滤） |
 | `sources.github.collaborators` | `[]` | bot 新建仓库时自动邀请为 collaborator 的 GitHub 登录名（通常是你的个人账号） |
+| `sources.github.operatorTokenFile` | — | 个人（operator）PAT 的**绝对路径**；用于邀请 bot/接受邀请，文件 0600，内容不写配置 |
+| `sources.github.acceptInvitations` | `allowlist` | bot 收到仓库邀请：`off` / `allowlist`（邀请者在 allowedLogins/collaborators）/ `all` |
+| `sources.github.botLogins` | `[]` | 允许作为推断候选来源的 bot 登录名 |
+| `sources.github.notifications` | `auto` | 通知流：`auto`（token 可读通知时用）/ `off` / `on` |
+| `sources.github.maxTextChars` | `16000` | 传给模型的 Issue/PR 文本上限（1k–64k） |
+| `sources.github.adaptivePolling` | `true` | 优先轮询通知流涉及的仓库 |
 | `executor.gitSshKeyFile` | — | bot 账号的 SSH 私钥路径；向导生成后自动写入，也可手填已有私钥的绝对路径 |
 | `executor.gitName` / `gitEmail` | — | bot 账号的 git 提交作者名/邮箱；留空由 runtime 用 bot login 与 `<login>@users.noreply.github.com` 推导 |
 | `sources.github.observe*` | `false` | 是否也收未 @ 的 Issue/PR/评论/CI；建议 `observeComments`、`observeCi` 设为 `true`，否则已订阅线程的后续讨论/CI 结果收不到 |
 | `language` | `zh` | 机器人对你说话/汇报使用的语言：`zh` 或 `en`（面板 UI 语言独立） |
+| `router.provider` / `model` / `reasoningEffort` | — | 常驻 Router Session 的模型；留空沿用 DSH 默认 |
+| `executor.provider` / `model` / `reasoningEffort` | — | Worker 模型；留空沿用 DSH 默认 |
 | `policy.mode` | `observe` | `off` 只接明确请求；`observe` 只记录；`auto` 接推断候选 |
 | `policy.rules` | `[]` | `auto` 下的主动规则（id/name/enabled/instructions） |
 | `executor.maxWorkers` | 2 | 并行 Worker 数；笔记本建议 1–2 |
@@ -354,4 +366,4 @@ dsh plugin --profile desktop remove dsh-superagent-personal
 
 唯一保留的是 DSH 自己的 plugin-manager 日志目录（`.plugin-manager/logs/`），属于 DSH 管理，不属于插件数据。撤销 Telegram bot：@BotFather → `/deletebot`；撤销 GitHub PAT：GitHub → Settings → Developer settings → Fine-grained tokens → Revoke。
 
-> 当前安装方式：从本仓库构建后用 Plugin Manager 安装（`link:`）。**npm/URL tarball 式在线安装暂不支持**——bundle 静态依赖宿主 DSH 的 `dsh-tools`/`dsh-llm`/`dsh-session`，tarball 安装会因 profile 无法解析这些包而降级；如果要做真正的在线安装，需要把这些 helper 一起打进产物（自包含构建），可以作为后续打包项。
+> 安装方式：开发时用 `link:`（改代码后重启 DSH 即生效）；发布时用 `pnpmw pack` 生成 tarball 并从 HTTPS 直链安装（§2.4）。tarball 的运行依赖 `dsh-tools`/`dsh-llm`/`dsh-session`/`proper-lockfile` 已在 `dependencies` 中声明，由 Plugin Manager 的 pnpm 安装；若目标机器无法访问 npm registry，请改用 `link:` 或预置依赖。
