@@ -104,12 +104,20 @@ export interface SessionsOptions {
   /** Route used when the preset does not pin a model (explicit executor config). */
   agentOptions?: AgentOptions
   /**
-   * Fallback route resolver for new sessions: the host default model
-   * (`agentDefaultModel.currentSelection()`) or an explicit executor model.
-   * A new AgentSession has no model selection of its own, so without this the
-   * first turn fails with "has no provider/model".
+   * Role-aware fallback route resolver for new sessions: the per-role config
+   * (Router/Worker) or the host default model
+   * (`agentDefaultModel.currentSelection()`). A new AgentSession has no model
+   * selection of its own, so without this the first turn fails with
+   * "has no provider/model".
    */
-  defaultModel?: () => AgentOptions | undefined | Promise<AgentOptions | undefined>
+  defaultModel?: (role: SessionRole) => AgentOptions | undefined | Promise<AgentOptions | undefined>
+  /**
+   * Explicit per-role model route from the plugin configuration (only set when
+   * the user configured provider+model). On resume it updates the durable
+   * selection so a panel change takes effect; when absent, the durable
+   * selection / host default is preserved.
+   */
+  configuredModel?: (role: SessionRole) => AgentOptions | undefined | Promise<AgentOptions | undefined>
   /** User-facing language for role prompts (default zh). */
   language?: Language
   /** Deadline for one create/resume call. */
@@ -264,7 +272,7 @@ export class Sessions {
     if (this.options.agentOptions) return this.options.agentOptions
     if (!this.options.defaultModel) return undefined
     try {
-      const route = await this.options.defaultModel()
+      const route = await this.options.defaultModel(info.role)
       if (route && typeof route.provider === 'string' && typeof route.model === 'string') return route
     } catch (error) {
       this.logger.warn('could not resolve the default model route', { error: errorMessage(error) })
@@ -277,30 +285,79 @@ export class Sessions {
     return undefined
   }
 
+  /** Explicit configured route for this role, or undefined (no override). */
+  private async resolveConfiguredRoute(info: SessionInfo): Promise<AgentOptions | undefined> {
+    if (!this.options.configuredModel) return undefined
+    try {
+      const route = await this.options.configuredModel(info.role)
+      if (route && typeof route.provider === 'string' && typeof route.model === 'string') return route
+    } catch (error) {
+      this.logger.warn('could not resolve the configured model route', { error: errorMessage(error) })
+    }
+    return undefined
+  }
+
   /**
    * A resumed session created before the fallback existed has no durable model
    * selection. Record the fallback once, so a later turn can run; an existing
    * durable selection is never overwritten.
    */
-  private ensureDurableSelection(agent: Agent, fallback: AgentOptions | undefined, resumed: boolean): void {
-    // New sessions get the route through agentOptions; only a resumed session
-    // created before the fallback existed (no durable selection) needs a repair.
+  private ensureDurableSelection(
+    agent: Agent,
+    configured: AgentOptions | undefined,
+    fallback: AgentOptions | undefined,
+    resumed: boolean,
+  ): void {
+    // New sessions get their route through agentOptions; only a resumed session
+    // needs a durable-selection reconciliation.
     if (!resumed) return
-    if (!fallback || typeof fallback.provider !== 'string' || typeof fallback.model !== 'string') return
+    const model = (agent as unknown as { model?: { current?: () => unknown; select?: (selection: unknown) => void } }).model
+    if (!model || typeof model.select !== 'function') return
+    let current: { provider?: unknown; model?: unknown; reasoningEffort?: unknown } | undefined
     try {
-      const model = (agent as unknown as { model?: { current?: () => unknown; select?: (selection: unknown) => void } }).model
-      if (!model || typeof model.select !== 'function') return
-      if (typeof model.current === 'function' && model.current() !== undefined) return
-      model.select({
-        provider: fallback.provider,
-        model: fallback.model,
-        ...(fallback.reasoningEffort !== undefined ? { reasoningEffort: fallback.reasoningEffort } : {}),
-      })
-      this.logger.info('recorded the default model selection on a session without one', {
-        sessionId: String(agent.id),
-      })
+      current = (typeof model.current === 'function' ? model.current() : undefined) as
+        | { provider?: unknown; model?: unknown; reasoningEffort?: unknown }
+        | undefined
+    } catch {
+      current = undefined
+    }
+    const performs = (route: AgentOptions): boolean => {
+      if (!current) return false
+      return (
+        current.provider === route.provider &&
+        current.model === route.model &&
+        (route.reasoningEffort === undefined || String(current.reasoningEffort ?? '') === String(route.reasoningEffort))
+      )
+    }
+    try {
+      if (configured && typeof configured.provider === 'string' && typeof configured.model === 'string') {
+        // A user-configured route wins over a stale durable selection, so a
+        // panel change actually takes effect after the plugin restarts.
+        if (performs(configured)) return
+        model.select({
+          provider: configured.provider,
+          model: configured.model,
+          ...(configured.reasoningEffort !== undefined ? { reasoningEffort: configured.reasoningEffort } : {}),
+        })
+        this.logger.info('updated the session model to the configured route', {
+          sessionId: String(agent.id),
+          provider: configured.provider,
+          model: configured.model,
+        })
+        return
+      }
+      if (fallback && typeof fallback.provider === 'string' && typeof fallback.model === 'string' && current === undefined) {
+        model.select({
+          provider: fallback.provider,
+          model: fallback.model,
+          ...(fallback.reasoningEffort !== undefined ? { reasoningEffort: fallback.reasoningEffort } : {}),
+        })
+        this.logger.info('recorded the default model selection on a session without one', {
+          sessionId: String(agent.id),
+        })
+      }
     } catch (error) {
-      this.logger.warn('could not record a fallback model selection', {
+      this.logger.warn('could not record a model selection', {
         sessionId: String(agent.id),
         error: errorMessage(error),
       })
@@ -364,6 +421,7 @@ export class Sessions {
     const timeoutMs = this.options.createTimeoutMs ?? 60_000
     const sessionId = info.sessionId
     const fallbackRoute = await this.resolveFallbackRoute(info)
+    const configuredRoute = await this.resolveConfiguredRoute(info)
     const setup = async (agentCtx: Context, agent: Agent): Promise<void> => {
       await this.mountPreset(agentCtx, info)
       this.registerPrompt(agentCtx, info, prompt)
@@ -417,7 +475,7 @@ export class Sessions {
       disposers: [],
       resumed: persisted,
     }
-    this.ensureDurableSelection(record.agent, fallbackRoute, persisted)
+    this.ensureDurableSelection(record.agent, configuredRoute, fallbackRoute, persisted)
     this.watch(record)
     return record
   }

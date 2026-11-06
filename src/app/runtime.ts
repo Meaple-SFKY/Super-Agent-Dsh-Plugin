@@ -16,6 +16,7 @@ import { existsSync } from 'node:fs'
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { fileURLToPath } from 'node:url'
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { AgentOptions } from '@deepseek-ai/dsh-agent'
@@ -53,7 +54,15 @@ import { Executor } from './executor.js'
 import { Assessor } from './assessor.js'
 import { Watchdog } from './watchdog.js'
 import { registerApi, API_HEADER, API_VERSION, type ApiActionRequest, type ApiActionValue, type ApiDeps, type ApiState } from './api.js'
-import { SETUP_SSH_KEY_PATH, SetupService, type ConfigEditorLike } from './setup.js'
+import {
+  SETUP_MODELS_PATH,
+  SETUP_SSH_KEY_PATH,
+  SETUP_WATCHDOG_PATH,
+  SetupService,
+  type ConfigEditorLike,
+  type LlmLike,
+  type ProcessResult,
+} from './setup.js'
 import { registerRouterTools } from '../tools/router.js'
 import { registerWorkerTools } from '../tools/worker.js'
 import { preloadPrompts } from '../prompts/index.js'
@@ -96,6 +105,8 @@ export interface RuntimeConfig {
   enabled?: boolean
   sources?: { telegram?: TelegramSourceConfig; github?: GithubSourceConfig }
   policy?: { mode?: AcceptMode; rules?: Array<{ id: string; name: string; enabled?: boolean; instructions: string }> }
+  /** Router session model override (falls back to the DSH default model). */
+  router?: { provider?: string; model?: string; reasoningEffort?: string }
   executor?: {
     model?: string
     provider?: string
@@ -108,6 +119,8 @@ export interface RuntimeConfig {
     gitName?: string
     gitEmail?: string
     gitSshKeyFile?: string
+    /** Worker reasoning effort for the selected model (adapter-defined id). */
+    reasoningEffort?: string
     prepareTimeoutMs?: number
     gitTimeoutMs?: number
   }
@@ -159,6 +172,33 @@ export function validateConfig(raw: unknown): { config?: RuntimeConfig; problem?
     if (value !== undefined && typeof value !== 'string') {
       return { problem: { error: `configuration.executor.${key} must be a string` } }
     }
+  }
+  const router = config.router
+  if (router !== undefined && (router === null || typeof router !== 'object')) {
+    return { problem: { error: 'configuration.router must be an object' } }
+  }
+  if (router) {
+    for (const key of ['provider', 'model', 'reasoningEffort'] as const) {
+      const value = router[key]
+      if (value !== undefined && typeof value !== 'string') {
+        return { problem: { error: `configuration.router.${key} must be a string` } }
+      }
+    }
+    const hasProvider = typeof router.provider === 'string' && router.provider.trim().length > 0
+    const hasModel = typeof router.model === 'string' && router.model.trim().length > 0
+    if (hasProvider !== hasModel) {
+      return { problem: { error: 'configuration.router.provider and configuration.router.model must be set together' } }
+    }
+  }
+  const executorProvider = typeof config.executor?.provider === 'string' && config.executor.provider.trim().length > 0
+  const executorModel = typeof config.executor?.model === 'string' && config.executor.model.trim().length > 0
+  if (executorProvider !== executorModel) {
+    return {
+      problem: { error: 'configuration.executor.provider and configuration.executor.model must be set together' },
+    }
+  }
+  if (config.executor?.reasoningEffort !== undefined && typeof config.executor.reasoningEffort !== 'string') {
+    return { problem: { error: 'configuration.executor.reasoningEffort must be a string' } }
   }
   const maxWorkers = config.executor?.maxWorkers
   if (maxWorkers !== undefined && (!Number.isInteger(maxWorkers) || maxWorkers < 1)) {
@@ -494,6 +534,12 @@ export interface RuntimeOverrides {
   skipLock?: boolean
   /** Test seam: fake `ssh-keygen` runner for the setup SSH-key endpoint. */
   runSshKeygen?: (args: string[]) => Promise<void>
+  /** Test seam: bounded child-process runner for the watchdog endpoints. */
+  runProcess?: (file: string, args: string[], timeoutMs: number) => Promise<ProcessResult>
+  /** Test seam: repo-script resolver for the watchdog endpoints. */
+  scriptPath?: (name: 'install-launchd.sh' | 'uninstall.sh') => string | undefined
+  /** Test seam: LaunchAgent plist path used for the installed check. */
+  watchdogPlistPath?: () => string
 }
 
 interface EffectStat {
@@ -527,6 +573,7 @@ export class Runtime {
   private apiDeps?: ApiDeps
   private setupService?: SetupService
   private sshKeyRouteDispose?: () => void
+  private watchdogRouteDispose?: () => void
   /** Serialized heartbeat writes; awaited during shutdown so teardown is clean. */
   private heartbeatQueue: Promise<void> = Promise.resolve()
 
@@ -673,7 +720,8 @@ export class Runtime {
       now: () => this.clock.now(),
       presetIds: { router: 'superagent-router', worker: 'superagent-worker' },
       language: this.language,
-      defaultModel: () => this.defaultAgentOptions(),
+      defaultModel: role => this.agentOptionsFor(role),
+      configuredModel: role => this.configuredAgentOptionsFor(role),
       maxWorkers: config.executor?.maxWorkers ?? 2,
       createTimeoutMs: 60_000,
       decorate: (agentCtx, info) => this.decorateAgent(agentCtx, info),
@@ -743,6 +791,12 @@ export class Runtime {
       redact: redactDetail,
       language: () => this.language,
       ...(this.overrides.runSshKeygen ? { runSshKeygen: this.overrides.runSshKeygen } : {}),
+      models: () => this.modelSelections(),
+      scriptPath: name => (this.overrides.scriptPath ? this.overrides.scriptPath(name) : this.resolveBundleScript(name)),
+      ...(this.overrides.runProcess ? { runProcess: this.overrides.runProcess } : {}),
+      ...(this.overrides.watchdogPlistPath ? { watchdogPlistPath: this.overrides.watchdogPlistPath } : {}),
+      llm: () => this.ctx.get('llm') as LlmLike | undefined,
+      validateModel: (provider, model, reasoningEffort) => this.validateModelRoute(provider, model, reasoningEffort),
       gitIdentity: () => {
         const resolved = resolveGitIdentity(this.config?.executor, this.config?.sources?.github?.login)
         return { name: resolved.gitName ?? '', email: resolved.gitEmail ?? '', sshKeyFile: resolved.gitSshKeyFile ?? '' }
@@ -761,6 +815,8 @@ export class Runtime {
       this.logger.warn('could not register the management API', { error: errorMessage(error) })
     }
     this.registerSshKeyRoute()
+    this.registerModelsRoute()
+    this.registerWatchdogRoute()
 
     // Router session: required for assessments and replies, retried in the background.
     await this.ensureRouter()
@@ -820,29 +876,12 @@ export class Runtime {
 
   // -- wiring --------------------------------------------------------------
 
-  /**
-   * The model route for new Router/Worker sessions.
-   *
-   * Order: explicit `executor.provider`/`executor.model` from the plugin config,
-   * then the DSH default model (`agentDefaultModel.currentSelection()`). A DSH
-   * AgentSession starts with no model selection of its own, so passing this as
-   * `agentOptions` is what makes the first turn runnable.
-   */
-  private defaultAgentOptions(): AgentOptions | undefined {
-    const executor = this.config?.executor
-    if (executor?.model) {
-      return {
-        ...(executor.provider ? { provider: executor.provider } : {}),
-        model: executor.model,
-      }
-    }
+  /** The host default model selection, when the DSH service is available. */
+  private hostSelection(): { provider: string; model: string; reasoningEffort?: string } | undefined {
     const service = this.ctx.get('agentDefaultModel') as
       | { currentSelection?: () => unknown }
       | undefined
-    if (!service || typeof service.currentSelection !== 'function') {
-      this.warnNoModel('the DSH agentDefaultModel service is unavailable')
-      return undefined
-    }
+    if (!service || typeof service.currentSelection !== 'function') return undefined
     try {
       const selection = service.currentSelection() as
         | { provider?: unknown; model?: unknown; reasoningEffort?: unknown }
@@ -858,15 +897,121 @@ export class Runtime {
           provider: selection.provider,
           model: selection.model,
           ...(selection.reasoningEffort !== undefined
-            ? { reasoningEffort: selection.reasoningEffort as AgentOptions['reasoningEffort'] }
+            ? { reasoningEffort: String(selection.reasoningEffort) }
             : {}),
         }
       }
-      this.warnNoModel('agentDefaultModel.currentSelection() returned no provider/model')
-    } catch (error) {
-      this.warnNoModel(`agentDefaultModel.currentSelection() failed: ${errorMessage(error)}`)
+    } catch {
+      // fall through to the caller's warning
     }
     return undefined
+  }
+
+  /**
+   * Effective model route for one role.
+   *
+   * Router uses `config.router.*`; Worker uses `config.executor.*`; both fall
+   * back to the DSH default model (`agentDefaultModel.currentSelection()`).
+   * A per-role `reasoningEffort` overrides the adapter default of that route.
+   */
+  private agentOptionsFor(role: 'router' | 'worker'): AgentOptions | undefined {
+    const host = this.hostSelection()
+    const explicit =
+      role === 'router'
+        ? this.config?.router?.provider && this.config?.router?.model
+          ? { provider: this.config.router.provider, model: this.config.router.model }
+          : undefined
+        : this.config?.executor?.provider && this.config?.executor?.model
+          ? { provider: this.config.executor.provider, model: this.config.executor.model }
+          : undefined
+    const base = explicit ?? (host ? { provider: host.provider, model: host.model } : undefined)
+    if (!base) {
+      this.warnNoModel('no per-role model and no DSH default model are available')
+      return undefined
+    }
+    const effort =
+      role === 'router'
+        ? (this.config?.router?.reasoningEffort ?? host?.reasoningEffort)
+        : (this.config?.executor?.reasoningEffort ?? host?.reasoningEffort)
+    return {
+      provider: base.provider,
+      model: base.model,
+      ...(effort ? { reasoningEffort: effort as AgentOptions['reasoningEffort'] } : {}),
+    }
+  }
+
+  /**
+   * Explicit per-role configuration only (no host default). Used on resume to
+   * update a durable selection after the user changes the model in the panel.
+   */
+  private configuredAgentOptionsFor(role: 'router' | 'worker'): AgentOptions | undefined {
+    if (role === 'router') {
+      const router = this.config?.router
+      if (!router?.provider || !router.model) return undefined
+      return {
+        provider: router.provider,
+        model: router.model,
+        ...(router.reasoningEffort ? { reasoningEffort: router.reasoningEffort as AgentOptions['reasoningEffort'] } : {}),
+      }
+    }
+    const executor = this.config?.executor
+    if (!executor?.provider || !executor.model) return undefined
+    return {
+      provider: executor.provider,
+      model: executor.model,
+      ...(executor.reasoningEffort ? { reasoningEffort: executor.reasoningEffort as AgentOptions['reasoningEffort'] } : {}),
+    }
+  }
+
+  /** Effective selections for `GET setup/state.models`. */
+  private modelSelections(): {
+    router: { provider: string; model: string; reasoningEffort?: string } | null
+    worker: { provider: string; model: string; reasoningEffort?: string } | null
+    default: { provider: string; model: string; reasoningEffort?: string } | null
+  } {
+    const view = (role: 'router' | 'worker'): { provider: string; model: string; reasoningEffort?: string } | null => {
+      const route = this.agentOptionsFor(role)
+      if (!route || typeof route.provider !== 'string' || typeof route.model !== 'string') return null
+      return {
+        provider: route.provider,
+        model: route.model,
+        ...(route.reasoningEffort !== undefined ? { reasoningEffort: String(route.reasoningEffort) } : {}),
+      }
+    }
+    return { router: view('router'), worker: view('worker'), default: this.hostSelection() ?? null }
+  }
+
+  /**
+   * Validate one explicit model route through the DSH llm service before the
+   * setup API writes it. A missing `llm` service cannot validate, so the save
+   * proceeds on structural checks only (the route fails loudly on first use).
+   */
+  private async validateModelRoute(
+    provider: string,
+    model: string,
+    reasoningEffort?: string,
+  ): Promise<string | undefined> {
+    const llm = this.ctx.get('llm') as
+      | { resolveModelInfo?: (provider: string, model: string, signal?: AbortSignal) => Promise<unknown> }
+      | undefined
+    if (!llm || typeof llm.resolveModelInfo !== 'function') return undefined
+    try {
+      const info = (await withTimeout(llm.resolveModelInfo(provider, model), 5_000, 'llm.resolveModelInfo')) as {
+        reasoning?: { efforts?: Array<{ id?: unknown }> }
+      }
+      if (reasoningEffort) {
+        const efforts = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts : []
+        if (efforts.length > 0 && !efforts.some(effort => String(effort?.id) === reasoningEffort)) {
+          return (
+            `reasoningEffort "${reasoningEffort}" is not supported by ${provider}/${model}; available: ` +
+            efforts.map(effort => String(effort?.id)).join(', ')
+          )
+        }
+      }
+      return undefined
+    } catch (error) {
+      return `unknown model ${provider}/${model}: ${errorMessage(error)}`
+    }
   }
 
   private warnNoModel(reason: string): void {
@@ -1367,6 +1512,191 @@ export class Runtime {
     }
   }
 
+  /** `GET /superagent/api/setup/models`: providers + models from the DSH llm service. */
+  private registerModelsRoute(): void {
+    const webServer = this.ctx.get('webServer') as
+      | {
+          register?: (route: {
+            kind: 'exact' | 'prefix'
+            path: string
+            handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>
+          }) => () => void
+        }
+      | undefined
+    const setup = this.setupService
+    if (!webServer?.register || !setup) return
+    const loopback = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
+    try {
+      webServer.register({
+        kind: 'exact',
+        path: SETUP_MODELS_PATH,
+        handler: async (req, res) => {
+          const reply = (status: number, body: Record<string, unknown>): void => {
+            try {
+              const text = JSON.stringify(body)
+              res.writeHead(status, {
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'no-store',
+                'content-length': Buffer.byteLength(text),
+              })
+              res.end(text)
+            } catch {
+              try {
+                res.end()
+              } catch {
+                // client already gone
+              }
+            }
+          }
+          try {
+            const address = req.socket?.remoteAddress
+            if (!address || !loopback.has(address) || req.headers[API_HEADER] !== '1') {
+              reply(403, { ok: false, error: 'forbidden' })
+              return
+            }
+            if (req.method !== 'GET' && req.method !== 'HEAD') {
+              reply(405, { ok: false, error: 'method not allowed' })
+              return
+            }
+            const result = await setup.listModels()
+            reply(result.status, result.body)
+          } catch (error) {
+            this.logger.warn('setup models endpoint failed', { error: errorMessage(error) })
+            reply(500, { ok: false, error: 'internal_error', description: 'could not list models' })
+          }
+        },
+      })
+    } catch (error) {
+      this.logger.warn('could not register the setup models route', { error: errorMessage(error) })
+    }
+  }
+
+  /** Resolve a repo script from the package root (source `src/app` or bundled `lib`). */
+  private resolveBundleScript(name: 'install-launchd.sh' | 'uninstall.sh'): string | undefined {
+    const candidates = [
+      new URL(`../../scripts/${name}`, import.meta.url),
+      new URL(`../scripts/${name}`, import.meta.url),
+      new URL(`./scripts/${name}`, import.meta.url),
+      { pathname: join(process.cwd(), 'scripts', name) },
+    ]
+    for (const candidate of candidates) {
+      try {
+        const path = 'pathname' in candidate ? candidate.pathname : fileURLToPath(candidate)
+        if (existsSync(path)) return path
+      } catch {
+        // try the next location
+      }
+    }
+    return undefined
+  }
+
+  /** `GET/POST /superagent/api/setup/watchdog`: login-item watchdog status/toggle. */
+  private registerWatchdogRoute(): void {
+    const webServer = this.ctx.get('webServer') as
+      | {
+          register?: (route: {
+            kind: 'exact' | 'prefix'
+            path: string
+            handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>
+          }) => () => void
+        }
+      | undefined
+    const setup = this.setupService
+    if (!webServer?.register || !setup) return
+    const loopback = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
+    const readBody = (req: IncomingMessage): Promise<Record<string, unknown>> =>
+      new Promise((resolve, reject) => {
+        let size = 0
+        const chunks: Buffer[] = []
+        const timer = setTimeout(() => reject(new Error('request body timed out')), 5_000)
+        timer.unref?.()
+        req.on('data', (chunk: Buffer | string) => {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+          size += buffer.length
+          if (size > 64 * 1024) {
+            clearTimeout(timer)
+            reject(new Error('request body too large'))
+            return
+          }
+          chunks.push(buffer)
+        })
+        req.on('end', () => {
+          clearTimeout(timer)
+          const text = Buffer.concat(chunks).toString('utf8').trim()
+          if (!text) {
+            resolve({})
+            return
+          }
+          try {
+            const parsed = JSON.parse(text) as unknown
+            resolve(parsed !== null && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {})
+          } catch (error) {
+            reject(new Error(`invalid JSON body: ${error instanceof Error ? error.message : String(error)}`))
+          }
+        })
+        req.on('error', reject)
+      })
+    try {
+      this.watchdogRouteDispose = webServer.register({
+        kind: 'exact',
+        path: SETUP_WATCHDOG_PATH,
+        handler: async (req, res) => {
+          const reply = (status: number, body: Record<string, unknown>): void => {
+            try {
+              const text = JSON.stringify(body)
+              res.writeHead(status, {
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'no-store',
+                'content-length': Buffer.byteLength(text),
+              })
+              res.end(text)
+            } catch {
+              try {
+                res.end()
+              } catch {
+                // client already gone
+              }
+            }
+          }
+          try {
+            const address = req.socket?.remoteAddress
+            if (!address || !loopback.has(address) || req.headers[API_HEADER] !== '1') {
+              reply(403, { ok: false, error: 'forbidden' })
+              return
+            }
+            if (req.method === 'GET' || req.method === 'HEAD') {
+              const result = await setup.getWatchdog(true)
+              reply(result.status, result.body)
+              return
+            }
+            if (req.method !== 'POST') {
+              reply(405, { ok: false, error: 'method not allowed' })
+              return
+            }
+            let body: Record<string, unknown>
+            try {
+              body = await readBody(req)
+            } catch (error) {
+              reply(400, { ok: false, error: 'invalid_body', description: errorMessage(error) })
+              return
+            }
+            if (typeof body.enabled !== 'boolean') {
+              reply(400, { ok: false, error: 'invalid_request', description: 'body must be { enabled: boolean }' })
+              return
+            }
+            const result = await setup.setWatchdog(body.enabled)
+            reply(result.status, result.body)
+          } catch (error) {
+            this.logger.warn('setup watchdog endpoint failed', { error: errorMessage(error) })
+            reply(500, { ok: false, error: 'internal_error', description: 'watchdog operation failed' })
+          }
+        },
+      })
+    } catch (error) {
+      this.logger.warn('could not register the setup watchdog route', { error: errorMessage(error) })
+    }
+  }
+
   // -- management API ------------------------------------------------------
 
   private readPaused(): boolean {
@@ -1602,6 +1932,7 @@ export class Runtime {
       ['sessions', async () => this.sessions?.stop('runtime stopped')],
       ['api', () => this.apiDispose?.()],
       ['setup-ssh-route', () => this.sshKeyRouteDispose?.()],
+      ['setup-watchdog-route', () => this.watchdogRouteDispose?.()],
       ['store', () => (this.ownsStore ? this.store?.close() : undefined)],
     ]
     for (const [name, run] of steps) {

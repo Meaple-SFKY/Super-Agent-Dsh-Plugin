@@ -13,6 +13,7 @@ import {
   normalizeLanguage,
   renderAssignmentMessage,
   renderCandidateMessage,
+  renderTriggerLine,
   renderDeliveryMessage,
   renderStatusRequest,
   renderStopMessage,
@@ -62,6 +63,18 @@ describe('prompt files', () => {
     expect(normalizeLanguage('en')).toBe('en')
     expect(normalizeLanguage('fr')).toBe('zh')
     expect(normalizeLanguage(undefined)).toBe('zh')
+  })
+
+  it('documents the extended GitHub actions, attachments and report files', () => {
+    const worker = workerSystemPrompt('en')
+    for (const action of ['get_issue', 'list_issues', 'create_issue', 'update_issue', 'get_pull', 'get_pull_files', 'review', 'merge_pull', 'search']) {
+      expect(worker).toContain(action)
+    }
+    expect(worker).toContain('confirm: true')
+    expect(worker).toContain('read_image')
+    expect(worker).toContain('read_file')
+    expect(worker).toContain('files: [{ path')
+    expect(worker).toContain('max 10 files')
   })
 
   it('forbids standalone status/summary comments and routes the conclusion through the report', () => {
@@ -218,6 +231,59 @@ describe('prompt renderers', () => {
     expect(text).toContain('mode=auto')
     expect(text).toContain('superagent_route')
     expect(text).toContain('please fix the failing test')
+  })
+
+  it('shows user attachments as local paths to the worker and the router', () => {
+    const trigger = makeTrigger({
+      id: 'tr_att',
+      text: 'please look at these screenshots',
+      meta: {
+        attachments: [
+          { kind: 'photo', path: '/state/downloads/42-shot.png', name: 'shot.png', mime: 'image/png', size: 1234 },
+          { kind: 'document', path: '/state/downloads/42-spec.pdf', name: 'spec.pdf', mime: 'application/pdf', size: 9999 },
+        ],
+      },
+    })
+    const candidate = renderCandidateMessage(
+      {
+        eval: { id: 'ev_att', triggerIds: [trigger.id], startedAt: '2026-01-01T00:00:00.000Z', expiries: 0 },
+        primaryTrigger: trigger,
+        triggers: [trigger],
+        thread: {
+          thread: {
+            key: trigger.thread.key,
+            source: 'telegram',
+            meta: {},
+            subscriptions: [],
+            context: [],
+            queued: [],
+            expired: 0,
+            decisions: [],
+          },
+          triggers: [trigger],
+          tickets: [],
+        },
+        relatedTickets: [],
+        ticketsTotal: 0,
+        policyVersion: 'p1',
+      },
+      makePolicy(),
+      ['superagent_route'],
+    )
+    expect(candidate).toContain('/state/downloads/42-shot.png')
+    expect(candidate).toContain('/state/downloads/42-spec.pdf')
+    expect(candidate).toContain('attachments (files the user sent')
+
+    const ticket = makeTicket()
+    const assignment = renderAssignmentMessage({
+      ticket,
+      assignment: ticket.assignments[0]!,
+      directory: '/tmp/work/t_1',
+      triggers: [trigger],
+    })
+    expect(assignment).toContain('attachments (files the user sent; local paths, use read_image/read_file on them):')
+    expect(assignment).toContain('photo path="/state/downloads/42-shot.png"')
+    expect(renderTriggerLine(trigger)).toContain('attachments=2')
   })
 
   it('renders an assignment card with directory, branch, acceptance and recovery note', () => {

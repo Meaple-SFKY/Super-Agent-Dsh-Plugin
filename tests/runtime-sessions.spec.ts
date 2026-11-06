@@ -352,7 +352,15 @@ function quietLogger(): RecordingLogger {
   return new RecordingLogger()
 }
 
-function makeSessions(host: ReturnType<typeof createFakeHost>, store: ReturnType<typeof makeHarness>['store'], logger: RecordingLogger, options: { defaultModel?: () => { provider: string; model: string } | undefined } = {}): Sessions {
+function makeSessions(
+  host: ReturnType<typeof createFakeHost>,
+  store: ReturnType<typeof makeHarness>['store'],
+  logger: RecordingLogger,
+  options: {
+    defaultModel?: () => { provider: string; model: string } | undefined
+    configuredModel?: (role: 'router' | 'worker') => { provider: string; model: string; reasoningEffort?: string } | undefined
+  } = {},
+): Sessions {
   return new Sessions({
     agents: host.agents as unknown as HostAgentRegistry,
     presets: host.presets as never,
@@ -361,6 +369,7 @@ function makeSessions(host: ReturnType<typeof createFakeHost>, store: ReturnType
     kv: store.kv,
     createTimeoutMs: 2_000,
     ...(options.defaultModel ? { defaultModel: options.defaultModel } : {}),
+    ...(options.configuredModel ? { configuredModel: options.configuredModel as never } : {}),
   })
 }
 
@@ -440,15 +449,17 @@ describe('model fallback for new sessions (task-16)', () => {
     expect(logger.text()).toContain('no provider/model')
   })
 
-  it('prefers an explicit executor model over the host default, and uses the host default otherwise', async () => {
-    const boot = async (executor: NonNullable<RuntimeConfig['executor']>): Promise<{ runtime: Runtime; host: ReturnType<typeof createFakeHost> }> => {
+  it('uses per-role model routes with the host default as fallback', async () => {
+    const boot = async (
+      config: Pick<RuntimeConfig, 'router' | 'executor'>,
+    ): Promise<{ runtime: Runtime; host: ReturnType<typeof createFakeHost> }> => {
       const stateDir = tempDir()
-      const host = createFakeHost({ defaultModel: { provider: 'host', model: 'host-model' } })
+      const host = createFakeHost({ defaultModel: { provider: 'host', model: 'host-model', reasoningEffort: 'host-effort' } })
       const runtime = new Runtime(host.ctx as unknown as Context, {
         stateDir,
         sources: { telegram: { enabled: false }, github: { enabled: false } },
         policy: { mode: 'observe' },
-        executor,
+        ...config,
         passIntervalMs: 60_000,
         heartbeatIntervalMs: 60_000,
         watchdog: { intervalMs: 60_000 },
@@ -457,10 +468,14 @@ describe('model fallback for new sessions (task-16)', () => {
       return { runtime, host }
     }
 
-    const explicit = await boot({ provider: 'deepseek', model: 'explicit-model' })
+    const explicit = await boot({
+      router: { provider: 'router-provider', model: 'router-model', reasoningEffort: 'high' },
+      executor: { provider: 'worker-provider', model: 'worker-model', reasoningEffort: 'low' },
+    })
     expect(explicit.host.agents.created.find(entry => entry.sessionId === 'superagent-router')?.agentOptions).toEqual({
-      provider: 'deepseek',
-      model: 'explicit-model',
+      provider: 'router-provider',
+      model: 'router-model',
+      reasoningEffort: 'high',
     })
     await explicit.runtime.stop()
 
@@ -468,9 +483,60 @@ describe('model fallback for new sessions (task-16)', () => {
     expect(fallback.host.agents.created.find(entry => entry.sessionId === 'superagent-router')?.agentOptions).toEqual({
       provider: 'host',
       model: 'host-model',
+      reasoningEffort: 'host-effort',
     })
     await fallback.runtime.stop()
   })
+
+  it('configures Router and Worker sessions independently (worker route reaches the worker session)', async () => {
+    const stateDir = tempDir()
+    const host = createFakeHost({ defaultModel: { provider: 'host', model: 'host-model' } })
+    const runtime = new Runtime(host.ctx as unknown as Context, {
+      stateDir,
+      sources: { telegram: { disabled: true }, github: { enabled: false } },
+      policy: { mode: 'observe' },
+      router: { provider: 'router-provider', model: 'router-model' },
+      executor: { provider: 'worker-provider', model: 'worker-model', reasoningEffort: 'low' },
+      passIntervalMs: 60_000,
+      heartbeatIntervalMs: 60_000,
+      watchdog: { intervalMs: 60_000 },
+    }, { store: createMemoryStore(), sources: [], skipLock: true })
+    try {
+      await runtime.ready
+      const sessions = (runtime as unknown as { sessions: Sessions }).sessions
+      const agent = await sessions.ensureWorker('t_role_model', tempDir())
+      expect(String(agent.id)).toBe('superagent-worker-t_role_model')
+      expect(host.agents.created.find(entry => entry.sessionId === 'superagent-worker-t_role_model')?.agentOptions).toEqual({
+        provider: 'worker-provider',
+        model: 'worker-model',
+        reasoningEffort: 'low',
+      })
+    } finally {
+      await runtime.stop()
+    }
+  })
+
+  it('validates per-role model config (pairs and types)', () => {
+    expect(
+      validateRuntimeConfig({ stateDir: '/tmp/x', router: { provider: 'p' } }).problem?.error,
+    ).toContain('router.provider and configuration.router.model')
+    expect(
+      validateRuntimeConfig({ stateDir: '/tmp/x', router: { provider: 'p', model: 'm', reasoningEffort: 3 as never } })
+        .problem?.error,
+    ).toContain('router.reasoningEffort')
+    expect(
+      validateRuntimeConfig({ stateDir: '/tmp/x', executor: { model: 'm' } }).problem?.error,
+    ).toContain('executor.provider and configuration.executor.model')
+    expect(
+      validateRuntimeConfig({ stateDir: '/tmp/x', executor: { provider: 'p', model: 'm', reasoningEffort: 'high' } })
+        .problem,
+    ).toBeUndefined()
+    expect(
+      validateRuntimeConfig({ stateDir: '/tmp/x', router: { provider: 'p', model: 'm', reasoningEffort: 'high' } })
+        .problem,
+    ).toBeUndefined()
+  })
+
 })
 
 // ---------------------------------------------------------------------------
@@ -595,5 +661,118 @@ describe('git identity for worker checkouts (task-30)', () => {
       'absolute path',
     )
     expect(validateRuntimeConfig({ stateDir: '/tmp/x', executor: { gitName: 42 } }).problem?.error).toContain('gitName')
+  })
+})
+
+describe('configured model overrides durable selection on resume (task-39 follow-up)', () => {
+  it('updates a stale durable selection when the config now sets an explicit route', async () => {
+    const host = createFakeHost({ defaultModel: { provider: 'host', model: 'host-model' } })
+    const harness = makeHarness()
+    const dir = tempDir()
+    const created = makeSessions(host, harness.store, quietLogger())
+    await created.ensureWorker('t_cfg_model', dir)
+    const sessionId = 'superagent-worker-t_cfg_model'
+
+    // Simulate a session whose durable selection came from an older config.
+    host.agents.selections.set(sessionId, { provider: 'old', model: 'old-model' })
+    host.agents.restart()
+
+    const resumed = makeSessions(host, harness.store, quietLogger(), {
+      defaultModel: () => ({ provider: 'host', model: 'host-model' }),
+      configuredModel: () => ({ provider: 'new', model: 'new-model', reasoningEffort: 'high' }),
+    })
+    await resumed.ensureWorker('t_cfg_model', dir)
+    const agent = host.agents.liveAgent(sessionId)!
+    expect(agent.modelSelection).toEqual({ provider: 'new', model: 'new-model', reasoningEffort: 'high' })
+    expect(agent.modelSelections).toHaveLength(1)
+  })
+
+  it('does not touch the durable selection when the config has no explicit route', async () => {
+    const host = createFakeHost({ defaultModel: { provider: 'host', model: 'host-model' } })
+    const harness = makeHarness()
+    const dir = tempDir()
+    const created = makeSessions(host, harness.store, quietLogger())
+    await created.ensureWorker('t_keep_cfg', dir)
+    const sessionId = 'superagent-worker-t_keep_cfg'
+    host.agents.selections.set(sessionId, { provider: 'durable', model: 'durable-model' })
+    host.agents.restart()
+
+    const resumed = makeSessions(host, harness.store, quietLogger(), {
+      defaultModel: () => ({ provider: 'host', model: 'host-model' }),
+    })
+    await resumed.ensureWorker('t_keep_cfg', dir)
+    const agent = host.agents.liveAgent(sessionId)!
+    expect(agent.modelSelection).toEqual({ provider: 'durable', model: 'durable-model' })
+    expect(agent.modelSelections).toHaveLength(0)
+  })
+
+  it('does not re-select when the explicit route already matches the durable selection', async () => {
+    const host = createFakeHost({ defaultModel: { provider: 'host', model: 'host-model' } })
+    const harness = makeHarness()
+    const dir = tempDir()
+    const created = makeSessions(host, harness.store, quietLogger())
+    await created.ensureWorker('t_same_cfg', dir)
+    const sessionId = 'superagent-worker-t_same_cfg'
+    host.agents.selections.set(sessionId, { provider: 'new', model: 'new-model' })
+    host.agents.restart()
+
+    const resumed = makeSessions(host, harness.store, quietLogger(), {
+      defaultModel: () => ({ provider: 'host', model: 'host-model' }),
+      configuredModel: () => ({ provider: 'new', model: 'new-model' }),
+    })
+    await resumed.ensureWorker('t_same_cfg', dir)
+    const agent = host.agents.liveAgent(sessionId)!
+    expect(agent.modelSelection).toEqual({ provider: 'new', model: 'new-model' })
+    expect(agent.modelSelections).toHaveLength(0)
+  })
+
+  it('applies the panel model change to the persisted Router session on restart', async () => {
+    const boot = async (
+      config: Pick<RuntimeConfig, 'router' | 'executor'>,
+      seed?: { provider: string; model: string },
+    ): Promise<{ runtime: Runtime; host: ReturnType<typeof createFakeHost>; stateDir: string }> => {
+      const stateDir = tempDir()
+      const host = createFakeHost({ defaultModel: { provider: 'host', model: 'host-model' } })
+      if (seed) {
+        host.agents.persisted.add('superagent-router')
+        host.agents.selections.set('superagent-router', seed)
+      }
+      const runtime = new Runtime(host.ctx as unknown as Context, {
+        stateDir,
+        sources: { telegram: { enabled: false }, github: { enabled: false } },
+        policy: { mode: 'observe' },
+        ...config,
+        passIntervalMs: 60_000,
+        heartbeatIntervalMs: 60_000,
+        watchdog: { intervalMs: 60_000 },
+      }, { store: createMemoryStore(), sources: [], skipLock: true })
+      await runtime.ready
+      return { runtime, host, stateDir }
+    }
+
+    // First boot creates/persists the router session.
+    const first = await boot({})
+    await first.runtime.stop()
+
+    // Second boot: explicit router config overrides the old durable selection.
+    const explicitHost = createFakeHost({ defaultModel: { provider: 'host', model: 'host-model' } })
+    explicitHost.agents.persisted.add('superagent-router')
+    explicitHost.agents.selections.set('superagent-router', { provider: 'old', model: 'old-model' })
+    const explicit = await boot({ router: { provider: 'panel', model: 'panel-model' } })
+    await explicit.runtime.stop()
+    expect(explicit.host.agents.liveAgent('superagent-router')).toBeUndefined() // stopped/disposed
+    expect(explicit.host.agents.selections.get('superagent-router')).toBeUndefined()
+    // The selection update happens on the resumed agent inside boot(seed); assert via a fresh boot below.
+    const seeded = await boot({ router: { provider: 'panel', model: 'panel-model' } }, { provider: 'old', model: 'old-model' })
+    const routerAgent = seeded.host.agents.liveAgent('superagent-router')!
+    expect(routerAgent.modelSelection).toEqual({ provider: 'panel', model: 'panel-model' })
+    expect(routerAgent.modelSelections).toHaveLength(1)
+    await seeded.runtime.stop()
+
+    const keep = await boot({}, { provider: 'old', model: 'old-model' })
+    const keptAgent = keep.host.agents.liveAgent('superagent-router')!
+    expect(keptAgent.modelSelection).toEqual({ provider: 'old', model: 'old-model' })
+    expect(keptAgent.modelSelections).toHaveLength(0)
+    await keep.runtime.stop()
   })
 })

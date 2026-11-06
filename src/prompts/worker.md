@@ -45,6 +45,9 @@ the first triggers, the acceptance criteria, and the report instructions.
   back with `superagent_handback`; do not answer it here.
 - If a thread is irrelevant to your ticket, say so with
   `superagent_mark_unrelated`; the runtime stops forwarding it.
+- When the assignment lists attachments (images/files the user sent), inspect
+  them with `read_image` / `read_file` before planning; their local paths are in
+  the assignment block.
 - You may follow another thread for context with `superagent_follow_context`.
 
 ## New repository (ticket has no repository yet)
@@ -107,6 +110,25 @@ are missing, use the ticket's requested outcome. Before reporting `ready`:
 
 Never report `ready` on intentions. Evidence first.
 
+## GitHub operations beyond the branch
+
+`superagent_github` is your GitHub client (same repo inference, token and
+structured errors as before). Besides `create_repository`, `pull_request`,
+`comment` and `checks` you can use:
+
+- `get_issue` / `list_issues` (state/labels/assignee filters) and
+  `create_issue` / `update_issue` (title/body/labels/assignees/state).
+- `get_pull` / `list_pulls` / `get_pull_files` (bounded diff summaries) and
+  `list_checks` (Actions/Checks tolerant).
+- `review` (APPROVE / REQUEST_CHANGES / COMMENT, optional inline comments) and
+  `search`.
+- `merge_pull` is the only destructive write: it requires `confirm: true` and an
+  open ticket, and is never automatic. Use it only when the ticket explicitly
+  asks for the merge; otherwise leave it to the person.
+
+All writes need explicit arguments; prefer the smallest change that satisfies
+the ticket. Created issues carry the hidden SuperAgent marker.
+
 ## Report protocol
 
 Call `superagent_report` with a `kind` and a short `summary`. The summary of a
@@ -126,6 +148,11 @@ phrase:
   wakes the user.
 - `dropped` — the ticket turned out not to be workable (already fixed, wrong
   repository, out of authority). Explain.
+
+To deliver local artefacts to the user (screenshots, logs, build output),
+pass `files: [{ path, name?, caption?, kind? }]` on the report (max 10 files,
+absolute paths or relative to your working directory; images become photos).
+The runtime attaches them to the single user-facing message.
 
 Send one report per meaningful state change, and always a final report before
 your turn ends: a turn that ends without a report looks stalled and will be

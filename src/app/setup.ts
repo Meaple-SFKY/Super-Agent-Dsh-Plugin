@@ -18,6 +18,7 @@
 
 import { chmod, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
+import { homedir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 
 import type { KeyValueStore } from '../core/ports.js'
@@ -30,6 +31,8 @@ export const SETUP_GITHUB_PATH = '/superagent/api/setup/github'
 export const SETUP_CONFIG_PATH = '/superagent/api/setup/config'
 export const SETUP_PERMISSIONS_PATH = '/superagent/api/setup/permissions'
 export const SETUP_SSH_KEY_PATH = '/superagent/api/setup/github/ssh-key'
+export const SETUP_MODELS_PATH = '/superagent/api/setup/models'
+export const SETUP_WATCHDOG_PATH = '/superagent/api/setup/watchdog'
 
 export const SETUP_PATHS = {
   state: SETUP_STATE_PATH,
@@ -38,6 +41,8 @@ export const SETUP_PATHS = {
   config: SETUP_CONFIG_PATH,
   permissions: SETUP_PERMISSIONS_PATH,
   sshKey: SETUP_SSH_KEY_PATH,
+  models: SETUP_MODELS_PATH,
+  watchdog: SETUP_WATCHDOG_PATH,
 } as const
 
 // ---------------------------------------------------------------------------
@@ -72,6 +77,43 @@ export interface SetupAccountGithub {
   tokenFile?: string
 }
 
+/** Watchdog LaunchAgent status. */
+export interface SetupWatchdogState {
+  installed: boolean
+  running: boolean
+  label: string
+  plistPath: string
+  stateDir: string
+  detail?: string
+}
+
+/** Result of one bounded child-process run (never thrown). */
+export interface ProcessResult {
+  code: number
+  stdout: string
+  stderr: string
+}
+
+/** One effective provider/model/reasoning selection. */
+export interface SetupModelSelection {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+
+export interface SetupModelsState {
+  router: SetupModelSelection | null
+  worker: SetupModelSelection | null
+  default: SetupModelSelection | null
+}
+
+/** The subset of the DSH `llm` service the setup API uses. */
+export interface LlmLike {
+  listProviders(): Array<{ id: string; name: string }>
+  listModels(provider: string): Promise<Array<{ id: string; name: string; description?: string; inputModalities?: readonly string[] }>>
+  resolveModelInfo?(provider: string, model: string, signal?: AbortSignal): Promise<unknown>
+}
+
 export interface SetupGitIdentity {
   name: string
   email: string
@@ -89,6 +131,10 @@ export interface SetupState {
   language: 'zh' | 'en'
   /** Dedicated bot account repo-local git identity (paths only, no key content). */
   git: SetupGitIdentity
+  /** Currently effective model selections (router/worker/default). */
+  models: SetupModelsState
+  /** Optional login-item watchdog state (installed/running). */
+  watchdog: SetupWatchdogState
   plugin: { status: string; detail: string | null }
   accounts: { telegram: SetupAccountTelegram; github: SetupAccountGithub }
   permissions: SetupPermission[]
@@ -105,6 +151,7 @@ export interface SetupApiResult {
 export interface SetupConfigPatch {
   sources?: Record<string, unknown>
   policy?: Record<string, unknown>
+  router?: Record<string, unknown>
   executor?: Record<string, unknown>
   quiet?: Record<string, unknown>
   /** User-facing language for the bot (zh default). */
@@ -117,8 +164,11 @@ export interface SetupApi {
   permissions(): SetupApiResult
   saveTelegram(body: unknown): Promise<SetupApiResult>
   saveGithub(body: unknown): Promise<SetupApiResult>
-  prepareConfig(body: unknown): { result: SetupApiResult; patch?: SetupConfigPatch }
+  prepareConfig(body: unknown): Promise<{ result: SetupApiResult; patch?: SetupConfigPatch }>
   commitConfigSoon(patch: SetupConfigPatch): void
+  listModels(): Promise<SetupApiResult>
+  getWatchdog(force?: boolean): Promise<SetupApiResult>
+  setWatchdog(enabled: boolean): Promise<SetupApiResult>
   generateGithubSshKey(): Promise<SetupApiResult>
   persistGitSshKey(keyFile: string): boolean
 }
@@ -167,6 +217,19 @@ export interface SetupDeps {
   gitIdentity?: () => { name: string; email: string; sshKeyFile: string }
   /** ssh-keygen runner (tests inject a fake; default runs the real binary). */
   runSshKeygen?: (args: string[]) => Promise<void>
+  /** DSH llm service (model catalog); absent on leaner hosts (→ 501). */
+  llm?: () => LlmLike | undefined
+  /** Currently effective model selections for `GET setup/state`. */
+  models?: () => SetupModelsState
+  /** Validate one provider/model(/reasoningEffort) before saving; returns an error message. */
+  validateModel?: (provider: string, model: string, reasoningEffort?: string) => Promise<string | undefined>
+  /** Bounded child-process runner for the watchdog scripts (tests inject a fake). */
+  runProcess?: (file: string, args: string[], timeoutMs: number) => Promise<ProcessResult>
+  /** Resolve a repo script (install-launchd.sh / uninstall.sh) to an absolute path. */
+  scriptPath?: (name: 'install-launchd.sh' | 'uninstall.sh') => string | undefined
+  /** Test seam: override the LaunchAgent label / plist path. */
+  watchdogLabel?: () => string
+  watchdogPlistPath?: () => string
   redact?: (text: string) => string
   timeoutMs?: number
   /** Test seam for the post-response commit. Defaults to an unref'ed timer. */
@@ -251,6 +314,25 @@ function deepMerge(base: Record<string, unknown>, patch: Record<string, unknown>
 
 function isUnder(parent: string, candidate: string): boolean {
   return candidate === parent || candidate.startsWith(`${parent}/`)
+}
+
+/** Bound one external call; the loser keeps a rejection handler attached. */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return promise
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
+    timer.unref?.()
+    promise.then(
+      value => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      error => {
+        clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
 }
 
 class SetupError extends Error {
@@ -367,6 +449,219 @@ export class SetupService implements SetupApi {
             restartRequired: true,
           },
         ] satisfies SetupPermission[],
+      },
+    }
+  }
+
+  // -- model catalog -------------------------------------------------------
+
+  /**
+   * List the provider routes and models the DSH `llm` service can currently
+   * route. A single failing provider is reported under `errors` instead of
+   * failing the whole answer; a missing `llm` service is a 501.
+   */
+  async listModels(): Promise<SetupApiResult> {
+    const llm = this.deps.llm?.()
+    if (!llm || typeof llm.listProviders !== 'function' || typeof llm.listModels !== 'function') {
+      return {
+        status: 501,
+        body: {
+          ok: false,
+          error: 'llm_unavailable',
+          description: 'the DSH llm service is unavailable on this host; models cannot be listed',
+        },
+      }
+    }
+    const timeoutMs = this.deps.timeoutMs ?? 5_000
+    let infos: Array<{ id: string; name: string }>
+    try {
+      infos = llm.listProviders()
+    } catch (error) {
+      return this.failure(new SetupError(502, 'llm_error', this.sanitize(errorMessage(error))))
+    }
+    const errors: Array<{ provider: string; error: string }> = []
+    const rows = await Promise.all(
+      infos.map(async (info, index) => {
+        try {
+          const models = await withTimeout(llm.listModels(info.id), timeoutMs, `listModels(${info.id})`)
+          return {
+            index,
+            provider: {
+              id: info.id,
+              name: info.name,
+              models: (Array.isArray(models) ? models : []).map(model => ({
+                id: model.id,
+                name: model.name,
+                ...(typeof model.description === 'string' ? { description: model.description } : {}),
+                ...(Array.isArray(model.inputModalities)
+                  ? { inputModalities: model.inputModalities.map(String) }
+                  : {}),
+              })),
+            },
+          }
+        } catch (error) {
+          errors.push({ provider: info.id, error: this.sanitize(errorMessage(error)) })
+          return undefined
+        }
+      }),
+    )
+    const providers = rows
+      .filter((row): row is NonNullable<typeof row> => row !== undefined)
+      .sort((left, right) => left.index - right.index)
+      .map(row => row.provider)
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        providers,
+        ...(errors.length > 0 ? { errors } : {}),
+      },
+    }
+  }
+
+  // -- login-item watchdog -------------------------------------------------
+
+  private watchdogCache?: { at: number; value: SetupWatchdogState }
+
+  private watchdogLabel(): string {
+    return this.deps.watchdogLabel?.() ?? (process.env.SUPERAGENT_WATCHDOG_LABEL?.trim() || 'com.sfky.superagent.watchdog')
+  }
+
+  private watchdogPlistPath(): string {
+    return this.deps.watchdogPlistPath?.() ?? join(homedir(), 'Library', 'LaunchAgents', `${this.watchdogLabel()}.plist`)
+  }
+
+  /** Bounded child-process runner; resolves with a code, never rejects. */
+  private async runProcess(file: string, args: string[], timeoutMs: number): Promise<ProcessResult> {
+    const runner = this.deps.runProcess
+    if (runner) return runner(file, args, timeoutMs)
+    return new Promise<ProcessResult>(resolve => {
+      execFile(
+        file,
+        args,
+        { timeout: timeoutMs, windowsHide: true, maxBuffer: 1024 * 1024 },
+        (error, stdout, stderr) => {
+          const code =
+            error === null ? 0 : typeof (error as NodeJS.ErrnoException).code === 'number' ? Number((error as NodeJS.ErrnoException).code) : -1
+          resolve({
+            code,
+            stdout: String(stdout ?? '').slice(-4000),
+            stderr: `${String(stderr ?? '')}${error && !stderr ? `\n${error.message}` : ''}`.slice(-4000),
+          })
+        },
+      )
+    })
+  }
+
+  /** Read the LaunchAgent state (cached briefly; `force` bypasses the cache). */
+  async probeWatchdog(force = false): Promise<SetupWatchdogState> {
+    const cached = this.watchdogCache
+    if (!force && cached && Date.now() - cached.at < 10_000) return cached.value
+    const label = this.watchdogLabel()
+    const plistPath = this.watchdogPlistPath()
+    let installed = false
+    try {
+      installed = (await stat(plistPath)).isFile()
+    } catch {
+      installed = false
+    }
+    let running = false
+    try {
+      const uid = typeof process.getuid === 'function' ? process.getuid() : 0
+      const result = await this.runProcess('launchctl', ['print', `gui/${uid}/${label}`], 5_000)
+      running = result.code === 0
+    } catch {
+      running = false
+    }
+    const value: SetupWatchdogState = {
+      installed,
+      running,
+      label,
+      plistPath,
+      stateDir: this.deps.stateDir,
+      ...(installed
+        ? { detail: running ? 'installed and running' : 'installed but not loaded' }
+        : { detail: 'not installed (login item disabled)' }),
+    }
+    this.watchdogCache = { at: Date.now(), value }
+    return value
+  }
+
+  async getWatchdog(force = false): Promise<SetupApiResult> {
+    const state = await this.probeWatchdog(force)
+    return { status: 200, body: { ok: true, ...state } }
+  }
+
+  /**
+   * Enable/disable the login-item watchdog by running the repo scripts.
+   * Script output goes to the plugin log only; the response carries a generic
+   * detail so host paths/outputs never reach the panel.
+   */
+  async setWatchdog(enabled: boolean): Promise<SetupApiResult> {
+    const scriptName = enabled ? 'install-launchd.sh' : 'uninstall.sh'
+    const script = this.deps.scriptPath?.(scriptName)
+    const manual = `sh <bundle>/scripts/${scriptName} --state-dir ${this.deps.stateDir}`
+    if (!script) {
+      return {
+        status: 501,
+        body: {
+          ok: false,
+          enabled,
+          error: 'watchdog_script_unavailable',
+          description: `the watchdog script is not available in this build; run manually: ${manual}`,
+        },
+      }
+    }
+    try {
+      const info = await stat(script)
+      if (!info.isFile()) throw new Error('not a file')
+    } catch {
+      return {
+        status: 501,
+        body: {
+          ok: false,
+          enabled,
+          error: 'watchdog_script_unavailable',
+          description: `the watchdog script is missing (${script}); run manually: ${manual}`,
+        },
+      }
+    }
+    let result: ProcessResult
+    try {
+      result = await this.runProcess('sh', [script, '--state-dir', this.deps.stateDir], 30_000)
+    } catch (error) {
+      result = { code: -1, stdout: '', stderr: errorMessage(error) }
+    }
+    this.logger.info(`watchdog ${enabled ? 'install' : 'uninstall'} script finished`, {
+      script: scriptName,
+      code: result.code,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    })
+    const state = await this.probeWatchdog(true)
+    if (result.code !== 0) {
+      return {
+        status: 500,
+        body: {
+          ok: false,
+          enabled,
+          installed: state.installed,
+          running: state.running,
+          error: 'watchdog_script_failed',
+          description: enabled
+            ? 'could not install the watchdog; see the DSH log for the script output'
+            : 'could not uninstall the watchdog; see the DSH log for the script output',
+        },
+      }
+    }
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        enabled,
+        installed: state.installed,
+        running: state.running,
+        detail: state.detail ?? null,
       },
     }
   }
@@ -551,11 +846,16 @@ export class SetupService implements SetupApi {
       ...(publicKey ? { publicKey } : {}),
     }
 
+    const models = this.deps.models?.() ?? { router: null, worker: null, default: null }
+    const watchdog = await this.probeWatchdog()
+
     const state: SetupState = {
       ok: true,
       stateDir: this.deps.stateDir,
       language,
       git,
+      models,
+      watchdog,
       plugin: this.deps.plugin(),
       accounts: {
         telegram: {
@@ -737,13 +1037,13 @@ export class SetupService implements SetupApi {
 
   // -- configuration -------------------------------------------------------
 
-  prepareConfig(body: unknown): { result: SetupApiResult; patch?: SetupConfigPatch } {
+  async prepareConfig(body: unknown): Promise<{ result: SetupApiResult; patch?: SetupConfigPatch }> {
     try {
       if (!isRecord(body)) throw new SetupError(400, 'invalid_request', 'request body must be a JSON object')
       const desired = isRecord(body.config) ? body.config : undefined
       if (!desired) throw new SetupError(400, 'invalid_request', 'config must be a JSON object')
       const patch: SetupConfigPatch = {}
-      for (const key of ['sources', 'policy', 'executor', 'quiet'] as const) {
+      for (const key of ['sources', 'policy', 'router', 'executor', 'quiet'] as const) {
         const value = desired[key]
         if (value === undefined) continue
         if (!isRecord(value)) throw new SetupError(400, 'invalid_config', `${key} must be a JSON object`)
@@ -757,13 +1057,14 @@ export class SetupService implements SetupApi {
         patch.language = language
       }
       if (Object.keys(patch).length === 0) {
-        throw new SetupError(400, 'invalid_config', 'config must contain sources, policy, executor, quiet or language')
+        throw new SetupError(400, 'invalid_config', 'config must contain sources, policy, router, executor, quiet or language')
       }
       this.assertSafePatch(patch)
       const base = this.deps.currentConfig() ?? {}
       const merged = deepMerge(base, patch as Record<string, unknown>)
       const problem = this.deps.validateConfig(merged)
       if (problem) throw new SetupError(400, 'invalid_config', problem)
+      await this.validateModelSelections(patch)
       if (this.deps.configEditor() === undefined || this.deps.hostEntry() === undefined) {
         throw new SetupError(
           501,
@@ -777,6 +1078,46 @@ export class SetupService implements SetupApi {
       }
     } catch (error) {
       return { result: this.failure(error) }
+    }
+  }
+
+  /**
+   * Validate explicit model routes against the DSH llm service before writing
+   * any config. A missing `llm` service cannot validate, so structural checks
+   * only are applied there (the route still fails loudly on first use).
+   */
+  private async validateModelSelections(patch: SetupConfigPatch): Promise<void> {
+    const validate = this.deps.validateModel
+    if (!validate) return
+    const checks: Array<{ scope: string; provider: string; model: string; effort?: string }> = []
+    const router = isRecord(patch.router) ? patch.router : undefined
+    if (router && typeof router.provider === 'string' && typeof router.model === 'string') {
+      checks.push({
+        scope: 'router',
+        provider: router.provider,
+        model: router.model,
+        ...(typeof router.reasoningEffort === 'string' ? { effort: router.reasoningEffort } : {}),
+      })
+    }
+    const executor = isRecord(patch.executor) ? patch.executor : undefined
+    if (executor && typeof executor.provider === 'string' && typeof executor.model === 'string') {
+      checks.push({
+        scope: 'executor',
+        provider: executor.provider,
+        model: executor.model,
+        ...(typeof executor.reasoningEffort === 'string' ? { effort: executor.reasoningEffort } : {}),
+      })
+    }
+    for (const check of checks) {
+      let problem: string | undefined
+      try {
+        problem = await validate(check.provider, check.model, check.effort)
+      } catch (error) {
+        problem = this.sanitize(errorMessage(error))
+      }
+      if (problem) {
+        throw new SetupError(400, 'invalid_model', `${check.scope}: ${problem}`)
+      }
     }
   }
 
@@ -795,6 +1136,33 @@ export class SetupService implements SetupApi {
     const mode = (patch.policy as Record<string, unknown> | undefined)?.mode
     if (mode !== undefined && mode !== 'off' && mode !== 'observe' && mode !== 'auto') {
       throw new SetupError(400, 'invalid_config', 'policy.mode must be off, observe or auto')
+    }
+    this.assertModelPatch('router', patch.router)
+    this.assertModelPatch('executor', patch.executor)
+  }
+
+  /** Structural checks for one provider/model/reasoningEffort patch. */
+  private assertModelPatch(scope: 'router' | 'executor', value: Record<string, unknown> | undefined): void {
+    if (!value) return
+    const provider = value.provider
+    const model = value.model
+    const effort = value.reasoningEffort
+    for (const [field, candidate] of [
+      ['provider', provider],
+      ['model', model],
+      ['reasoningEffort', effort],
+    ] as const) {
+      if (candidate !== undefined && candidate !== '' && typeof candidate !== 'string') {
+        throw new SetupError(400, 'invalid_config', `${scope}.${field} must be a string`)
+      }
+      if (typeof candidate === 'string' && candidate.length > 200) {
+        throw new SetupError(400, 'invalid_config', `${scope}.${field} is implausibly long`)
+      }
+    }
+    const hasProvider = typeof provider === 'string' && provider.trim().length > 0
+    const hasModel = typeof model === 'string' && model.trim().length > 0
+    if (hasProvider !== hasModel) {
+      throw new SetupError(400, 'invalid_config', `${scope}.provider and ${scope}.model must be set together`)
     }
   }
 

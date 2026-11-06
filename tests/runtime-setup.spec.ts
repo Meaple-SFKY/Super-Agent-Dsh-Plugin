@@ -8,7 +8,7 @@
  * the HTTP fence/ordering through `registerApi`.
  */
 
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   SetupService,
+  SETUP_MODELS_PATH,
   SETUP_SSH_KEY_PATH,
   SETUP_CONFIG_PATH,
   SETUP_GITHUB_PATH,
@@ -32,7 +33,7 @@ import { redactDetail, validateConfig, Runtime, type RuntimeConfig } from '../sr
 import { createMemoryStore } from '../src/app/store.js'
 import type { KeyValueStore } from '../src/core/ports.js'
 import type { Context } from '@deepseek-ai/cordis'
-import { FakeWebServer, RecordingLogger, createFakeHost } from './runtime-host.js'
+import { FakeLlm, FakeWebServer, RecordingLogger, createFakeHost } from './runtime-host.js'
 import { EventEmitter } from 'node:events'
 
 class FakeRequest extends EventEmitter {
@@ -194,6 +195,9 @@ function makeHarness(overrides: Partial<SetupDeps> = {}, options: { editor?: Con
     },
     loadTelegramHelpers: async () => TELEGRAM_STUB,
     loadGithubHelpers: async () => GITHUB_STUB,
+    // Watchdog defaults never touch the real launchctl/plist in unit tests.
+    runProcess: async () => ({ code: 1, stdout: '', stderr: '' }),
+    watchdogPlistPath: () => join(stateDir, 'watchdog.plist'),
     ...overrides,
   }
   return {
@@ -329,7 +333,7 @@ describe('setup wizard backend', () => {
 
   it('persists merged config through configEditor after returning restarting:true', async () => {
     const harness = makeHarness()
-    const prepared = harness.service.prepareConfig({
+    const prepared = await harness.service.prepareConfig({
       config: {
         sources: { telegram: { allowedUserIds: ['1', '2'] }, github: { repositories: ['octocat/one', 'octocat/two'] } },
         policy: { mode: 'auto' },
@@ -361,23 +365,23 @@ describe('setup wizard backend', () => {
     expect(harness.kv.get<boolean>('superagent.setup.restartPending')).toBeUndefined()
   })
 
-  it('returns 501 for config writes when configEditor is unavailable', () => {
+  it('returns 501 for config writes when configEditor is unavailable', async () => {
     const harness = makeHarness({}, { editor: null })
-    const prepared = harness.service.prepareConfig({ config: { policy: { mode: 'auto' } } })
+    const prepared = await harness.service.prepareConfig({ config: { policy: { mode: 'auto' } } })
     expect(prepared.result.status).toBe(501)
     expect(prepared.result.body.error).toBe('config_editor_unavailable')
     expect(prepared.patch).toBeUndefined()
   })
 
-  it('rejects invalid configuration patches', () => {
+  it('rejects invalid configuration patches', async () => {
     const harness = makeHarness()
-    expect(harness.service.prepareConfig({}).result.status).toBe(400)
-    expect(harness.service.prepareConfig({ config: { policy: { mode: 'always' } } }).result.status).toBe(400)
+    expect((await harness.service.prepareConfig({})).result.status).toBe(400)
+    expect((await harness.service.prepareConfig({ config: { policy: { mode: 'always' } } })).result.status).toBe(400)
     expect(
-      harness.service.prepareConfig({ config: { sources: { telegram: { tokenFile: 'relative' } } } }).result.status,
+      (await harness.service.prepareConfig({ config: { sources: { telegram: { tokenFile: 'relative' } } } })).result.status,
     ).toBe(400)
     expect(
-      harness.service.prepareConfig({ config: { sources: { telegram: { enabled: false } } } }).result.status,
+      (await harness.service.prepareConfig({ config: { sources: { telegram: { enabled: false } } } })).result.status,
     ).toBe(200)
   })
 
@@ -390,7 +394,7 @@ describe('setup wizard backend', () => {
     const switched = (await harness.service.state()).body as { language: string }
     expect(switched.language).toBe('en')
 
-    const prepared = harness.service.prepareConfig({ config: { language: 'en' } })
+    const prepared = await harness.service.prepareConfig({ config: { language: 'en' } })
     expect(prepared.result.status).toBe(200)
     expect(prepared.result.body).toEqual({ ok: true, restarting: true })
     expect(prepared.patch?.language).toBe('en')
@@ -399,7 +403,7 @@ describe('setup wizard backend', () => {
     await harness.service.waitForCommit()
     expect(harness.editor.calls[0]!.next.language).toBe('en')
 
-    const invalid = harness.service.prepareConfig({ config: { language: 'fr' } })
+    const invalid = await harness.service.prepareConfig({ config: { language: 'fr' } })
     expect(invalid.result.status).toBe(400)
     expect(invalid.result.body.error).toBe('invalid_config')
   })
@@ -430,13 +434,13 @@ describe('setup wizard backend', () => {
     const explicit = (await harness.service.state()).body as { git: { name: string; email: string } }
     expect(explicit.git).toMatchObject({ name: 'Cine Bot', email: 'bot@example.com' })
 
-    const prepared = harness.service.prepareConfig({
+    const prepared = await harness.service.prepareConfig({
       config: { executor: { gitName: 'Cine Bot', gitEmail: 'bot@example.com', gitSshKeyFile: keyFile } },
     })
     expect(prepared.result.status).toBe(200)
     expect(prepared.patch?.executor).toMatchObject({ gitName: 'Cine Bot', gitEmail: 'bot@example.com' })
 
-    const relativeKey = harness.service.prepareConfig({ config: { executor: { gitSshKeyFile: 'relative/key' } } })
+    const relativeKey = await harness.service.prepareConfig({ config: { executor: { gitSshKeyFile: 'relative/key' } } })
     expect(relativeKey.result.status).toBe(400)
     expect(relativeKey.result.body.error).toBe('invalid_config')
   })
@@ -764,5 +768,330 @@ describe('setup generated SSH key (task-33)', () => {
     expect(state.git.sshKeyFile).toBe(custom)
     expect(state.git.publicKey).toContain('AAAACUSTOM')
     expect(harness.service.persistGitSshKey(custom)).toBe(false)
+  })
+})
+
+describe('setup model catalog + selection (task-34)', () => {
+  it('lists providers and models, isolating a single failing provider', async () => {
+    const llm = new FakeLlm()
+    const harness = makeHarness({ llm: () => llm })
+    const listed = await harness.service.listModels()
+    expect(listed.status).toBe(200)
+    const body = listed.body as {
+      ok: boolean
+      providers: Array<{ id: string; name: string; models: Array<{ id: string; name: string; description?: string; inputModalities?: string[] }> }>
+      errors?: Array<{ provider: string; error: string }>
+    }
+    expect(body.ok).toBe(true)
+    expect(body.providers.map(provider => provider.id)).toEqual(['deepseek', 'openrouter'])
+    expect(body.providers[0]!.models.map(model => model.id)).toEqual(['deepseek-chat', 'deepseek-reasoner'])
+    expect(body.providers[0]!.models[0]!.description).toBe('fast')
+    expect(body.errors).toBeUndefined()
+
+    const partial = new FakeLlm(undefined, undefined, new Set(['openrouter']))
+    const partialHarness = makeHarness({ llm: () => partial })
+    const partialResult = await partialHarness.service.listModels()
+    expect(partialResult.status).toBe(200)
+    const partialBody = partialResult.body as {
+      providers: Array<{ id: string }>
+      errors?: Array<{ provider: string; error: string }>
+    }
+    expect(partialBody.providers.map(provider => provider.id)).toEqual(['deepseek'])
+    expect(partialBody.errors?.[0]?.provider).toBe('openrouter')
+    expect(partialBody.errors?.[0]?.error).toContain('unavailable')
+  })
+
+  it('returns 501 when the DSH llm service is unavailable', async () => {
+    const harness = makeHarness({ llm: () => undefined })
+    const result = await harness.service.listModels()
+    expect(result.status).toBe(501)
+    expect(result.body.error).toBe('llm_unavailable')
+  })
+
+  it('validates explicit provider/model/settings before saving', async () => {
+    const seen: Array<{ provider: string; model: string; effort?: string }> = []
+    const harness = makeHarness({
+      validateModel: async (provider, model, reasoningEffort) => {
+        seen.push({ provider, model, ...(reasoningEffort ? { effort: reasoningEffort } : {}) })
+        return provider === 'bad-provider' ? 'unknown model bad-provider/x' : undefined
+      },
+    })
+    const invalid = await harness.service.prepareConfig({
+      config: { router: { provider: 'bad-provider', model: 'x' } },
+    })
+    expect(invalid.result.status).toBe(400)
+    expect(invalid.result.body.error).toBe('invalid_model')
+    expect(String(invalid.result.body.description)).toContain('router: unknown model')
+
+    const valid = await harness.service.prepareConfig({
+      config: {
+        router: { provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'high' },
+        executor: { provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'low' },
+      },
+    })
+    expect(valid.result.status).toBe(200)
+    expect(valid.result.body).toEqual({ ok: true, restarting: true })
+    expect(seen).toEqual([
+      { provider: 'bad-provider', model: 'x' },
+      { provider: 'deepseek', model: 'deepseek-chat', effort: 'high' },
+      { provider: 'deepseek', model: 'deepseek-reasoner', effort: 'low' },
+    ])
+
+    const pair = await harness.service.prepareConfig({ config: { router: { provider: 'deepseek' } } })
+    expect(pair.result.status).toBe(400)
+    expect(pair.result.body.error).toBe('invalid_config')
+  })
+
+  it('exposes the currently effective router/worker/default selections in state', async () => {
+    const harness = makeHarness({
+      models: () => ({
+        router: { provider: 'router-provider', model: 'router-model', reasoningEffort: 'high' },
+        worker: { provider: 'worker-provider', model: 'worker-model' },
+        default: { provider: 'host', model: 'host-model' },
+      }),
+    })
+    const state = (await harness.service.state()).body as { models: unknown }
+    expect(state.models).toEqual({
+      router: { provider: 'router-provider', model: 'router-model', reasoningEffort: 'high' },
+      worker: { provider: 'worker-provider', model: 'worker-model' },
+      default: { provider: 'host', model: 'host-model' },
+    })
+  })
+
+  it('serves GET setup/models from the runtime route and reports effective state models', async () => {
+    const llm = new FakeLlm()
+    const stateDir = tempStateDir()
+    const host = createFakeHost({ llm })
+    const runtime = new Runtime(
+      host.ctx as unknown as Context,
+      {
+        stateDir,
+        sources: { telegram: { enabled: false }, github: { enabled: false } },
+        policy: { mode: 'observe' },
+        router: { provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'high' },
+        executor: { provider: 'deepseek', model: 'deepseek-reasoner' },
+        passIntervalMs: 60_000,
+        heartbeatIntervalMs: 60_000,
+        watchdog: { intervalMs: 60_000 },
+      },
+      { store: createMemoryStore(), sources: [], skipLock: true },
+    )
+    try {
+      await runtime.ready
+
+      const route = host.webServer.route(SETUP_MODELS_PATH)
+      expect(route).toBeDefined()
+      const forbidden = new FakeResponse()
+      await route!.handler(new FakeRequest({ method: 'GET' }), forbidden)
+      expect(forbidden.statusCode).toBe(403)
+      const wrongMethod = new FakeResponse()
+      await route!.handler(new FakeRequest({ method: 'POST', headers: { [API_HEADER]: '1' } }), wrongMethod)
+      expect(wrongMethod.statusCode).toBe(405)
+
+      const response = new FakeResponse()
+      await route!.handler(new FakeRequest({ method: 'GET', headers: { [API_HEADER]: '1' } }), response)
+      expect(response.statusCode).toBe(200)
+      const body = response.json<{ ok: boolean; providers: Array<{ id: string }> }>()
+      expect(body.ok).toBe(true)
+      expect(body.providers.map(provider => provider.id)).toEqual(['deepseek', 'openrouter'])
+
+      const stateRoute = host.webServer.route('/superagent/api/setup/state')!
+      const stateResponse = new FakeResponse()
+      await stateRoute.handler(new FakeRequest({ method: 'GET', headers: { [API_HEADER]: '1' } }), stateResponse)
+      const state = stateResponse.json<{
+        models: { router: unknown; worker: unknown; default: unknown }
+      }>()
+      expect(state.models.router).toEqual({
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        reasoningEffort: 'high',
+      })
+      expect(state.models.worker).toEqual({ provider: 'deepseek', model: 'deepseek-reasoner' })
+      expect(state.models.default).toBeNull()
+    } finally {
+      await runtime.stop()
+    }
+  })
+})
+
+describe('setup watchdog toggle (task-36)', () => {
+  it('reports the LaunchAgent state (installed / running) without throwing', async () => {
+    const harness = makeHarness()
+    const idle = await harness.service.getWatchdog(true)
+    expect(idle.status).toBe(200)
+    expect(idle.body).toMatchObject({
+      ok: true,
+      installed: false,
+      running: false,
+      label: 'com.sfky.superagent.watchdog',
+      stateDir: harness.stateDir,
+    })
+    expect(String(idle.body.detail)).toContain('not installed')
+
+    const installedHarness = makeHarness()
+    const plistPath = join(installedHarness.stateDir, 'watchdog.plist')
+    writeFileSync(plistPath, '<plist/>', { mode: 0o600 })
+    const calls: Array<{ file: string; args: string[] }> = []
+    installedHarness.service = new SetupService({
+      ...({
+        stateDir: installedHarness.stateDir,
+        kv: installedHarness.kv,
+        logger: installedHarness.logger,
+        plugin: () => ({ status: 'ready', detail: null }),
+        currentConfig: () => installedHarness.config,
+        validateConfig: candidate => validateConfig(candidate).problem?.error,
+        configEditor: () => installedHarness.editor,
+        hostEntry: () => ({ id: 'dsh-superagent-personal' }),
+        runProcess: async (file, args) => {
+          calls.push({ file, args })
+          return { code: 0, stdout: '', stderr: '' }
+        },
+        watchdogPlistPath: () => plistPath,
+      } satisfies SetupDeps),
+    })
+    const running = await installedHarness.service.getWatchdog(true)
+    expect(running.body).toMatchObject({ installed: true, running: true, plistPath })
+    expect(String(running.body.detail)).toContain('running')
+    expect(calls[0]!.file).toBe('launchctl')
+    expect(calls[0]!.args[0]).toBe('print')
+    expect(calls[0]!.args[1]).toContain('com.sfky.superagent.watchdog')
+  })
+
+  it('enables/disables by running the repo scripts with --state-dir, output only in logs', async () => {
+    const scriptPath = join(tempStateDir(), 'install-launchd.sh')
+    const uninstallPath = join(tempStateDir(), 'uninstall.sh')
+    writeFileSync(scriptPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    writeFileSync(uninstallPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    const calls: Array<{ file: string; args: string[]; timeout: number }> = []
+    const harness = makeHarness({
+      scriptPath: name => (name === 'install-launchd.sh' ? scriptPath : uninstallPath),
+      runProcess: async (file, args, timeoutMs) => {
+        calls.push({ file, args, timeout: timeoutMs })
+        return { code: 0, stdout: 'installed ok (secret-output-should-not-leak)', stderr: '' }
+      },
+    })
+
+    const enabled = await harness.service.setWatchdog(true)
+    expect(enabled.status).toBe(200)
+    expect(enabled.body).toMatchObject({ ok: true, enabled: true })
+    const scriptCalls = calls.filter(call => call.file === 'sh')
+    expect(scriptCalls).toHaveLength(1)
+    expect(scriptCalls[0]!.args).toEqual([scriptPath, '--state-dir', harness.stateDir])
+    expect(scriptCalls[0]!.timeout).toBe(30_000)
+    expect(calls.some(call => call.file === 'launchctl')).toBe(true)
+    expect(JSON.stringify(enabled.body)).not.toContain('secret-output-should-not-leak')
+    expect(
+      harness.logger.lines.some(line => JSON.stringify(line.extra ?? {}).includes('secret-output-should-not-leak')),
+    ).toBe(true)
+
+    const disabled = await harness.service.setWatchdog(false)
+    expect(disabled.status).toBe(200)
+    expect(disabled.body).toMatchObject({ ok: true, enabled: false })
+    const afterDisable = calls.filter(call => call.file === 'sh')
+    expect(afterDisable[1]!.args).toEqual([uninstallPath, '--state-dir', harness.stateDir])
+  })
+
+  it('returns readable failures (script error, missing script) without leaking output', async () => {
+    const scriptPath = join(tempStateDir(), 'install-launchd.sh')
+    writeFileSync(scriptPath, '#!/bin/sh\nexit 1\n', { mode: 0o755 })
+    const failing = makeHarness({
+      scriptPath: () => scriptPath,
+      runProcess: async () => ({ code: 1, stdout: 'rm -rf /Users/secret/path', stderr: 'permission denied' }),
+    })
+    const failure = await failing.service.setWatchdog(true)
+    expect(failure.status).toBe(500)
+    expect(failure.body).toMatchObject({ ok: false, enabled: true, error: 'watchdog_script_failed' })
+    expect(JSON.stringify(failure.body)).not.toContain('rm -rf')
+    expect(JSON.stringify(failure.body)).not.toContain('/Users/secret')
+
+    const missing = makeHarness({ scriptPath: () => undefined })
+    const unavailable = await missing.service.setWatchdog(true)
+    expect(unavailable.status).toBe(501)
+    expect(unavailable.body.error).toBe('watchdog_script_unavailable')
+    expect(String(unavailable.body.description)).toContain('install-launchd.sh --state-dir')
+  })
+
+  it('serves GET/POST setup/watchdog from the runtime route and backfills state', async () => {
+    const stateDir = tempStateDir()
+    const plistPath = join(stateDir, 'watchdog.plist')
+    const scriptPath = join(stateDir, 'install-launchd.sh')
+    const uninstallPath = join(stateDir, 'uninstall.sh')
+    writeFileSync(scriptPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    writeFileSync(uninstallPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    const calls: string[][] = []
+    const host = createFakeHost()
+    const runtime = new Runtime(
+      host.ctx as unknown as Context,
+      {
+        stateDir,
+        sources: { telegram: { enabled: false }, github: { enabled: false } },
+        policy: { mode: 'observe' },
+        passIntervalMs: 60_000,
+        heartbeatIntervalMs: 60_000,
+        watchdog: { intervalMs: 60_000 },
+      },
+      {
+        store: createMemoryStore(),
+        sources: [],
+        skipLock: true,
+        scriptPath: name => (name === 'install-launchd.sh' ? scriptPath : uninstallPath),
+        watchdogPlistPath: () => plistPath,
+        runProcess: async (file, args) => {
+          calls.push([file, ...args])
+          if (file === 'launchctl') return { code: existsSync(plistPath) ? 0 : 1, stdout: '', stderr: '' }
+          writeFileSync(plistPath, '<plist/>', { mode: 0o600 })
+          return { code: 0, stdout: 'ok', stderr: '' }
+        },
+      },
+    )
+    try {
+      await runtime.ready
+      const route = host.webServer.route('/superagent/api/setup/watchdog')
+      expect(route).toBeDefined()
+
+      const forbidden = new FakeResponse()
+      await route!.handler(new FakeRequest({ method: 'GET' }), forbidden)
+      expect(forbidden.statusCode).toBe(403)
+
+      const idle = new FakeResponse()
+      await route!.handler(new FakeRequest({ method: 'GET', headers: { [API_HEADER]: '1' } }), idle)
+      expect(idle.statusCode).toBe(200)
+      expect(idle.json<{ installed: boolean; running: boolean }>()).toMatchObject({ installed: false, running: false })
+
+      const invalid = new FakeResponse()
+      const invalidReq = new FakeRequest({ method: 'POST', headers: { [API_HEADER]: '1' } })
+      const invalidPromise = route!.handler(invalidReq, invalid)
+      invalidReq.feed('{"enabled":"yes"}')
+      await invalidPromise
+      expect(invalid.statusCode).toBe(400)
+
+      const enable = new FakeResponse()
+      const enableReq = new FakeRequest({ method: 'POST', headers: { [API_HEADER]: '1' } })
+      const enablePromise = route!.handler(enableReq, enable)
+      enableReq.feed('{"enabled":true}')
+      await enablePromise
+      expect(enable.statusCode).toBe(200)
+      expect(enable.json()).toMatchObject({ ok: true, enabled: true, installed: true, running: true })
+      expect(calls.some(call => call[0] === 'sh' && call[1] === scriptPath && call[2] === '--state-dir')).toBe(true)
+
+      const disable = new FakeResponse()
+      const disableReq = new FakeRequest({ method: 'POST', headers: { [API_HEADER]: '1' } })
+      const disablePromise = route!.handler(disableReq, disable)
+      disableReq.feed('{"enabled":false}')
+      await disablePromise
+      expect(disable.json()).toMatchObject({ ok: true, enabled: false })
+
+      const stateRoute = host.webServer.route('/superagent/api/setup/state')!
+      const stateResponse = new FakeResponse()
+      await stateRoute.handler(new FakeRequest({ method: 'GET', headers: { [API_HEADER]: '1' } }), stateResponse)
+      const state = stateResponse.json<{ watchdog: { installed: boolean; stateDir: string; label: string } }>()
+      expect(state.watchdog).toMatchObject({
+        installed: true,
+        stateDir,
+        label: 'com.sfky.superagent.watchdog',
+      })
+    } finally {
+      await runtime.stop()
+    }
   })
 })

@@ -16,11 +16,12 @@ import type {
   GithubApi,
   GithubCheckRun,
   GithubCheckRunsResponse,
+  GithubIssue,
   GithubPullRequest,
   GithubWorkflowRunsResponse,
 } from '../sources/github-api.js'
 import type { Input, PullRequestRef, Report, ReportKind } from '../core/model.js'
-import { errorMessage, oneLine } from '../app/support.js'
+import { clampText, errorMessage, oneLine } from '../app/support.js'
 import { renderTicketCard, renderThreadWindow, renderTriggerLine } from '../prompts/index.js'
 import {
   asJson,
@@ -59,6 +60,41 @@ function pendingInputs(deps: ToolDeps, ticketId: string): Input[] {
   const ticket = deps.store.tickets.get(ticketId)
   if (!ticket) return []
   return ticket.inputs.filter(input => !input.readAt)
+}
+
+/** Normalize the report `files` argument into Engine attachments (max 10). */
+function reportFilesOf(
+  value: unknown,
+  cwd: string | undefined,
+): { files: NonNullable<Report['files']>; invalid: string[] } {
+  if (!Array.isArray(value)) return { files: [], invalid: [] }
+  const files: NonNullable<Report['files']> = []
+  const invalid: string[] = []
+  for (const item of value.slice(0, 10)) {
+    const record: Record<string, unknown> =
+      item !== null && typeof item === 'object' ? (item as Record<string, unknown>) : { path: item }
+    const rawPath = typeof record.path === 'string' ? record.path.trim() : ''
+    if (!rawPath) continue
+    const absolute = rawPath.startsWith('/') || /^[A-Za-z]:[\\/]/.test(rawPath) ? rawPath : resolvePath(cwd ?? process.cwd(), rawPath)
+    if (!existsSync(absolute)) {
+      invalid.push(rawPath)
+      continue
+    }
+    const extension = /\.(png|jpe?g|webp|gif)$/i.exec(absolute)?.[1]?.toLowerCase()
+    const kind =
+      record.kind === 'photo' || record.kind === 'document'
+        ? record.kind
+        : extension
+          ? 'photo'
+          : 'document'
+    files.push({
+      path: absolute,
+      ...(typeof record.name === 'string' && record.name.trim() ? { name: record.name.trim() } : {}),
+      ...(typeof record.caption === 'string' && record.caption.trim() ? { caption: record.caption.trim().slice(0, 400) } : {}),
+      kind,
+    })
+  }
+  return { files, invalid }
 }
 
 function pullRequestOf(args: Record<string, unknown>): PullRequestRef | undefined {
@@ -387,6 +423,39 @@ function summarizeWorkflowRuns(response: GithubWorkflowRunsResponse): Record<str
   }
 }
 
+function summarizeIssue(issue: GithubIssue): Record<string, unknown> {
+  return {
+    number: issue.number,
+    title: issue.title,
+    state: issue.state,
+    author: issue.user?.login ?? null,
+    url: issue.html_url ?? null,
+    labels: Array.isArray(issue.labels)
+      ? issue.labels.map(label => (typeof label === 'string' ? label : label?.name)).filter(Boolean)
+      : [],
+    comments: issue.comments ?? null,
+    body: issue.body === null || issue.body === undefined ? null : clampText(String(issue.body), 2_000),
+    updatedAt: issue.updated_at ?? null,
+  }
+}
+
+function summarizePull(pull: GithubPullRequest): Record<string, unknown> {
+  return {
+    number: pull.number,
+    title: pull.title,
+    state: pull.state,
+    merged: pull.merged === true,
+    draft: pull.draft === true,
+    author: pull.user?.login ?? null,
+    url: pull.html_url ?? null,
+    head: pull.head?.ref ?? null,
+    base: pull.base?.ref ?? null,
+    headSha: pull.head?.sha ?? null,
+    body: pull.body === null || pull.body === undefined ? null : clampText(String(pull.body), 2_000),
+    updatedAt: pull.updated_at ?? null,
+  }
+}
+
 /** The `superagent_github` tool definition (worker scope only). */
 function githubToolDefinition(deps: ToolDeps): ToolDefinition {
   const now = clockOf(deps)
@@ -399,7 +468,23 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
     parameters: {
       action: {
         type: 'string',
-        enum: ['create_repository', 'pull_request', 'comment', 'checks'],
+        enum: [
+          'create_repository',
+          'pull_request',
+          'comment',
+          'checks',
+          'list_checks',
+          'get_issue',
+          'list_issues',
+          'create_issue',
+          'update_issue',
+          'get_pull',
+          'list_pulls',
+          'get_pull_files',
+          'review',
+          'merge_pull',
+          'search',
+        ],
         required: true,
         description: 'Which GitHub action to perform',
       },
@@ -424,13 +509,46 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
       number: { type: 'integer', description: 'comment: PR/issue number (default: the ticket PR); checks: resolve the head SHA from this PR' },
       ref: { type: 'string', description: 'checks: commit SHA or branch (default agent/<ticketId>)' },
       draft: { type: 'boolean', description: 'pull_request: open as draft' },
+      state: { type: 'string', enum: ['open', 'closed', 'all'], description: 'list/issues/update: state filter or target state' },
+      labels: { type: 'array', items: { type: 'string' }, description: 'issue/PR labels (list filter or write value)' },
+      assignees: { type: 'array', items: { type: 'string' }, description: 'issue assignees (GitHub logins)' },
+      event: {
+        type: 'string',
+        enum: ['APPROVE', 'REQUEST_CHANGES', 'COMMENT'],
+        description: 'review: GitHub review event',
+      },
+      comments: {
+        type: 'json',
+        description: 'review: optional inline comments [{path, body, line?, side?}]',
+      },
+      mergeMethod: { type: 'string', enum: ['merge', 'squash', 'rebase'], description: 'merge_pull: merge method (default merge)' },
+      confirm: { type: 'boolean', description: 'merge_pull: must be true; merging is never automatic' },
+      query: { type: 'string', description: 'search: GitHub search query (issues/PRs)' },
+      limit: { type: 'integer', description: 'list/search: maximum results (default 20, max 100)' },
     },
     async run(args, exec) {
       const call = workerCallContext(exec, deps)
       if ('ok' in call) return call
       const action = String(args.action ?? '')
-      if (action !== 'create_repository' && action !== 'pull_request' && action !== 'comment' && action !== 'checks') {
-        return failure('invalid_action', 'expected create_repository, pull_request, comment or checks')
+      const KNOWN_ACTIONS = new Set([
+        'create_repository',
+        'pull_request',
+        'comment',
+        'checks',
+        'list_checks',
+        'get_issue',
+        'list_issues',
+        'create_issue',
+        'update_issue',
+        'get_pull',
+        'list_pulls',
+        'get_pull_files',
+        'review',
+        'merge_pull',
+        'search',
+      ])
+      if (!KNOWN_ACTIONS.has(action)) {
+        return failure('invalid_action', `unsupported action; expected one of ${[...KNOWN_ACTIONS].join(', ')}`)
       }
 
       if (action === 'create_repository') {
@@ -504,6 +622,178 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
       const ticket = deps.store.tickets.get(call.ticketId)
 
       try {
+        if (
+          action === 'get_issue' ||
+          action === 'list_issues' ||
+          action === 'create_issue' ||
+          action === 'update_issue' ||
+          action === 'get_pull' ||
+          action === 'list_pulls' ||
+          action === 'get_pull_files' ||
+          action === 'review' ||
+          action === 'merge_pull' ||
+          action === 'search'
+        ) {
+          const limit = Number.isInteger(Number(args.limit)) ? Math.min(Math.max(Number(args.limit), 1), 100) : 20
+          const bodyMarker = (body: string, kind: string): string =>
+            body.includes('<!-- superagent:') ? body : `${body}${body.trim() ? '\n\n' : ''}<!-- superagent:${call.ticketId}:${kind} -->`
+          const ticket = deps.store.tickets.get(call.ticketId)
+
+          try {
+            if (action === 'get_issue') {
+              if (!Number.isInteger(Number(args.number)) || Number(args.number) <= 0) return failure('number_required', 'get_issue needs number')
+              const issue = (await client.getIssue(repo, Number(args.number))) as GithubIssue
+              return { ok: true, action, repo, issue: summarizeIssue(issue) }
+            }
+            if (action === 'list_issues') {
+              const page = (await client.listIssues(repo, {
+                ...(typeof args.state === 'string' ? { state: args.state } : {}),
+                ...(Array.isArray(args.labels) ? { labels: args.labels.map(String) } : {}),
+                ...(Array.isArray(args.assignees) && args.assignees[0] ? { assignee: String(args.assignees[0]) } : {}),
+                maxPages: 2,
+              }))
+              return { ok: true, action, repo, issues: page.items.slice(0, limit).map(summarizeIssue) }
+            }
+            if (action === 'create_issue') {
+              const title = typeof args.title === 'string' ? args.title.trim() : ''
+              if (!title) return failure('title_required', 'create_issue needs title')
+              const body = bodyMarker(typeof args.body === 'string' ? args.body : '', 'issue')
+              const issue = await client.createIssue(repo, {
+                title,
+                body,
+                ...(Array.isArray(args.labels) && args.labels.length > 0 ? { labels: args.labels.map(String) } : {}),
+                ...(Array.isArray(args.assignees) && args.assignees.length > 0 ? { assignees: args.assignees.map(String) } : {}),
+              })
+              return { ok: true, action, repo, issue: summarizeIssue(issue) }
+            }
+            if (action === 'update_issue') {
+              if (!Number.isInteger(Number(args.number)) || Number(args.number) <= 0) return failure('number_required', 'update_issue needs number')
+              const patch: Record<string, unknown> = {}
+              if (typeof args.title === 'string' && args.title.trim()) patch.title = args.title.trim()
+              if (typeof args.body === 'string') patch.body = args.body
+              if (args.state === 'open' || args.state === 'closed') patch.state = args.state
+              if (Array.isArray(args.labels)) patch.labels = args.labels.map(String)
+              if (Array.isArray(args.assignees)) patch.assignees = args.assignees.map(String)
+              if (Object.keys(patch).length === 0) {
+                return failure('nothing_to_update', 'update_issue needs at least one of title/body/state/labels/assignees')
+              }
+              const issue = await client.updateIssue(repo, Number(args.number), patch)
+              return { ok: true, action, repo, issue: summarizeIssue(issue) }
+            }
+            if (action === 'get_pull') {
+              if (!Number.isInteger(Number(args.number)) || Number(args.number) <= 0) return failure('number_required', 'get_pull needs number')
+              const pull = (await client.getPull(repo, Number(args.number))) as GithubPullRequest
+              return { ok: true, action, repo, pull: summarizePull(pull) }
+            }
+            if (action === 'list_pulls') {
+              const page = (await client.listPulls(repo, {
+                ...(typeof args.state === 'string' ? { state: args.state } : {}),
+                maxPages: 2,
+              }))
+              return {
+                ok: true,
+                action,
+                repo,
+                pulls: page.items.slice(0, limit).map(pull => summarizePull(pull)),
+              }
+            }
+            if (action === 'get_pull_files') {
+              if (!Number.isInteger(Number(args.number)) || Number(args.number) <= 0) {
+                return failure('number_required', 'get_pull_files needs number')
+              }
+              const files = await client.listPullFiles(repo, Number(args.number))
+              const maxFiles = Math.min(Math.max(limit, 1), 30)
+              return {
+                ok: true,
+                action,
+                repo,
+                number: Number(args.number),
+                files: files.slice(0, maxFiles).map(file => ({
+                  filename: file.filename,
+                  status: file.status,
+                  additions: file.additions,
+                  deletions: file.deletions,
+                  changes: file.changes,
+                  patch: typeof file.patch === 'string' ? clampText(file.patch, 1200) : null,
+                })),
+                truncated: files.length > maxFiles,
+              }
+            }
+            if (action === 'review') {
+              if (!Number.isInteger(Number(args.number)) || Number(args.number) <= 0) return failure('number_required', 'review needs number')
+              const event = args.event
+              if (event !== 'APPROVE' && event !== 'REQUEST_CHANGES' && event !== 'COMMENT') {
+                return failure('event_required', 'review needs event APPROVE|REQUEST_CHANGES|COMMENT')
+              }
+              if (event !== 'APPROVE' && !(typeof args.body === 'string' && args.body.trim())) {
+                return failure('body_required', 'REQUEST_CHANGES/COMMENT reviews need a body')
+              }
+              const body = bodyMarker(typeof args.body === 'string' ? args.body : '', 'review')
+              let comments: Array<Record<string, unknown>> | undefined
+              if (Array.isArray(args.comments)) {
+                comments = (args.comments as unknown[])
+                  .filter((item): item is Record<string, unknown> => item !== null && typeof item === 'object')
+                  .map(item => ({
+                    path: String(item.path ?? ''),
+                    body: String(item.body ?? ''),
+                    ...(Number.isInteger(Number(item.line)) ? { line: Number(item.line) } : {}),
+                    ...(item.side === 'LEFT' || item.side === 'RIGHT' ? { side: item.side } : {}),
+                  }))
+                  .filter(item => item.path.length > 0 && item.body.length > 0)
+              }
+              const result = await client.createPullReview(repo, Number(args.number), {
+                event,
+                body,
+                ...(comments && comments.length > 0 ? { comments: comments as never } : {}),
+              })
+              return { ok: true, action, repo, number: Number(args.number), reviewId: result.id, state: result.state, url: result.html_url ?? null }
+            }
+            if (action === 'merge_pull') {
+              if (args.confirm !== true) {
+                return failure('confirm_required', 'merge_pull needs confirm:true; merging is never automatic')
+              }
+              if (!ticket || ticket.state !== 'open') {
+                return failure('ticket_not_open', 'merge_pull is only allowed for an open ticket with a live mandate')
+              }
+              if (!Number.isInteger(Number(args.number)) || Number(args.number) <= 0) return failure('number_required', 'merge_pull needs number')
+              const methodName = args.mergeMethod === 'squash' || args.mergeMethod === 'rebase' ? args.mergeMethod : 'merge'
+              const result = await client.mergePull(repo, Number(args.number), {
+                merge_method: methodName as 'merge' | 'squash' | 'rebase',
+                ...(typeof args.title === 'string' && args.title.trim() ? { commit_title: args.title.trim() } : {}),
+                ...(typeof args.body === 'string' && args.body.trim() ? { commit_message: args.body.trim() } : {}),
+              })
+              return {
+                ok: true,
+                action,
+                repo,
+                number: Number(args.number),
+                merged: result.merged === true,
+                commit: result.sha ?? null,
+                message: result.message ?? null,
+                mergeMethod: methodName,
+              }
+            }
+            // action === 'search'
+            const query = typeof args.query === 'string' ? args.query.trim() : ''
+            if (!query) return failure('query_required', 'search needs a query')
+            const result = await client.searchIssues(query, { perPage: limit, maxPages: 1 })
+            return {
+              ok: true,
+              action,
+              total: typeof result.total_count === 'number' ? result.total_count : (result.items ?? []).length,
+              items: (result.items ?? []).slice(0, limit).map(issue => ({
+                number: issue.number,
+                title: issue.title,
+                state: issue.state,
+                url: issue.html_url ?? null,
+                isPull: typeof issue.pull_request !== 'undefined',
+              })),
+            }
+          } catch (error) {
+            return mapGithubError(error)
+          }
+        }
+
         if (action === 'pull_request') {
           const head = (typeof args.head === 'string' && args.head.trim()) || `agent/${call.ticketId}`
           const title = (typeof args.title === 'string' && args.title.trim()) || ticket?.title || `SuperAgent: ${call.ticketId}`
@@ -606,7 +896,7 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
           }
         }
 
-        // action === 'checks'
+        // action === 'checks' | 'list_checks'
         let ref = typeof args.ref === 'string' ? args.ref.trim() : ''
         const number = Number.isInteger(Number(args.number)) && Number(args.number) > 0 ? Number(args.number) : undefined
         if (!ref && number !== undefined) {
@@ -639,7 +929,7 @@ function githubToolDefinition(deps: ToolDeps): ToolDefinition {
         }
         return {
           ok: true,
-          action: 'checks',
+          action,
           repo,
           ref,
           checks,
@@ -716,6 +1006,20 @@ export function workerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
       prNumber: { type: 'integer', description: 'ready: pull request number' },
       branch: { type: 'string', description: 'Branch carrying the change, e.g. agent/t-123' },
       facts: { type: 'json', description: 'Free-form JSON facts (files, test results, commit sha)' },
+      files: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            path: { type: 'string', required: true, description: 'Absolute local path (or path relative to the working directory)' },
+            name: { type: 'string', description: 'Display name' },
+            caption: { type: 'string', description: 'Short caption shown with the file' },
+            kind: { type: 'string', enum: ['photo', 'document'], description: 'Send as photo or document (default: by extension)' },
+          },
+        },
+        description: 'Local files to deliver to the user with a ready/blocked/failed report (max 10; screenshots, logs, artifacts)',
+      },
     },
     async run(args, exec) {
       const call = workerCallContext(exec, deps)
@@ -737,6 +1041,10 @@ export function workerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
       if (typeof args.branch === 'string' && args.branch.trim()) facts.branch = args.branch.trim()
       const pullRequest = pullRequestOf(args as Record<string, unknown>)
       if (pullRequest) facts.pullRequest = pullRequest
+      const reportFiles = reportFilesOf(args.files, call.cwd)
+      if (reportFiles.invalid.length > 0) {
+        return failure('invalid_file_path', `files must exist and be readable: ${reportFiles.invalid.join(', ')}`)
+      }
       const reportValue: Report = {
         kind,
         summary,
@@ -744,9 +1052,17 @@ export function workerToolDefinitions(deps: ToolDeps): ToolDefinition[] {
         ...(kind === 'blocked' ? { question } : {}),
         ...(pullRequest ? { pullRequest } : {}),
         ...(Object.keys(facts).length > 0 ? { facts } : {}),
+        ...(reportFiles.files.length > 0 ? { files: reportFiles.files } : {}),
       }
       deps.engine.executor.report({ ticketId: call.ticketId, assignmentId: call.assignmentId, report: reportValue })
-      return { ok: true, accepted: true, kind, at: reportValue.at, ticketId: call.ticketId }
+      return {
+        ok: true,
+        accepted: true,
+        kind,
+        at: reportValue.at,
+        ticketId: call.ticketId,
+        ...(reportFiles.files.length > 0 ? { files: reportFiles.files.length } : {}),
+      }
     },
   })
 

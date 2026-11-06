@@ -349,6 +349,41 @@ export class RecordingLogger {
   }
 }
 
+/** Simulated DSH `llm` service for the setup model catalog. */
+export class FakeLlm {
+  constructor(
+    public providers: Array<{ id: string; name: string }> = [
+      { id: 'deepseek', name: 'DeepSeek' },
+      { id: 'openrouter', name: 'OpenRouter' },
+    ],
+    public modelsByProvider: Record<string, Array<{ id: string; name: string; description?: string; inputModalities?: readonly string[] }>> = {
+      deepseek: [
+        { id: 'deepseek-chat', name: 'DeepSeek Chat', description: 'fast' },
+        { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner', inputModalities: ['text'] },
+      ],
+      openrouter: [{ id: 'openrouter/auto', name: 'Auto' }],
+    },
+    public failProviders: Set<string> = new Set(),
+    public resolve?: (provider: string, model: string) => unknown,
+  ) {}
+
+  listProviders(): Array<{ id: string; name: string }> {
+    return this.providers.map(provider => ({ ...provider }))
+  }
+
+  async listModels(provider: string): Promise<Array<{ id: string; name: string; description?: string; inputModalities?: readonly string[] }>> {
+    if (this.failProviders.has(provider)) throw new Error(`provider ${provider} is unavailable`)
+    return this.modelsByProvider[provider] ?? []
+  }
+
+  async resolveModelInfo(provider: string, model: string, _signal?: AbortSignal): Promise<unknown> {
+    if (this.resolve) return this.resolve(provider, model)
+    const found = (this.modelsByProvider[provider] ?? []).find(candidate => candidate.id === model)
+    if (!found) throw new Error(`unknown model ${provider}/${model}`)
+    return { provider, id: model, name: found.name }
+  }
+}
+
 export interface FakeHost {
   ctx: FakeRootContext
   agents: FakeAgentRegistry
@@ -392,6 +427,8 @@ export function createFakeHost(
     logger?: RecordingLogger
     /** Simulate the DSH `agentDefaultModel` service. */
     defaultModel?: { provider: string; model: string; reasoningEffort?: string }
+    /** Simulate the DSH `llm` service. */
+    llm?: FakeLlm
   } = {},
 ): FakeHost {
   const logger = options.logger ?? new RecordingLogger()
@@ -407,6 +444,7 @@ export function createFakeHost(
     ...(options.defaultModel
       ? { agentDefaultModel: { currentSelection: () => ({ ...options.defaultModel }) } }
       : {}),
+    ...(options.llm ? { llm: options.llm } : {}),
   }
   const ctx = new FakeRootContext(services, logger)
   const host: FakeHost = {

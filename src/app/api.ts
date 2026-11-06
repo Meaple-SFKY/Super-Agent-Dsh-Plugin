@@ -325,7 +325,7 @@ export function registerApi(ctx: Context, deps: ApiDeps): () => void {
         sendJson(res, 400, { ok: false, error: 'invalid_body', description: error instanceof Error ? error.message : String(error) })
         return
       }
-      const prepared = setup.prepareConfig(body)
+      const prepared = await setup.prepareConfig(body)
       if (prepared.result.body.ok !== true || prepared.patch === undefined) {
         sendJson(res, prepared.result.status, prepared.result.body)
         return

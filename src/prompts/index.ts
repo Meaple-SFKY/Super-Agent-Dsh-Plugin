@@ -145,6 +145,72 @@ function timeShort(iso: string | undefined): string {
   return iso.length >= 16 ? iso.slice(0, 16).replace('T', ' ') : iso
 }
 
+/** One attachment the Source downloaded for a Trigger (see SourceContext). */
+export interface TriggerAttachment {
+  kind: string
+  path: string
+  name?: string
+  mime?: string
+  size?: number
+}
+
+/** Read `meta.attachments` defensively (Sources own the exact payload). */
+export function attachmentsOf(trigger: Trigger): TriggerAttachment[] {
+  const raw = trigger.meta?.attachments
+  if (!Array.isArray(raw)) return []
+  const attachments: TriggerAttachment[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const record = item as Record<string, unknown>
+    if (typeof record.path !== 'string' || record.path.length === 0) continue
+    attachments.push({
+      kind: typeof record.kind === 'string' ? record.kind : 'document',
+      path: record.path,
+      ...(typeof record.name === 'string' ? { name: record.name } : {}),
+      ...(typeof record.mime === 'string' ? { mime: record.mime } : {}),
+      ...(typeof record.size === 'number' ? { size: record.size } : {}),
+    })
+  }
+  return attachments
+}
+
+function attachmentNote(attachment: TriggerAttachment): string {
+  const name = attachment.name ? ` name=${JSON.stringify(attachment.name)}` : ''
+  const mime = attachment.mime ? ` mime=${attachment.mime}` : ''
+  const size = attachment.size !== undefined ? ` bytes=${attachment.size}` : ''
+  return `${attachment.kind} path=${JSON.stringify(attachment.path)}${name}${mime}${size}`
+}
+
+/** Compact one-line attachment summary for trigger rows/candidate blocks. */
+export function renderAttachmentSummary(trigger: Trigger): string {
+  const attachments = attachmentsOf(trigger)
+  if (attachments.length === 0) return ''
+  return `attachments=${attachments.length} [${attachments
+    .slice(0, 3)
+    .map(attachment => `${attachment.kind}:${attachment.path}`)
+    .join(', ')}${attachments.length > 3 ? ', …' : ''}]`
+}
+
+/** Multi-line attachment block for the worker assignment (local paths only). */
+export function renderAttachmentBlock(triggers: Trigger[], limit = 10): string[] {
+  const seen = new Set<string>()
+  const attachments: TriggerAttachment[] = []
+  for (const trigger of triggers) {
+    for (const attachment of attachmentsOf(trigger)) {
+      if (seen.has(attachment.path)) continue
+      seen.add(attachment.path)
+      attachments.push(attachment)
+      if (attachments.length >= limit) break
+    }
+    if (attachments.length >= limit) break
+  }
+  if (attachments.length === 0) return []
+  return [
+    'attachments (files the user sent; local paths, use read_image/read_file on them):',
+    ...attachments.map((attachment, index) => `- ${index + 1}. ${attachmentNote(attachment)}`),
+  ]
+}
+
 function actorLine(trigger: Trigger): string {
   const name = trigger.actor.name ? `${trigger.actor.name} ` : ''
   return `${name}(${trigger.actor.id})${trigger.actor.bot ? ' bot' : ''}`
@@ -161,7 +227,10 @@ export function renderTriggerLine(trigger: Trigger, options: { textLimit?: numbe
     `addressed=${trigger.addressed}`,
     `actor=${actorLine(trigger)}`,
     `text=${JSON.stringify(clampText(trigger.text, limit))}`,
-  ].join(' ')
+    renderAttachmentSummary(trigger),
+  ]
+    .filter(Boolean)
+    .join(' ')
 }
 
 /** A short ticket card usable by tools and the executor. */
@@ -249,6 +318,7 @@ export function renderCandidateMessage(candidate: Candidate, policy: Policy, too
   lines.push(...policyLines(policy))
   lines.push(`thread: ${thread.thread.key}${thread.thread.label ? ` (${oneLine(thread.thread.label, 100)})` : ''}`)
   lines.push(`primary text: ${JSON.stringify(clampText(primaryTrigger.text, 1200))}`)
+  lines.push(...renderAttachmentBlock([primaryTrigger], 10))
   lines.push(`batch (${triggers.length} trigger(s), oldest first):`)
   for (const trigger of triggers) lines.push(renderTriggerLine(trigger))
   if (primaryTrigger.correlations && primaryTrigger.correlations.length > 0) {
@@ -329,6 +399,7 @@ export function renderAssignmentMessage(options: AssignmentRenderOptions): strin
   lines.push('first triggers:')
   if (triggers.length === 0) lines.push('- (no trigger payload attached)')
   else for (const trigger of triggers.slice(-6)) lines.push(renderTriggerLine(trigger))
+  lines.push(...renderAttachmentBlock(triggers, 10))
   if (inputs.length > 0) {
     lines.push('new input delivered with this assignment:')
     for (const input of inputs.slice(-6)) {
