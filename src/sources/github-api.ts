@@ -335,6 +335,90 @@ export interface GithubResult<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Extended REST inputs/results (issues, pulls, reviews, search)
+// ---------------------------------------------------------------------------
+
+export interface GithubIssueListOptions {
+  state?: 'open' | 'closed' | 'all'
+  labels?: string[]
+  assignee?: string
+  perPage?: number
+  maxPages?: number
+  signal?: AbortSignal
+}
+
+export interface CreateGithubIssueInput {
+  title: string
+  body?: string
+  labels?: string[]
+  assignees?: string[]
+}
+
+export interface UpdateGithubIssueInput {
+  title?: string
+  body?: string
+  state?: 'open' | 'closed'
+  labels?: string[]
+  assignees?: string[]
+}
+
+export interface GithubPullListOptions {
+  state?: 'open' | 'closed' | 'all'
+  head?: string
+  base?: string
+  perPage?: number
+  maxPages?: number
+  signal?: AbortSignal
+}
+
+export interface GithubPullFile {
+  filename: string
+  status: string
+  additions: number
+  deletions: number
+  changes: number
+  patch?: string | null
+  blob_url?: string | null
+  raw_url?: string | null
+}
+
+export interface GithubPullReviewInput {
+  event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT'
+  body?: string
+  comments?: Array<{
+    path: string
+    body: string
+    line?: number
+    side?: 'LEFT' | 'RIGHT'
+    start_line?: number
+  }>
+}
+
+export interface GithubReviewSummary {
+  id: number
+  state: string
+  html_url?: string
+}
+
+export interface GithubMergePullInput {
+  merge_method?: 'merge' | 'squash' | 'rebase'
+  commit_title?: string
+  commit_message?: string
+  sha?: string
+}
+
+export interface GithubMergePullResult {
+  merged: boolean
+  sha?: string
+  message?: string
+}
+
+export interface GithubSearchResult {
+  total_count: number
+  items: GithubIssue[]
+}
+
+// ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
@@ -393,6 +477,13 @@ function nextLink(headers: Headers): string | undefined {
   if (!link) return undefined
   const match = /<([^>]+)>\s*;\s*rel="next"/.exec(link)
   return match?.[1]
+}
+
+/** Worker-facing patches are capped: full diffs can be megabytes. */
+const PULL_PATCH_LIMIT = 4_000
+function truncatePullPatch(patch: string, limit = PULL_PATCH_LIMIT): string {
+  if (patch.length <= limit) return patch
+  return `${patch.slice(0, limit)}\n… [truncated]`
 }
 
 function repoPath(repo: string): string {
@@ -703,6 +794,190 @@ export class GithubApi {
 
   async getPull(repo: string, number: number, options: { signal?: AbortSignal } = {}): Promise<GithubPullRequest> {
     return this.must<GithubPullRequest>(`/repos/${repoPath(repo)}/pulls/${number}`, { signal: options.signal })
+  }
+
+  /** Issues of one repository (GitHub's issues endpoint also returns PRs). */
+  async listIssues(repo: string, options: GithubIssueListOptions = {}): Promise<GithubPage<GithubIssue>> {
+    const params: string[] = [`state=${encodeURIComponent(options.state ?? 'open')}`]
+    if (options.labels && options.labels.length > 0) {
+      params.push(`labels=${encodeURIComponent(options.labels.join(','))}`)
+    }
+    if (options.assignee) params.push(`assignee=${encodeURIComponent(options.assignee)}`)
+    return this.paginate<GithubIssue>(`/repos/${repoPath(repo)}/issues?${params.join('&')}`, {
+      ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.perPage !== undefined ? { perPage: options.perPage } : {}),
+      ...(options.maxPages !== undefined ? { maxPages: options.maxPages } : {}),
+    })
+  }
+
+  /**
+   * Create an issue. A 422 (invalid labels/assignees, or a duplicate title in a
+   * repository with issue uniqueness enforced by an app) is a `GithubApiError`
+   * with GitHub's message; 403 means the token may not write issues.
+   */
+  async createIssue(
+    repo: string,
+    input: CreateGithubIssueInput,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<GithubIssue> {
+    return this.must<GithubIssue>(`/repos/${repoPath(repo)}/issues`, {
+      method: 'POST',
+      body: {
+        title: input.title,
+        ...(input.body !== undefined ? { body: input.body } : {}),
+        ...(input.labels !== undefined ? { labels: input.labels } : {}),
+        ...(input.assignees !== undefined ? { assignees: input.assignees } : {}),
+      },
+      ...(options.signal ? { signal: options.signal } : {}),
+    })
+  }
+
+  /** Update title/body/state/labels/assignees of an issue or pull request. */
+  async updateIssue(
+    repo: string,
+    number: number,
+    input: UpdateGithubIssueInput,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<GithubIssue> {
+    return this.must<GithubIssue>(`/repos/${repoPath(repo)}/issues/${number}`, {
+      method: 'PATCH',
+      body: {
+        ...(input.title !== undefined ? { title: input.title } : {}),
+        ...(input.body !== undefined ? { body: input.body } : {}),
+        ...(input.state !== undefined ? { state: input.state } : {}),
+        ...(input.labels !== undefined ? { labels: input.labels } : {}),
+        ...(input.assignees !== undefined ? { assignees: input.assignees } : {}),
+      },
+      ...(options.signal ? { signal: options.signal } : {}),
+    })
+  }
+
+  /** Pull requests of one repository; `head` is `owner:branch` per GitHub. */
+  async listPulls(repo: string, options: GithubPullListOptions = {}): Promise<GithubPage<GithubPullRequest>> {
+    const params: string[] = [`state=${encodeURIComponent(options.state ?? 'open')}`]
+    if (options.head) params.push(`head=${encodeURIComponent(options.head)}`)
+    if (options.base) params.push(`base=${encodeURIComponent(options.base)}`)
+    return this.paginate<GithubPullRequest>(`/repos/${repoPath(repo)}/pulls?${params.join('&')}`, {
+      ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.perPage !== undefined ? { perPage: options.perPage } : {}),
+      ...(options.maxPages !== undefined ? { maxPages: options.maxPages } : {}),
+    })
+  }
+
+  /** Files changed by a pull request (patch text included when available). */
+  async listPullFiles(
+    repo: string,
+    number: number,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<GithubPullFile[]> {
+    const page = await this.paginate<GithubPullFile>(`/repos/${repoPath(repo)}/pulls/${number}/files`, {
+      ...(options.signal ? { signal: options.signal } : {}),
+      maxPages: 3,
+    })
+    return page.items.map(file => ({
+      filename: file.filename,
+      status: file.status,
+      additions: typeof file.additions === 'number' ? file.additions : 0,
+      deletions: typeof file.deletions === 'number' ? file.deletions : 0,
+      changes: typeof file.changes === 'number' ? file.changes : 0,
+      patch: typeof file.patch === 'string' ? truncatePullPatch(file.patch) : null,
+      blob_url: typeof file.blob_url === 'string' ? file.blob_url : null,
+      raw_url: typeof file.raw_url === 'string' ? file.raw_url : null,
+    }))
+  }
+
+  /** Alias of {@link listPullFiles} used by the worker GitHub tool. */
+  async getPullFiles(
+    repo: string,
+    number: number,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<GithubPullFile[]> {
+    return this.listPullFiles(repo, number, options)
+  }
+
+  /**
+   * Submit a pull request review. 422 = invalid inline comment (e.g. a line
+   * outside the diff); 403 = the token may not review its own PR (GitHub rejects
+   * self-approval unless the token belongs to another account).
+   */
+  async createPullReview(
+    repo: string,
+    number: number,
+    input: GithubPullReviewInput,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<GithubReviewSummary> {
+    return this.must<GithubReviewSummary>(`/repos/${repoPath(repo)}/pulls/${number}/reviews`, {
+      method: 'POST',
+      body: {
+        event: input.event,
+        ...(input.body !== undefined ? { body: input.body } : {}),
+        ...(input.comments !== undefined ? { comments: input.comments } : {}),
+      },
+      ...(options.signal ? { signal: options.signal } : {}),
+    })
+  }
+
+  /**
+   * Merge a pull request. 405 = not mergeable (conflicts/branch protection),
+   * 409 = the head moved; both come back as `GithubApiError` with GitHub's
+   * message so the caller can report a concrete reason.
+   */
+  async mergePull(
+    repo: string,
+    number: number,
+    input: GithubMergePullInput = {},
+    options: { signal?: AbortSignal } = {},
+  ): Promise<GithubMergePullResult> {
+    return this.must<GithubMergePullResult>(`/repos/${repoPath(repo)}/pulls/${number}/merge`, {
+      method: 'PUT',
+      body: {
+        ...(input.merge_method !== undefined ? { merge_method: input.merge_method } : {}),
+        ...(input.commit_title !== undefined ? { commit_title: input.commit_title } : {}),
+        ...(input.commit_message !== undefined ? { commit_message: input.commit_message } : {}),
+        ...(input.sha !== undefined ? { sha: input.sha } : {}),
+      },
+      ...(options.signal ? { signal: options.signal } : {}),
+    })
+  }
+
+  /**
+   * Search issues and pull requests (`GET /search/issues`). `total_count` comes
+   * from the first page; items are paginated up to `maxPages` (default 1).
+   */
+  async searchIssues(
+    query: string,
+    options: { perPage?: number; maxPages?: number; signal?: AbortSignal } = {},
+  ): Promise<GithubSearchResult> {
+    const maxPages = Math.max(1, options.maxPages ?? 1)
+    let next: string | undefined = appendParam(
+      `/search/issues?q=${encodeURIComponent(query)}`,
+      'per_page',
+      String(options.perPage ?? 30),
+    )
+    const items: GithubIssue[] = []
+    let total = 0
+    let pages = 0
+    while (next && pages < maxPages) {
+      const requestPath = next
+      pages += 1
+      const result = await this.json<{ total_count?: number; items?: GithubIssue[] }>(requestPath, {
+        ...(options.signal ? { signal: options.signal } : {}),
+      })
+      if (result.notModified) break
+      const data = result.data
+      if (!data || !Array.isArray(data.items)) {
+        throw new GithubApiError({
+          status: result.status,
+          method: 'GET',
+          path: requestPath,
+          details: 'expected a search answer with items',
+        })
+      }
+      if (typeof data.total_count === 'number') total = data.total_count
+      for (const item of data.items) items.push(item)
+      next = nextLink(result.headers)
+    }
+    return { total_count: total, items }
   }
 
   /**

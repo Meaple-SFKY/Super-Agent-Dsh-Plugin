@@ -5,6 +5,9 @@
 
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterAll, afterEach, describe, expect, it } from 'vitest'
 
 import type { OutboundMessage, Trigger } from '../src/core/model.js'
@@ -19,7 +22,10 @@ import {
 } from '../src/sources/telegram.js'
 import {
   TelegramTokenValidationError,
+  chunkTelegramHtml,
   chunkText,
+  markdownToTelegramHtml,
+  stripTelegramHtml,
   validateTelegramToken,
 } from '../src/sources/telegram-api.js'
 import type { TelegramUpdate } from '../src/sources/telegram-api.js'
@@ -39,12 +45,16 @@ afterAll(() => {
 interface FakeCall {
   method: string
   body: Record<string, unknown>
+  /** Raw request body (multipart uploads are not JSON). */
+  raw?: string
 }
 
 interface TelegramAnswer {
   status?: number
   headers?: Record<string, string>
   body?: unknown
+  /** Raw bytes (file downloads). */
+  raw?: string | Buffer
   /** Do not answer at all (used to test aborting an in-flight long poll). */
   pending?: boolean
 }
@@ -63,10 +73,18 @@ interface FakeTelegram {
 }
 
 const openServers: FakeTelegram[] = []
+const tempDirs: string[] = []
 
 afterEach(async () => {
   await Promise.all(openServers.splice(0).map(server => server.close()))
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 })
 })
+
+function tempDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), `superagent-${prefix}-`))
+  tempDirs.push(dir)
+  return dir
+}
 
 async function startTelegram(handler: TelegramHandler = () => undefined): Promise<FakeTelegram> {
   const calls: FakeCall[] = []
@@ -75,17 +93,19 @@ async function startTelegram(handler: TelegramHandler = () => undefined): Promis
     req.on('data', (chunk: Buffer) => chunks.push(chunk))
     req.on('end', () => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+      const fileMatch = /^\/file\/bot[^/]+\/(.+)$/.exec(url.pathname)
       const match = /^\/bot[^/]+\/([A-Za-z]+)$/.exec(url.pathname)
-      const method = match?.[1] ?? 'unknown'
-      let body: Record<string, unknown> = {}
-      if (chunks.length > 0) {
+      const method = fileMatch ? 'downloadFile' : (match?.[1] ?? 'unknown')
+      const raw = chunks.length > 0 ? Buffer.concat(chunks).toString('utf8') : undefined
+      let body: Record<string, unknown> = fileMatch ? { filePath: decodeURIComponent(fileMatch[1]!) } : {}
+      if (!fileMatch && raw) {
         try {
-          body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>
+          body = JSON.parse(raw) as Record<string, unknown>
         } catch {
           body = {}
         }
       }
-      calls.push({ method, body })
+      calls.push({ method, body, ...(raw !== undefined ? { raw } : {}) })
       const answer = handler(method, body, calls.length) ?? defaultAnswer(method, body)
       if (!answer) {
         res.writeHead(404, { 'content-type': 'application/json' })
@@ -93,6 +113,11 @@ async function startTelegram(handler: TelegramHandler = () => undefined): Promis
         return
       }
       if (answer.pending) return
+      if (answer.raw !== undefined) {
+        res.writeHead(answer.status ?? 200, { 'content-type': 'application/octet-stream', ...(answer.headers ?? {}) })
+        res.end(answer.raw)
+        return
+      }
       res.writeHead(answer.status ?? 200, { 'content-type': 'application/json', ...(answer.headers ?? {}) })
       res.end(JSON.stringify(answer.body ?? { ok: true, result: true }))
     })
@@ -124,6 +149,19 @@ function defaultAnswer(method: string, body: Record<string, unknown>): TelegramA
       },
     }
   }
+  if (method === 'getUpdates') return { body: { ok: true, result: [] } }
+  if (method === 'setMyCommands') return { body: { ok: true, result: true } }
+  if (method === 'sendPhoto' || method === 'sendDocument') {
+    return {
+      body: {
+        ok: true,
+        result: { message_id: 2, date: 0, chat: { id: Number(body.chat_id ?? 42), type: 'private' } },
+      },
+    }
+  }
+  if (method === 'answerCallbackQuery' || method === 'editMessageReplyMarkup') {
+    return { body: { ok: true, result: true } }
+  }
   return undefined
 }
 
@@ -138,23 +176,29 @@ interface TestContext {
   triggers: Trigger[]
   health: SourceHealth[]
   kv: Map<string, unknown>
+  loggerWarnings: Array<Record<string, unknown>>
 }
 
 interface TestContextOptions {
   /** Override the Engine answer; `undefined` falls back to normal dedupe. */
   receive?: (trigger: Trigger) => Disposition | undefined
+  /** State directory (media downloads); defaults to a throwaway path. */
+  stateDir?: string
 }
 
 function makeContext(id = 'telegram', options: TestContextOptions = {}): TestContext {
   const kv = new Map<string, unknown>()
   const triggers: Trigger[] = []
   const health: SourceHealth[] = []
+  const loggerWarnings: Array<Record<string, unknown>> = []
   const seen = new Set<string>()
   let counter = 0
   const logger: SourceLogger = {
     debug: () => undefined,
     info: () => undefined,
-    warn: () => undefined,
+    warn: (_message: string, extra?: Record<string, unknown>) => {
+      loggerWarnings.push(extra ?? {})
+    },
     error: () => undefined,
   }
   const receive = (trigger: Trigger): Disposition => {
@@ -167,7 +211,7 @@ function makeContext(id = 'telegram', options: TestContextOptions = {}): TestCon
   }
   const ctx = {
     id,
-    stateDir: '/tmp/superagent-sources-test',
+    stateDir: options.stateDir ?? '/tmp/superagent-sources-test',
     now: () => new Date().toISOString(),
     newId: (prefix: string) => `${prefix}-${(counter += 1)}`,
     receive,
@@ -186,7 +230,7 @@ function makeContext(id = 'telegram', options: TestContextOptions = {}): TestCon
       keys: (prefix = '') => [...kv.keys()].filter(key => key.startsWith(prefix)),
     },
   } as SourceContext
-  return { ctx, triggers, health, kv }
+  return { ctx, triggers, health, kv, loggerWarnings }
 }
 
 function textMessage(options: {
@@ -750,5 +794,574 @@ describe('telegram token validation (stateless setup helper)', () => {
 
   it('rejects an empty token without calling the network', async () => {
     await expect(validateTelegramToken('   ')).rejects.toThrow(/empty/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Rich text, files, inline keyboards and topics
+// ---------------------------------------------------------------------------
+
+function nowIso(): string {
+  return new Date().toISOString()
+}
+
+describe('telegram source: rich text', () => {
+  it('converts the markdown subset to Telegram-safe HTML', () => {
+    const html = markdownToTelegramHtml(
+      [
+        '**bold** *italic* `code`',
+        '- one',
+        '- two',
+        '[site](https://example.com/?a=1&b=2)',
+        '```js',
+        'const x = 1 < 2',
+        '```',
+        '& < >',
+      ].join('\n'),
+    )
+    expect(html).toContain('<b>bold</b>')
+    expect(html).toContain('<i>italic</i>')
+    expect(html).toContain('<code>code</code>')
+    expect(html).toContain('• one')
+    expect(html).toContain('<a href="https://example.com/?a=1&amp;b=2">site</a>')
+    expect(html).toContain('<pre><code class="language-js">')
+    expect(html).toContain('const x = 1 &lt; 2')
+    expect(html).toContain('&amp; &lt; &gt;')
+    expect(html).not.toContain('**')
+  })
+
+  it('chunks rendered HTML at 4096 without breaking tags', () => {
+    const html = markdownToTelegramHtml(
+      Array.from({ length: 400 }, (_value, index) => `**word${index}** and some text`).join('\n'),
+    )
+    const chunks = chunkTelegramHtml(html, 4096)
+    expect(chunks.length).toBeGreaterThan(1)
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeLessThanOrEqual(4096)
+      expect((chunk.match(/<b>/g) ?? []).length).toBe((chunk.match(/<\/b>/g) ?? []).length)
+    }
+    expect(stripTelegramHtml(html)).toContain('word399')
+  })
+
+  it('falls back to plain text when Telegram rejects the HTML entities', async () => {
+    let sends = 0
+    const fake = await startTelegram(method => {
+      if (method === 'sendMessage') {
+        sends += 1
+        if (sends === 1) {
+          return {
+            status: 400,
+            body: { ok: false, error_code: 400, description: "Bad Request: can't parse entities" },
+          }
+        }
+      }
+      return undefined
+    })
+    const { ctx } = makeContext()
+    const source = createSource(baseConfig(fake.url), ctx) as TelegramSource
+
+    const outcome = await source.send({
+      id: 'rich-1',
+      purpose: 'answer',
+      channel: { source: 'telegram', thread: 'telegram:dm:42', to: '42' },
+      text: '**bold** & <x>',
+      markdown: 'telegram',
+      at: nowIso(),
+    })
+
+    expect(outcome).toBe('sent')
+    const sendsCalls = fake.callsOf('sendMessage')
+    expect(sendsCalls).toHaveLength(2)
+    expect(sendsCalls[0]!.body.parse_mode).toBe('HTML')
+    expect(sendsCalls[0]!.body.text).toContain('<b>bold</b>')
+    expect(sendsCalls[1]!.body.parse_mode).toBeUndefined()
+    expect(sendsCalls[1]!.body.text).toBe('bold & <x>')
+  })
+})
+
+describe('telegram source: outgoing files', () => {
+  it('sends photo and document attachments with captions', async () => {
+    const dir = tempDir('telegram-attach')
+    const photo = join(dir, 'pixel.png')
+    const document = join(dir, 'report.pdf')
+    writeFileSync(photo, Buffer.from([1, 2, 3, 4]))
+    writeFileSync(document, '%PDF-1.4')
+    const fake = await startTelegram()
+    const { ctx, loggerWarnings } = makeContext('telegram', { stateDir: dir })
+    const source = createSource(baseConfig(fake.url), ctx) as TelegramSource
+
+    const outcome = await source.send({
+      id: 'files-1',
+      purpose: 'notice',
+      channel: { source: 'telegram', thread: 'telegram:dm:42', to: '42' },
+      text: 'here are the files',
+      attachments: [
+        { kind: 'photo', path: photo, caption: 'pixel' },
+        { kind: 'document', path: document, name: 'report.pdf', caption: 'report' },
+      ],
+      at: nowIso(),
+    })
+
+    expect(outcome).toBe('sent')
+    const photoCall = fake.callsOf('sendPhoto')[0]!
+    expect(photoCall.raw).toContain('name="photo"')
+    expect(photoCall.raw).toContain('pixel')
+    expect(photoCall.raw).toContain('here are the files'.length > 0 ? 'caption' : '')
+    const documentCall = fake.callsOf('sendDocument')[0]!
+    expect(documentCall.raw).toContain('name="document"')
+    expect(documentCall.raw).toContain('report.pdf')
+    expect(loggerWarnings).toEqual([])
+  })
+
+  it('keeps the text message when an attachment upload fails', async () => {
+    const dir = tempDir('telegram-attach-fail')
+    const photo = join(dir, 'fail.png')
+    writeFileSync(photo, 'not an image')
+    const fake = await startTelegram(method => {
+      if (method === 'sendPhoto') {
+        return { status: 400, body: { ok: false, error_code: 400, description: 'Bad Request: invalid file' } }
+      }
+      return undefined
+    })
+    const { ctx, loggerWarnings } = makeContext('telegram', { stateDir: dir })
+    const source = createSource(baseConfig(fake.url), ctx) as TelegramSource
+
+    const outcome = await source.send({
+      id: 'files-2',
+      purpose: 'result',
+      channel: { source: 'telegram', thread: 'telegram:dm:42', to: '42' },
+      text: 'text still arrives',
+      attachments: [{ kind: 'photo', path: photo }],
+      at: nowIso(),
+    })
+
+    expect(outcome).toBe('sent')
+    expect(fake.callsOf('sendMessage')).toHaveLength(1)
+    expect(loggerWarnings).toHaveLength(1)
+    expect(String(loggerWarnings[0]!.kind)).toBe('photo')
+  })
+})
+
+describe('telegram source: incoming media', () => {
+  function mediaUpdate(updateId: number, message: Record<string, unknown>): TelegramUpdate {
+    return {
+      update_id: updateId,
+      message: {
+        message_id: updateId,
+        date: 1_730_000_000,
+        from: { id: 42, is_bot: false, first_name: 'Ann', username: 'ann' },
+        chat: { id: 42, type: 'private' },
+        ...message,
+      },
+    } as TelegramUpdate
+  }
+
+  it('downloads the largest photo into <stateDir>/downloads and records it in meta', async () => {
+    const dir = tempDir('telegram-download')
+    const fake = await startTelegram((method, body) => {
+      if (method === 'getFile') {
+        expect(body.file_id).toBe('large')
+        return { body: { ok: true, result: { file_id: 'large', file_path: 'photos/file_42.jpg' } } }
+      }
+      if (method === 'downloadFile') {
+        expect(body.filePath).toBe('photos/file_42.jpg')
+        return { raw: 'JPEGDATA' }
+      }
+      if (method === 'getUpdates') {
+        return {
+          body: {
+            ok: true,
+            result: [
+              mediaUpdate(400, {
+                caption: 'look at this',
+                photo: [
+                  { file_id: 'small', width: 10, height: 10, file_size: 5 },
+                  { file_id: 'large', width: 100, height: 100, file_size: 8 },
+                ],
+              }),
+            ],
+          },
+        }
+      }
+      return undefined
+    })
+    const { ctx, triggers, loggerWarnings } = makeContext('telegram', { stateDir: dir })
+    const source = createSource(baseConfig(fake.url), ctx) as TelegramSource
+
+    const result = await source.pollOnce(new AbortController().signal)
+
+    expect(result.received).toBe(1)
+    expect(triggers).toHaveLength(1)
+    const trigger = triggers[0]!
+    expect(trigger.text).toBe('look at this')
+    const attachments = trigger.meta.attachments as Array<Record<string, unknown>>
+    expect(attachments).toHaveLength(1)
+    expect(attachments[0]).toMatchObject({ kind: 'photo', name: 'photo.jpg', size: 8 })
+    const path = String(attachments[0]!.path)
+    expect(path.startsWith(join(dir, 'downloads'))).toBe(true)
+    expect(readFileSync(path, 'utf8')).toBe('JPEGDATA')
+    expect(loggerWarnings).toEqual([])
+  })
+
+  it('skips media above maxDownloadBytes but still delivers the caption', async () => {
+    const dir = tempDir('telegram-limit')
+    const fake = await startTelegram(method => {
+      if (method === 'getUpdates') {
+        return {
+          body: {
+            ok: true,
+            result: [
+              mediaUpdate(401, {
+                caption: 'too big',
+                document: { file_id: 'huge', file_name: 'huge.zip', file_size: 5_000 },
+              }),
+            ],
+          },
+        }
+      }
+      return undefined
+    })
+    const { ctx, triggers, loggerWarnings } = makeContext('telegram', { stateDir: dir })
+    const source = createSource(baseConfig(fake.url, { maxDownloadBytes: 2_000 }), ctx) as TelegramSource
+
+    await source.pollOnce(new AbortController().signal)
+
+    expect(triggers).toHaveLength(1)
+    expect(triggers[0]!.text).toBe('too big')
+    expect(triggers[0]!.meta.attachments).toBeUndefined()
+    expect(fake.callsOf('getFile')).toHaveLength(0)
+    expect(loggerWarnings).toHaveLength(1)
+    expect(loggerWarnings[0]!.limit).toBe(2_000)
+  })
+
+  it('sanitizes document file names and logs download failures without leaking the token', async () => {
+    const dir = tempDir('telegram-doc')
+    const fake = await startTelegram(method => {
+      if (method === 'getUpdates') {
+        return {
+          body: {
+            ok: true,
+            result: [
+              mediaUpdate(402, {
+                document: { file_id: 'doc', file_name: '../evil name.pdf', file_size: 10 },
+              }),
+            ],
+          },
+        }
+      }
+      if (method === 'getFile') {
+        return { status: 403, body: { ok: false, error_code: 403, description: 'Forbidden: file unavailable' } }
+      }
+      return undefined
+    })
+    const { ctx, triggers, loggerWarnings } = makeContext('telegram', { stateDir: dir })
+    const source = createSource(baseConfig(fake.url), ctx) as TelegramSource
+
+    await source.pollOnce(new AbortController().signal)
+
+    expect(triggers).toHaveLength(1)
+    expect(triggers[0]!.meta.attachments).toBeUndefined()
+    expect(loggerWarnings).toHaveLength(1)
+    expect(String(loggerWarnings[0]!.kind)).toBe('document')
+    expect(JSON.stringify(loggerWarnings)).not.toContain('test-token-not-a-secret')
+  })
+})
+
+describe('telegram source: inline keyboards and advanced', () => {
+  const commands: TelegramCommands = {
+    status: async () => 'ok',
+    pause: async () => 'paused',
+    resume: async () => 'resumed',
+    tickets: async () => 'none',
+    stopTicket: async (ticketId: string) => `stopped ${ticketId}`,
+    retryTicket: async (ticketId: string) => `retried ${ticketId}`,
+  }
+
+  it('attaches actionable buttons to attention and result messages', async () => {
+    const fake = await startTelegram()
+    const { ctx } = makeContext()
+    const source = createSource(baseConfig(fake.url, { commands }), ctx) as TelegramSource
+
+    await source.send({
+      id: 'kb-1',
+      ticketId: 't_1',
+      purpose: 'attention',
+      channel: { source: 'telegram', thread: 'telegram:dm:42', to: '42' },
+      text: 'blocked',
+      at: nowIso(),
+    })
+
+    const send = fake.callsOf('sendMessage')[0]!
+    const markup = JSON.parse(String(send.body.reply_markup)) as {
+      inline_keyboard: Array<Array<{ text: string; callback_data: string }>>
+    }
+    expect(markup.inline_keyboard).toHaveLength(1)
+    expect(markup.inline_keyboard[0]!.map(button => button.callback_data)).toEqual([
+      'sa:ack:t_1',
+      'sa:retry:t_1',
+      'sa:stop:t_1',
+    ])
+  })
+
+  it('routes sa: button callbacks to TelegramCommands and removes the keyboard', async () => {
+    const retried: string[] = []
+    const commandsWithRetry: TelegramCommands = {
+      ...commands,
+      retryTicket: async (ticketId: string) => {
+        retried.push(ticketId)
+        return `retried ${ticketId}`
+      },
+    }
+    const fake = await startTelegram(method => {
+      if (method === 'getUpdates') {
+        return {
+          body: {
+            ok: true,
+            result: [
+              {
+                update_id: 500,
+                callback_query: {
+                  id: 'cb-1',
+                  from: { id: 42, is_bot: false, username: 'ann' },
+                  data: 'sa:retry:t_1',
+                  message: {
+                    message_id: 9,
+                    date: 1_730_000_000,
+                    chat: { id: 42, type: 'private' },
+                    from: { id: 999, is_bot: true, username: 'testbot' },
+                  },
+                },
+              },
+            ],
+          },
+        }
+      }
+      return undefined
+    })
+    const { ctx, triggers } = makeContext()
+    const source = createSource(baseConfig(fake.url, { commands: commandsWithRetry }), ctx) as TelegramSource
+
+    const result = await source.pollOnce(new AbortController().signal)
+
+    expect(result.commands).toBe(1)
+    expect(triggers).toHaveLength(0)
+    expect(retried).toEqual(['t_1'])
+    expect(fake.callsOf('answerCallbackQuery')[0]!.body.text).toBe('retried t_1')
+    const edit = fake.callsOf('editMessageReplyMarkup')[0]!
+    expect(edit.body.message_id).toBe(9)
+    expect(JSON.parse(String(edit.body.reply_markup))).toEqual({ inline_keyboard: [] })
+  })
+
+  it('registers the bot command list once', async () => {
+    const fake = await startTelegram()
+    const { ctx } = makeContext()
+    const source = createSource(baseConfig(fake.url), ctx) as TelegramSource
+
+    await source.pollOnce(new AbortController().signal)
+
+    const registrations = fake.callsOf('setMyCommands')
+    expect(registrations).toHaveLength(1)
+    const list = registrations[0]!.body.commands as Array<{ command: string; description: string }>
+    expect(list.map(item => item.command)).toEqual([
+      'status',
+      'pause',
+      'resume',
+      'tickets',
+      'stop',
+      'retry',
+      'help',
+    ])
+  })
+
+  it('reads and writes forum topic ids', async () => {
+    const fake = await startTelegram(method => {
+      if (method === 'getUpdates') {
+        return {
+          body: {
+            ok: true,
+            result: [
+              {
+                update_id: 600,
+                message: {
+                  message_id: 600,
+                  date: 1_730_000_000,
+                  is_topic_message: true,
+                  message_thread_id: 77,
+                  from: { id: 42, is_bot: false, first_name: 'Ann' },
+                  chat: { id: -1001, type: 'supergroup', title: 'Ops' },
+                  text: '@testbot deploy it',
+                },
+              },
+            ],
+          },
+        }
+      }
+      return undefined
+    })
+    const { ctx, triggers } = makeContext()
+    const source = createSource(baseConfig(fake.url, { chats: ['-1001'] }), ctx) as TelegramSource
+
+    await source.pollOnce(new AbortController().signal)
+
+    expect(triggers).toHaveLength(1)
+    const trigger = triggers[0]!
+    expect(trigger.thread.key).toBe('telegram:chat:-1001:topic:77')
+    expect(trigger.meta.messageThreadId).toBe(77)
+    expect(trigger.channel.replyTo).toBe('600')
+
+    await source.send({
+      id: 'topic-1',
+      purpose: 'notice',
+      channel: trigger.channel,
+      text: 'in topic',
+      at: nowIso(),
+    })
+    const sent = fake.callsOf('sendMessage')[0]!
+    expect(sent.body.message_thread_id).toBe(77)
+  })
+})
+
+describe('telegram source: files and keyboards switches', () => {
+  it('does not send attachments when files is false but keeps the text', async () => {
+    const dir = tempDir('telegram-files-off')
+    const photo = join(dir, 'pixel.png')
+    writeFileSync(photo, Buffer.from([1, 2, 3]))
+    const fake = await startTelegram()
+    const { ctx, loggerWarnings } = makeContext('telegram', { stateDir: dir })
+    const source = createSource(baseConfig(fake.url, { files: false }), ctx) as TelegramSource
+
+    const outcome = await source.send({
+      id: 'files-off-1',
+      purpose: 'result',
+      channel: { source: 'telegram', thread: 'telegram:dm:42', to: '42' },
+      text: 'text still sent',
+      attachments: [{ kind: 'photo', path: photo }],
+      at: nowIso(),
+    })
+
+    expect(outcome).toBe('sent')
+    expect(fake.callsOf('sendMessage')).toHaveLength(1)
+    expect(fake.callsOf('sendPhoto')).toHaveLength(0)
+    expect(fake.callsOf('sendDocument')).toHaveLength(0)
+    expect(loggerWarnings).toEqual([])
+  })
+
+  it('does not upload an attachment-only message when files is false', async () => {
+    const dir = tempDir('telegram-files-only')
+    const document = join(dir, 'report.pdf')
+    writeFileSync(document, '%PDF')
+    const fake = await startTelegram()
+    const { ctx } = makeContext('telegram', { stateDir: dir })
+    const source = createSource(baseConfig(fake.url, { files: false }), ctx) as TelegramSource
+
+    const outcome = await source.send({
+      id: 'files-off-2',
+      purpose: 'result',
+      channel: { source: 'telegram', thread: 'telegram:dm:42', to: '42' },
+      text: '',
+      attachments: [{ kind: 'document', path: document }],
+      at: nowIso(),
+    })
+
+    expect(outcome).toBe('sent')
+    expect(fake.callsOf('sendMessage')).toHaveLength(0)
+    expect(fake.callsOf('sendDocument')).toHaveLength(0)
+  })
+
+  it('does not download incoming media when files is false', async () => {
+    const fake = await startTelegram(method => {
+      if (method === 'getUpdates') {
+        return {
+          body: {
+            ok: true,
+            result: [
+              {
+                update_id: 700,
+                message: {
+                  message_id: 700,
+                  date: 1_730_000_000,
+                  from: { id: 42, is_bot: false, first_name: 'Ann' },
+                  chat: { id: 42, type: 'private' },
+                  caption: 'just the caption',
+                  photo: [{ file_id: 'p1', width: 10, height: 10, file_size: 100 }],
+                },
+              },
+            ],
+          },
+        }
+      }
+      return undefined
+    })
+    const { ctx, triggers } = makeContext()
+    const source = createSource(baseConfig(fake.url, { files: false }), ctx) as TelegramSource
+
+    await source.pollOnce(new AbortController().signal)
+
+    expect(triggers).toHaveLength(1)
+    expect(triggers[0]!.text).toBe('just the caption')
+    expect(triggers[0]!.meta.attachments).toBeUndefined()
+    expect(fake.callsOf('getFile')).toHaveLength(0)
+  })
+
+  it('does not attach or handle inline keyboards when keyboards is false', async () => {
+    const retried: string[] = []
+    const commands: TelegramCommands = {
+      status: async () => 'ok',
+      pause: async () => 'paused',
+      resume: async () => 'resumed',
+      tickets: async () => 'none',
+      stopTicket: async (ticketId: string) => `stopped ${ticketId}`,
+      retryTicket: async (ticketId: string) => {
+        retried.push(ticketId)
+        return `retried ${ticketId}`
+      },
+    }
+    const fake = await startTelegram(method => {
+      if (method === 'getUpdates') {
+        return {
+          body: {
+            ok: true,
+            result: [
+              {
+                update_id: 701,
+                callback_query: {
+                  id: 'cb-off',
+                  from: { id: 42, is_bot: false, username: 'ann' },
+                  data: 'sa:retry:t_1',
+                  message: {
+                    message_id: 10,
+                    date: 1_730_000_000,
+                    chat: { id: 42, type: 'private' },
+                    from: { id: 999, is_bot: true, username: 'testbot' },
+                  },
+                },
+              },
+            ],
+          },
+        }
+      }
+      return undefined
+    })
+    const { ctx, triggers } = makeContext()
+    const source = createSource(baseConfig(fake.url, { commands, keyboards: false }), ctx) as TelegramSource
+
+    // Outgoing attention message: no inline keyboard is attached.
+    await source.send({
+      id: 'kb-off-1',
+      ticketId: 't_1',
+      purpose: 'attention',
+      channel: { source: 'telegram', thread: 'telegram:dm:42', to: '42' },
+      text: 'blocked',
+      at: nowIso(),
+    })
+    expect(fake.callsOf('sendMessage')[0]!.body.reply_markup).toBeUndefined()
+
+    // Incoming sa: callback: ignored entirely, no command and no callback answer.
+    const result = await source.pollOnce(new AbortController().signal)
+    expect(result.commands).toBe(0)
+    expect(triggers).toHaveLength(0)
+    expect(retried).toEqual([])
+    expect(fake.callsOf('answerCallbackQuery')).toHaveLength(0)
+    expect(fake.callsOf('editMessageReplyMarkup')).toHaveLength(0)
   })
 })

@@ -30,6 +30,8 @@ import type {
   ThreadRef,
   Trigger,
 } from '../core/model.js'
+import { join } from 'node:path'
+
 import type { Source, SourceContext, SourceHealthState, SourceKind } from './kind.js'
 import { makeTrigger } from './kind.js'
 import {
@@ -60,6 +62,17 @@ const HELP_TEXT = [
   '/retry <ticketId> — 重试一个 Ticket',
   '/help — 显示这条帮助',
 ].join('\n')
+
+/** Commands registered with the Bot API (`setMyCommands`) at start-up. */
+const BOT_COMMANDS = [
+  { command: 'status', description: '运行状态' },
+  { command: 'pause', description: '暂停接单' },
+  { command: 'resume', description: '恢复接单' },
+  { command: 'tickets', description: '查看 Ticket' },
+  { command: 'stop', description: '停止 Ticket' },
+  { command: 'retry', description: '重试 Ticket' },
+  { command: 'help', description: '帮助' },
+]
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -100,6 +113,20 @@ export interface TelegramConfig {
    * chat history into Tickets.
    */
   processBacklog?: boolean
+  /** Render `markdown: 'telegram'` messages as Telegram HTML. Default true. */
+  richText?: boolean
+  /**
+   * Allow sending outgoing attachments and downloading incoming media.
+   * Default true; false keeps the Source text-only (captions still arrive).
+   */
+  files?: boolean
+  /**
+   * Attach inline keyboards to attention/result messages and handle their
+   * `sa:` button callbacks. Default true.
+   */
+  keyboards?: boolean
+  /** Refuse to download media larger than this many bytes (default 20 MB). */
+  maxDownloadBytes?: number
   /** Commands handler injected by the runtime (see {@link TelegramCommands}). */
   commands?: TelegramCommands
 }
@@ -116,6 +143,10 @@ interface NormalizedTelegramConfig {
   observeAllChatMessages: boolean
   replyToMessages: boolean
   processBacklog: boolean
+  richText: boolean
+  files: boolean
+  keyboards: boolean
+  maxDownloadBytes: number
   mentionPattern?: string
   commands?: TelegramCommands
 }
@@ -144,6 +175,10 @@ export function normalizeTelegramConfig(config: TelegramConfig = {}): Normalized
     observeAllChatMessages: config.observeAllChatMessages === true,
     replyToMessages: config.replyToMessages === true,
     processBacklog: config.processBacklog === true,
+    richText: config.richText !== false,
+    files: config.files !== false,
+    keyboards: config.keyboards !== false,
+    maxDownloadBytes: clampNumber(config.maxDownloadBytes ?? 20 * 1024 * 1024, 1024, 100 * 1024 * 1024),
     ...(config.mentionPattern?.trim() ? { mentionPattern: config.mentionPattern.trim() } : {}),
     ...(config.commands ? { commands: config.commands } : {}),
   }
@@ -171,6 +206,8 @@ export interface TelegramCommands {
   tickets(): Promise<string>
   stopTicket(ticketId: string): Promise<string>
   retryTicket(ticketId: string): Promise<string>
+  /** Optional: acknowledge a ticket from an inline `✅` button (toast only). */
+  ack?(ticketId: string): Promise<string> | string | void
 }
 
 /**
@@ -258,6 +295,37 @@ function chatLabel(chat: TelegramMessage['chat']): string {
 
 type Handled = 'received' | 'command' | 'filtered' | 'ignored' | 'failed'
 
+interface MediaItem {
+  kind: 'photo' | 'document' | 'voice' | 'audio' | 'video'
+  fileId: string
+  size?: number
+  name?: string
+  mime?: string
+}
+
+interface MediaAttachment {
+  kind: string
+  path: string
+  name: string
+  mime?: string
+  size: number
+}
+
+/** Keep only basename-safe characters; the download path is built from it. */
+function safeFileName(name: string): string {
+  const base = name.split(/[\\/]/).pop() ?? 'file'
+  const cleaned = base.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '')
+  return (cleaned || 'file').slice(0, 80)
+}
+
+/** Topic (forum thread) id encoded in a group Thread key, if any. */
+function threadIdOf(thread: string | undefined): number | undefined {
+  const match = /:topic:(\d+)$/.exec(thread ?? '')
+  if (!match) return undefined
+  const value = Number(match[1])
+  return Number.isSafeInteger(value) ? value : undefined
+}
+
 export interface TelegramPollResult {
   updates: number
   received: number
@@ -276,6 +344,8 @@ export class TelegramSource implements Source {
   private controller: AbortController | undefined
   private loopPromise: Promise<void> | undefined
   private lastHealth: SourceHealthState = 'off'
+  /** `setMyCommands` is registered once per process, on the first poll. */
+  private commandsRegistered = false
 
   constructor(config: TelegramConfig, ctx: SourceContext) {
     this.ctx = ctx
@@ -391,6 +461,15 @@ export class TelegramSource implements Source {
   async pollOnce(signal: AbortSignal): Promise<TelegramPollResult> {
     const api = this.getApi()
     if (!this.bot) this.bot = await api.getMe(signal)
+    if (!this.commandsRegistered) {
+      this.commandsRegistered = true
+      try {
+        await api.setMyCommands(BOT_COMMANDS, signal)
+      } catch (error) {
+        if (signal.aborted || isAbortError(error)) throw error
+        this.ctx.logger.warn('telegram: setMyCommands failed', { error: describeError(error) })
+      }
+    }
     // Fresh install: only the latest pending update is read (`offset = -1`),
     // so up to 24h of Bot API backlog never becomes a burst of Tickets.
     const storedOffset = this.ctx.kv.get<number>(OFFSET_KEY)
@@ -452,9 +531,10 @@ export class TelegramSource implements Source {
   private async handleUpdate(update: TelegramUpdate, api: TelegramApi, signal: AbortSignal): Promise<Handled> {
     const message = update.message
     if (!message) {
-      // Edits and channel posts are intentionally ignored.
+      // Edits and channel posts are intentionally ignored; button presses are
+      // handled here (inline keyboard actions never become Triggers).
       const callback = update.callback_query
-      if (callback && this.config.observeCallbacks) return this.handleCallback(callback, api, signal)
+      if (callback) return this.handleCallback(callback, api, signal)
       return 'ignored'
     }
     const from = message.from
@@ -467,6 +547,7 @@ export class TelegramSource implements Source {
     if (!isPrivate && !this.isAllowedChat(chatId)) return 'filtered'
 
     const text = (message.text ?? message.caption ?? '').trim()
+    const media = this.mediaOf(message)
     const addressed = this.isAddressed(message, text, isPrivate)
     if (!isPrivate && !addressed && !this.config.observeAllChatMessages) return 'filtered'
 
@@ -483,8 +564,19 @@ export class TelegramSource implements Source {
     // Unknown slash commands are not conversation: ignore them instead of
     // turning a typo into a Ticket.
     if (text.startsWith('/')) return 'filtered'
-    if (!text) return 'ignored'
-    return this.offer(this.buildMessageTrigger(message))
+    if (!text && (media.length === 0 || !this.config.files)) return 'ignored'
+    // Media is downloaded before the Trigger is offered, so the Engine and its
+    // worker can read the files from disk. A failed download never drops text.
+    // `files: false` keeps the Source text-only (caption/message still arrives).
+    const attachments =
+      this.config.files && media.length > 0 ? await this.downloadMedia(message, media, api, signal) : []
+    if (!this.config.files && media.length > 0) {
+      this.ctx.logger.debug('telegram: files disabled; incoming media is not downloaded', {
+        chatId,
+        messageId: message.message_id,
+      })
+    }
+    return this.offer(this.buildMessageTrigger(message, attachments))
   }
 
   /**
@@ -510,18 +602,21 @@ export class TelegramSource implements Source {
     return 'received'
   }
 
-  private buildMessageTrigger(message: TelegramMessage): Trigger {
+  private buildMessageTrigger(message: TelegramMessage, attachments: MediaAttachment[] = []): Trigger {
     const from = message.from!
     const userId = String(from.id)
     const chatId = String(message.chat.id)
     const isPrivate = message.chat.type === 'private'
     const text = (message.text ?? message.caption ?? '').trim()
+    const topicId = message.is_topic_message === true && typeof message.message_thread_id === 'number'
+      ? message.message_thread_id
+      : undefined
     const thread: ThreadRef = isPrivate
       ? { key: `telegram:dm:${userId}`, source: TELEGRAM_SOURCE, label: `DM ${displayName(from) ?? userId}` }
       : {
-          key: `telegram:chat:${chatId}`,
+          key: topicId !== undefined ? `telegram:chat:${chatId}:topic:${topicId}` : `telegram:chat:${chatId}`,
           source: TELEGRAM_SOURCE,
-          label: message.chat.title ?? `chat ${chatId}`,
+          label: `${message.chat.title ?? `chat ${chatId}`}${topicId !== undefined ? ` · topic ${topicId}` : ''}`,
         }
     const addressed = this.isAddressed(message, text, isPrivate) ? (isPrivate ? 'direct' : 'mention') : 'none'
     return makeTrigger(`telegram:msg:${chatId}:${message.message_id}`, TELEGRAM_SOURCE, {
@@ -543,8 +638,10 @@ export class TelegramSource implements Source {
         userId,
         ...(from.username ? { username: from.username } : {}),
         date: message.date,
+        ...(topicId !== undefined ? { messageThreadId: topicId } : {}),
         ...(message.reply_to_message ? { replyToMessageId: message.reply_to_message.message_id } : {}),
         ...(isPrivate ? {} : { chatTitle: chatLabel(message.chat) }),
+        ...(attachments.length > 0 ? { attachments } : {}),
       },
     })
   }
@@ -561,6 +658,14 @@ export class TelegramSource implements Source {
     const chatId = String(message?.chat.id ?? callback.from.id)
     const isPrivate = !message || message.chat.type === 'private'
     if (!isPrivate && !this.isAllowedChat(chatId)) return 'filtered'
+    // Inline-keyboard actions (`sa:<action>:<ticketId>`) are handled locally:
+    // they call TelegramCommands and never become Triggers/Evals. With
+    // `keyboards: false` they are ignored entirely.
+    if (callback.data?.startsWith('sa:')) {
+      if (!this.config.keyboards) return 'ignored'
+      return this.handleInlineAction(callback, api, signal)
+    }
+    if (!callback.data || !this.config.observeCallbacks) return 'ignored'
     try {
       // Best effort: without an answer the client keeps a spinner.
       await api.answerCallbackQuery({ callbackQueryId: callback.id, text: '' }, signal)
@@ -568,30 +673,175 @@ export class TelegramSource implements Source {
       if (isAbortError(error) && signal.aborted) throw error
       this.ctx.logger.debug('telegram: answerCallbackQuery failed', { error: describeError(error) })
     }
-    if (!callback.data) return 'ignored'
     const thread: ThreadRef = isPrivate
       ? { key: `telegram:dm:${userId}`, source: TELEGRAM_SOURCE, label: `DM ${displayName(callback.from) ?? userId}` }
       : { key: `telegram:chat:${chatId}`, source: TELEGRAM_SOURCE, label: message?.chat.title ?? `chat ${chatId}` }
     const trigger = makeTrigger(`telegram:callback:${callback.id}`, TELEGRAM_SOURCE, {
-        kind: 'callback',
-        at: message ? messageAt(message, this.ctx.now()) : this.ctx.now(),
-        thread,
-        actor: {
-          id: userId,
-          ...(displayName(callback.from) ? { name: displayName(callback.from)! } : {}),
-          bot: callback.from.is_bot === true,
-        },
-        addressed: 'direct',
-        text: callback.data,
-        channel: this.channelFor(thread, message),
-        meta: {
-          chatId,
-          callbackQueryId: callback.id,
-          ...(message ? { messageId: message.message_id } : {}),
-          userId,
-        },
+      kind: 'callback',
+      at: message ? messageAt(message, this.ctx.now()) : this.ctx.now(),
+      thread,
+      actor: {
+        id: userId,
+        ...(displayName(callback.from) ? { name: displayName(callback.from)! } : {}),
+        bot: callback.from.is_bot === true,
+      },
+      addressed: 'direct',
+      text: callback.data,
+      channel: this.channelFor(thread, message),
+      meta: {
+        chatId,
+        callbackQueryId: callback.id,
+        ...(message ? { messageId: message.message_id } : {}),
+        userId,
+      },
     })
     return this.offer(trigger)
+  }
+
+  /** `sa:ack|retry|stop:<ticketId>` from an inline keyboard button. */
+  private async handleInlineAction(
+    callback: TelegramCallbackQuery,
+    api: TelegramApi,
+    signal: AbortSignal,
+  ): Promise<Handled> {
+    const match = /^sa:(ack|retry|stop):([A-Za-z0-9_-]+)$/.exec(callback.data ?? '')
+    if (!match) return 'ignored'
+    const action = match[1] as 'ack' | 'retry' | 'stop'
+    const ticketId = match[2]!
+    const handler = this.config.commands ?? fallbackCommands
+    let toast = '已处理'
+    try {
+      if (!handler) {
+        toast = COMMAND_UNAVAILABLE
+      } else if (action === 'ack') {
+        const text = await handler.ack?.(ticketId)
+        toast = typeof text === 'string' && text.trim() ? text.trim() : '已处理'
+      } else if (action === 'retry') {
+        toast = (await handler.retryTicket(ticketId)).trim() || '已重试'
+      } else {
+        toast = (await handler.stopTicket(ticketId)).trim() || '已停止'
+      }
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) throw error
+      this.ctx.logger.warn('telegram: inline action failed', { action, ticketId, error: describeError(error) })
+      toast = '操作失败，请稍后重试'
+    }
+    try {
+      await api.answerCallbackQuery({ callbackQueryId: callback.id, text: toast.slice(0, 180) }, signal)
+    } catch (error) {
+      if (isAbortError(error) && signal.aborted) throw error
+      this.ctx.logger.debug('telegram: answerCallbackQuery failed', { error: describeError(error) })
+    }
+    const message = callback.message
+    if (message) {
+      try {
+        // The button did its job; remove the keyboard so it cannot be pressed twice.
+        await api.editMessageReplyMarkup(
+          { chatId: String(message.chat.id), messageId: message.message_id, replyMarkup: { inline_keyboard: [] } },
+          signal,
+        )
+      } catch (error) {
+        if (isAbortError(error) && signal.aborted) throw error
+        this.ctx.logger.debug('telegram: editMessageReplyMarkup failed', { error: describeError(error) })
+      }
+    }
+    return 'command'
+  }
+
+  // -------------------------------------------------------------------------
+  // Media (incoming photo / document / voice / audio / video)
+  // -------------------------------------------------------------------------
+
+  /** Largest photo, document, voice, audio and video of one message. */
+  private mediaOf(message: TelegramMessage): MediaItem[] {
+    const media: MediaItem[] = []
+    if (Array.isArray(message.photo) && message.photo.length > 0) {
+      const largest = [...message.photo].sort((left, right) => right.width * right.height - left.width * left.height)[0]!
+      media.push({
+        kind: 'photo',
+        fileId: largest.file_id,
+        ...(largest.file_size !== undefined ? { size: largest.file_size } : {}),
+        name: 'photo.jpg',
+        mime: 'image/jpeg',
+      })
+    }
+    if (message.document) {
+      media.push({
+        kind: 'document',
+        fileId: message.document.file_id,
+        ...(message.document.file_size !== undefined ? { size: message.document.file_size } : {}),
+        ...(message.document.file_name ? { name: message.document.file_name } : {}),
+        ...(message.document.mime_type ? { mime: message.document.mime_type } : {}),
+      })
+    }
+    for (const [kind, item] of [
+      ['voice', message.voice],
+      ['audio', message.audio],
+      ['video', message.video],
+    ] as const) {
+      if (!item) continue
+      media.push({
+        kind,
+        fileId: item.file_id,
+        ...(item.file_size !== undefined ? { size: item.file_size } : {}),
+        ...(item.file_name ? { name: item.file_name } : {}),
+        ...(item.mime_type ? { mime: item.mime_type } : {}),
+      })
+    }
+    return media
+  }
+
+  /**
+   * Download media into `<stateDir>/downloads/`. Each file is size-checked,
+   * written 0600 in a 0700 directory, and a failure is only logged: the
+   * Trigger (caption text) is still delivered.
+   */
+  private async downloadMedia(
+    message: TelegramMessage,
+    media: MediaItem[],
+    api: TelegramApi,
+    signal: AbortSignal,
+  ): Promise<MediaAttachment[]> {
+    const attachments: MediaAttachment[] = []
+    for (const item of media) {
+      if (signal.aborted) throw abortError()
+      if (item.size !== undefined && item.size > this.config.maxDownloadBytes) {
+        this.ctx.logger.warn('telegram: media exceeds maxDownloadBytes; skipped', {
+          kind: item.kind,
+          size: item.size,
+          limit: this.config.maxDownloadBytes,
+        })
+        continue
+      }
+      try {
+        const file = await api.getFile(item.fileId, signal)
+        if (!file.file_path) {
+          this.ctx.logger.warn('telegram: getFile returned no file_path', { kind: item.kind })
+          continue
+        }
+        const fallbackName = file.file_path.split('/').pop() ?? `${item.kind}-${message.message_id}`
+        const name = safeFileName(item.name ?? fallbackName)
+        const destination = join(this.ctx.stateDir, 'downloads', `${message.message_id}-${name}`)
+        const downloaded = await api.downloadFile(file.file_path, destination, {
+          maxBytes: this.config.maxDownloadBytes,
+          signal,
+        })
+        attachments.push({
+          kind: item.kind,
+          path: destination,
+          name,
+          ...(item.mime ? { mime: item.mime } : {}),
+          size: downloaded.bytes,
+        })
+      } catch (error) {
+        if (signal.aborted || isAbortError(error)) throw error
+        this.ctx.logger.warn('telegram: media download failed', {
+          kind: item.kind,
+          error: describeError(error),
+        })
+      }
+    }
+    return attachments
   }
 
   // -------------------------------------------------------------------------
@@ -671,8 +921,11 @@ export class TelegramSource implements Source {
     return {
       source: TELEGRAM_SOURCE,
       thread: thread.key,
-      to: message ? String(message.chat.id) : thread.key.replace(/^telegram:(?:dm|chat):/, ''),
-      ...(message && this.config.replyToMessages ? { replyTo: String(message.message_id) } : {}),
+      to: message
+        ? String(message.chat.id)
+        : thread.key.replace(/^telegram:(?:dm|chat):/, '').replace(/:topic:\d+$/, ''),
+      // Map the source message so outbound replies can thread under it.
+      ...(message ? { replyTo: String(message.message_id) } : {}),
     }
   }
 
@@ -684,34 +937,101 @@ export class TelegramSource implements Source {
     const chatId = message.channel.to
     if (!this.isAllowedChat(chatId)) return 'gone'
     const api = this.getApi()
-    try {
-      if (!this.bot) this.bot = await api.getMe(this.controller?.signal)
-      const replyTo = this.config.replyToMessages ? Number(message.channel.replyTo) : undefined
-      await api.sendMessage({
-        chatId,
-        text: message.text,
-        markdown: message.markdown ?? 'plain',
-        ...(replyTo !== undefined && Number.isFinite(replyTo) ? { replyToMessageId: replyTo } : {}),
-        signal: this.controller?.signal,
-      })
-      return 'sent'
-    } catch (error) {
-      if (error instanceof TelegramTokenError) throw error
-      if (error instanceof TelegramApiError) {
-        // 403: the bot was blocked / kicked; 400 with these texts is permanent.
-        if (error.code === 403) return 'gone'
-        if (error.code === 400 && /chat not found|user is deactivated|PEER_ID_INVALID|bot was blocked/i.test(error.description)) {
-          return 'gone'
-        }
+    const replyTo = this.config.replyToMessages ? Number(message.channel.replyTo) : undefined
+    const topicId = threadIdOf(message.channel.thread)
+    const replyMarkup = this.keyboardFor(message)
+    const text = message.text ?? ''
+    let delivered = false
+    let firstError: unknown
+    if (text.trim()) {
+      try {
+        if (!this.bot) this.bot = await api.getMe(this.controller?.signal)
+        await api.sendMessage({
+          chatId,
+          text,
+          markdown: message.markdown ?? 'plain',
+          rich: this.config.richText,
+          ...(replyTo !== undefined && Number.isFinite(replyTo) ? { replyToMessageId: replyTo } : {}),
+          ...(topicId !== undefined ? { messageThreadId: topicId } : {}),
+          ...(replyMarkup !== undefined ? { replyMarkup } : {}),
+          signal: this.controller?.signal,
+        })
+        delivered = true
+      } catch (error) {
+        firstError = error
+        if (isPermanentTelegramError(error)) return 'gone'
       }
-      // Everything else is retryable by the Outbox.
-      throw error
+    }
+    // Attachments are best effort: a failed upload never blocks the text, and
+    // `files: false` skips them entirely (the text still goes out).
+    const attachments = this.config.files ? (message.attachments ?? []) : []
+    if (!this.config.files && (message.attachments?.length ?? 0) > 0) {
+      this.ctx.logger.debug('telegram: files disabled; outgoing attachments are not sent', {
+        count: message.attachments!.length,
+      })
+    }
+    for (let index = 0; index < attachments.length; index += 1) {
+      const attachment = attachments[index]!
+      try {
+        const options = {
+          chatId,
+          path: attachment.path,
+          ...(attachment.name ? { name: attachment.name } : {}),
+          ...(attachment.caption ? { caption: attachment.caption } : {}),
+          ...(attachment.mime ? { mime: attachment.mime } : {}),
+          ...(topicId !== undefined ? { messageThreadId: topicId } : {}),
+          ...(index === 0 && replyMarkup !== undefined ? { replyMarkup } : {}),
+          signal: this.controller?.signal,
+        }
+        if (attachment.kind === 'photo') await api.sendPhoto(options)
+        else await api.sendDocument(options)
+        delivered = true
+      } catch (error) {
+        this.ctx.logger.warn('telegram: attachment send failed', {
+          kind: attachment.kind,
+          name: attachment.name ?? attachment.path,
+          error: describeError(error),
+        })
+      }
+    }
+    if (delivered) return 'sent'
+    if (attachments.length === 0 && !text.trim()) return 'sent'
+    if (firstError) {
+      if (firstError instanceof TelegramTokenError) throw firstError
+      throw firstError
+    }
+    return 'failed'
+  }
+
+  /** Inline keyboard for messages that ask the owner to act on a Ticket. */
+  private keyboardFor(message: OutboundMessage): unknown | undefined {
+    if (!this.config.keyboards) return undefined
+    if (!message.ticketId) return undefined
+    if (message.purpose !== 'attention' && message.purpose !== 'result') return undefined
+    const id = message.ticketId
+    return {
+      inline_keyboard: [
+        [
+          { text: '✅ 已处理', callback_data: `sa:ack:${id}` },
+          { text: '🔁 重试', callback_data: `sa:retry:${id}` },
+          { text: '⏹ 停止', callback_data: `sa:stop:${id}` },
+        ],
+      ],
     }
   }
 
   channelAllowed(channel: ChannelAddress): boolean {
     return channel.source === TELEGRAM_SOURCE && this.isAllowedChat(channel.to)
   }
+}
+
+function isPermanentTelegramError(error: unknown): boolean {
+  if (!(error instanceof TelegramApiError)) return false
+  if (error.code === 403) return true
+  return (
+    error.code === 400 &&
+    /chat not found|user is deactivated|PEER_ID_INVALID|bot was blocked/i.test(error.description)
+  )
 }
 
 function messageAt(message: TelegramMessage, fallback: IsoTime): IsoTime {

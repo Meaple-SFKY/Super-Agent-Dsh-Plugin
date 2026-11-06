@@ -1372,6 +1372,165 @@ describe('github source: sending', () => {
 // ---------------------------------------------------------------------------
 
 describe('github api client', () => {
+  it('lists, creates and updates issues', async () => {
+    const fake = await startGithub(request => {
+      if (request.method === 'GET' && request.path === '/repos/o/r/issues') {
+        return { body: [makeIssue(1), makeIssue(2)] }
+      }
+      if (request.method === 'POST' && request.path === '/repos/o/r/issues') {
+        const body = request.body as Record<string, unknown>
+        return { status: 201, body: makeIssue(3, { title: String(body.title), body: String(body.body ?? '') }) }
+      }
+      if (request.method === 'PATCH' && request.path === '/repos/o/r/issues/3') {
+        const body = request.body as Record<string, unknown>
+        return { body: makeIssue(3, { state: String(body.state ?? 'open'), updated_at: iso() }) }
+      }
+      return undefined
+    })
+    const api = new GithubApi({ token: 'token', baseUrl: fake.url, maxAttempts: 1 })
+
+    const listed = await api.listIssues('o/r', { state: 'all', labels: ['bug', 'p1'], assignee: 'alice' })
+    expect(listed.items.map(issue => issue.number)).toEqual([1, 2])
+    const query = fake.requestsTo('/repos/o/r/issues')[0]!.query
+    expect(query.get('state')).toBe('all')
+    expect(query.get('labels')).toBe('bug,p1')
+    expect(query.get('assignee')).toBe('alice')
+
+    const created = await api.createIssue('o/r', {
+      title: 'New issue',
+      body: 'details',
+      labels: ['bug'],
+      assignees: ['alice'],
+    })
+    expect(created.number).toBe(3)
+    const post = fake.requests.find(entry => entry.method === 'POST' && entry.path === '/repos/o/r/issues')!
+    expect(post.body).toEqual({ title: 'New issue', body: 'details', labels: ['bug'], assignees: ['alice'] })
+
+    const updated = await api.updateIssue('o/r', 3, { state: 'closed', labels: ['done'] })
+    expect(updated.state).toBe('closed')
+    const patch = fake.requests.find(entry => entry.method === 'PATCH')!
+    expect(patch.body).toEqual({ state: 'closed', labels: ['done'] })
+  })
+
+  it('lists pulls, files, reviews and merges a pull request', async () => {
+    const fake = await startGithub(request => {
+      if (request.method === 'GET' && request.path === '/repos/o/r/pulls') {
+        return { body: [makePull(5, { head: { ref: 'feature', sha: 'abc' }, base: { ref: 'main', sha: 'def' } })] }
+      }
+      if (request.method === 'GET' && request.path === '/repos/o/r/pulls/5/files') {
+        return {
+          body: [
+            {
+              filename: 'src/index.ts',
+              status: 'modified',
+              additions: 3,
+              deletions: 1,
+              changes: 4,
+              patch: 'x'.repeat(5_000),
+              blob_url: 'https://github.com/o/r/blob/abc/src/index.ts',
+              raw_url: 'https://github.com/o/r/raw/abc/src/index.ts',
+            },
+          ],
+        }
+      }
+      if (request.method === 'POST' && request.path === '/repos/o/r/pulls/5/reviews') {
+        return { status: 201, body: { id: 9, state: 'APPROVED', html_url: 'https://github.com/o/r/pull/5#pullrequestreview-9' } }
+      }
+      if (request.method === 'PUT' && request.path === '/repos/o/r/pulls/5/merge') {
+        return { body: { merged: true, sha: 'mergesha', message: 'Pull Request successfully merged' } }
+      }
+      return undefined
+    })
+    const api = new GithubApi({ token: 'token', baseUrl: fake.url, maxAttempts: 1 })
+
+    const pulls = await api.listPulls('o/r', { state: 'all', head: 'o:feature', base: 'main' })
+    expect(pulls.items.map(pull => pull.number)).toEqual([5])
+    const pullsQuery = fake.requestsTo('/repos/o/r/pulls')[0]!.query
+    expect(pullsQuery.get('state')).toBe('all')
+    expect(pullsQuery.get('head')).toBe('o:feature')
+    expect(pullsQuery.get('base')).toBe('main')
+
+    const files = await api.getPullFiles('o/r', 5)
+    expect(files).toHaveLength(1)
+    expect(files[0]).toMatchObject({
+      filename: 'src/index.ts',
+      status: 'modified',
+      additions: 3,
+      deletions: 1,
+      changes: 4,
+      blob_url: 'https://github.com/o/r/blob/abc/src/index.ts',
+    })
+    expect(files[0]!.patch!.length).toBeLessThan(5_000)
+    expect(files[0]!.patch).toContain('[truncated]')
+
+    const review = await api.createPullReview('o/r', 5, {
+      event: 'REQUEST_CHANGES',
+      body: 'please fix',
+      comments: [{ path: 'src/index.ts', line: 2, body: 'nit' }],
+    })
+    expect(review).toMatchObject({ id: 9, state: 'APPROVED' })
+    const reviewPost = fake.requests.find(entry => entry.method === 'POST' && entry.path.endsWith('/reviews'))!
+    expect(reviewPost.body).toEqual({
+      event: 'REQUEST_CHANGES',
+      body: 'please fix',
+      comments: [{ path: 'src/index.ts', line: 2, body: 'nit' }],
+    })
+
+    const merged = await api.mergePull('o/r', 5, { merge_method: 'squash', commit_title: 'squash it' })
+    expect(merged).toMatchObject({ merged: true, sha: 'mergesha' })
+    const mergePut = fake.requests.find(entry => entry.method === 'PUT')!
+    expect(mergePut.body).toEqual({ merge_method: 'squash', commit_title: 'squash it' })
+  })
+
+  it('searches issues and pull requests with pagination and a total count', async () => {
+    const fake = await startGithub(request => {
+      if (request.path !== '/search/issues') return undefined
+      const page = Number(request.query.get('page') ?? '1')
+      if (page === 1) {
+        return {
+          body: { total_count: 2, items: [makeIssue(1)] },
+          headers: { link: `<${fake.url}/search/issues?per_page=2&page=2>; rel="next"` },
+        }
+      }
+      return { body: { total_count: 2, items: [makeIssue(2)] } }
+    })
+    const api = new GithubApi({ token: 'token', baseUrl: fake.url, maxAttempts: 1 })
+
+    const result = await api.searchIssues('repo:o/r is:open label:bug', { perPage: 2, maxPages: 2 })
+
+    expect(result.total_count).toBe(2)
+    expect(result.items.map(issue => issue.number)).toEqual([1, 2])
+    expect(fake.requestsTo('/search/issues')[0]!.query.get('q')).toBe('repo:o/r is:open label:bug')
+  })
+
+  it('maps write failures to structured, token-free GithubApiError', async () => {
+    const fake = await startGithub(request => {
+      if (request.method === 'POST' && request.path === '/repos/o/r/issues') {
+        return { status: 422, body: { message: 'Validation Failed', errors: [{ message: 'labels is invalid' }] } }
+      }
+      if (request.method === 'PUT' && request.path === '/repos/o/r/pulls/5/merge') {
+        return { status: 405, body: { message: 'Pull Request is not mergeable' } }
+      }
+      if (request.method === 'GET' && request.path === '/repos/o/r/issues') {
+        return { status: 401, body: { message: 'Bad credentials' } }
+      }
+      return undefined
+    })
+    const api = new GithubApi({ token: 'write-secret-token', baseUrl: fake.url, maxAttempts: 1 })
+
+    await expect(api.createIssue('o/r', { title: 'x' })).rejects.toMatchObject({ status: 422 })
+    await expect(api.mergePull('o/r', 5)).rejects.toMatchObject({ status: 405 })
+    await expect(api.listIssues('o/r')).rejects.toMatchObject({ status: 401 })
+    for (const error of await Promise.all([
+      api.createIssue('o/r', { title: 'x' }).catch(caught => caught),
+      api.mergePull('o/r', 5).catch(caught => caught),
+      api.listIssues('o/r').catch(caught => caught),
+    ])) {
+      expect(error).toBeInstanceOf(GithubApiError)
+      expect(String(error)).not.toContain('write-secret-token')
+    }
+  })
+
   it('marks pull request bodies it creates exactly once', async () => {
     const fake = await startGithub(request => {
       if (request.method === 'POST' && request.path === '/repos/o/r/pulls') {
