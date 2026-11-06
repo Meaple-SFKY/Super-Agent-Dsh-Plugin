@@ -26,7 +26,7 @@
 
 1. 在 Telegram 里找 [@BotFather](https://t.me/BotFather)，发送 `/newbot`，按提示取名字。
 2. BotFather 返回的 token 形如 `123456789:AA...`。**只复制一次**，直接进入下一步，不要发到任何聊天窗口。
-3. 拿到后立刻保存为本地文件：
+3. 拿到后立刻保存为本地文件（**如果打算用面板向导，可跳过这一步**：向导会在校验通过后自动写入 `<stateDir>/secrets/telegram-token`）：
 
 ```sh
 mkdir -p ~/.config/superagent && chmod 700 ~/.config/superagent
@@ -47,7 +47,7 @@ chmod 600 ~/.config/superagent/telegram-token
    - **Pull requests: Read and write**（读 PR、发 review 评论）
    - **Metadata: Read**（必选，自动带上）
    - 需要看 CI 时加 **Actions: Read**（推荐，必需）；**Checks: Read** 可选——没有 Checks 权限时会自动只用 Actions runs，两者都没有才会报错。
-4. 生成后同样只显示一次，保存：
+4. 生成后同样只显示一次，保存（或用面板向导在 GitHub 步骤里粘贴，由向导写入 `<stateDir>/secrets/github-token`）：
 
 ```sh
 printf '%s' '<github_pat>' > ~/.config/superagent/github-token
@@ -98,7 +98,20 @@ dsh plugin --profile "$PROFILE" add "link:$PWD"
 2. 选择 **Install bundle**（对应 `plugin_manager` 的 `install_bundle` 动作），目标填本仓库的**绝对路径**（`link:` 方式安装的是当前 checkout，改代码后重启 DSH 即生效）。
 3. 装完确认插件列表里出现 `dsh-superagent-personal`，且 bundle 的 patch 行未被禁用。
 
-### 2.4 写机器配置
+### 2.4 配置（面板向导，推荐）
+
+装好 bundle 并重启 DSH 后，打开左侧栏 **Superagent → 设置**，按向导三步完成，**不需要手改 YAML**：
+
+1. **Telegram**：粘贴 @BotFather 的 token → 校验 → 显示 bot 用户名和 Start 链接（bot 不能主动发起会话，需你先点 Start）。
+2. **GitHub**：粘贴 fine-grained PAT → 校验 → 勾选要监听的仓库。
+3. **行为**：填允许的 Telegram user id、选择 `observe`（先观察，推荐）或 `auto`、设置并行 Worker 数。
+4. **完成**：保存后插件自动重启；向导轮询到 `plugin.status=ready` 即完成。
+
+向导会把 token 写到 `<stateDir>/secrets/telegram-token` 与 `<stateDir>/secrets/github-token`（目录 0700、文件 0600），配置里只出现 `tokenFile` 路径；**不会**写进仓库或聊天。也可以在 **权限** 页看到 SuperAgent 需要/不需要哪些 macOS 权限。
+
+> 配置归 DSH 原生配置（profile 的 `cordis.patch.yml`，由 `configEditor` 写入），保存后面板会把结果落盘并重启插件。`stateDir` 与 `enabled` 属于安装期配置：更换它们需要重启 DSH。
+
+**手动配置（自动化/无面板时）**
 
 复制示例并替换占位符：
 
@@ -134,8 +147,10 @@ node scripts/setup.mjs --profile "$PROFILE" --state-dir "$HOME/.dsh/state/supera
 2. **degraded 文件**：`ls "$HOME/.dsh/state/superagent/"`。正常情况下只有 `superagent-status.json`（可能还有 `superagent-heartbeat.json`）；出现 `superagent-degraded.json` 说明插件降级，`cat` 它看 `detail`（不含密钥）。
 3. **Telegram**：给 bot 发 `/status`，应收到一段不超过 100 字的状态（来源健康、活跃/待决策 Ticket 数、是否 paused）。
 4. **面板**：DSH 左侧栏出现 **Superagent** 入口；点开能看到来源健康、待处理、进行中的 Ticket。面板 5 秒轮询一次；显示“无法连接”通常表示引擎没起来（看 §7）。
-   > 验证范围说明：面板是手写的纯 JS Client 模块（不经过 TS 构建），仓库内测试只覆盖“模块能加载、两个 slot 注册形状正确、失败时退化为无操作模块”以及 API 路径/请求头；**真实页面渲染与 slot props 尚未在浏览器里验证**，需要安装后在 DSH 页面确认入口、页面和按钮。即使面板加载失败，宿主页面与 DSH 本体也不受影响。
-5. **管理 API**（可选）：
+   > 验证范围说明：面板是手写的纯 JS Client 模块（不经过 TS 构建），仓库内测试覆盖“模块能加载、两个 slot 注册形状正确、失败时退化为无操作模块、API 路径/请求头、设置向导状态机（步骤门槛/配置载荷/tokenFile）”；**真实页面渲染、视觉细节与 slot props 尚未在浏览器里验证**，需要安装后在 DSH 页面确认入口、页面、向导和按钮。即使面板加载失败，宿主页面与 DSH 本体也不受影响。
+5. **设置向导**：Superagent → 设置，走完三步后显示“设置完成”，插件状态回到 ready；再次打开设置可重新配置。若校验失败，错误会直接显示在页内（无效 token、权限不足、网络失败），DSH 与插件都不受影响。
+6. **权限页**：Superagent → 权限，确认显示不需要屏幕录制/辅助功能/完全磁盘访问；看门狗默认关闭并给出手动命令。
+7. **管理 API**（可选）：
 
 ```sh
 curl -s -H 'x-superagent-request: 1' http://127.0.0.1:<DSH 端口>/superagent/api/state | head
@@ -143,7 +158,7 @@ curl -s -H 'x-superagent-request: 1' http://127.0.0.1:<DSH 端口>/superagent/ap
 
 只接受 loopback 且必须有 `x-superagent-request: 1` 头，否则 403。
 
-6. **observe 模式验证**：用被允许的账号给 bot 发一条明确请求（或 @agent 的 Issue），应出现“本来会接”的记录/Ticket 但不对外发消息。确认日志和面板符合预期后，再把 `policy.mode` 改成 `auto` 并重启。
+8. **observe 模式验证**：用被允许的账号给 bot 发一条明确请求（或 @agent 的 Issue），应出现“本来会接”的记录/Ticket 但不对外发消息。确认日志和面板符合预期后，再把 `policy.mode` 改成 `auto` 并重启。
 
 ## 4. 看门狗（进程级自愈）
 
@@ -237,6 +252,11 @@ node scripts/watchdog.mjs --state-dir "$HOME/.dsh/state/superagent" --dry-run
 | 面板能列出页面但按钮没反应 | 检查 `/superagent/api/action` 返回（403 = 缺 `x-superagent-request: 1`；`ok:false` 会显示在页面） |
 
 日志位置：DSH 自身日志（Web/CLI 启动窗口或 `~/.dsh` 下对应 profile 的日志）、`<stateDir>/watchdog.log`、插件状态文件 `<stateDir>/superagent-status.json`。
+
+| 向导里 Telegram 校验失败 | token 错误/被撤销，或网络无法访问 Telegram API；错误文本来自 Telegram 的 description，修正后重试。token 只在内存与 0600 文件里 |
+| 向导里 GitHub 校验失败但 token 正确 | fine-grained PAT 未勾选 Contents/Issues/PRs 权限，或未授权目标仓库；改权限后生成新 token 再试 |
+| 向导保存后一直“插件重启中” | 60 秒内未回到 ready：看 DSH 日志与 `<stateDir>/superagent-degraded.json` 的 detail；配置已保存，修好后重新保存或重启 DSH |
+| 设置页显示“设置接口暂时不可用” | 插件正在重启/降级，或 runtime 的 setup API 未就绪；等插件 ready 后刷新 |
 
 ## 8. 卸载
 

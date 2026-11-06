@@ -195,6 +195,42 @@ describe('guardian apply() never throws', () => {
   })
 })
 
+describe('guardian Config schema', () => {
+  it('exports a schemastery Config with safe defaults and validation', async () => {
+    const guardian = await loadGuardian()
+    const Config = guardian.Config as unknown as {
+      (value: unknown): Record<string, any>
+      '~standard': { validate(value: unknown): { value?: any; issues?: unknown } }
+    }
+    expect(Config).toBeTruthy()
+
+    const resolved = Config({
+      stateDir: '/tmp/superagent',
+      sources: { telegram: { enabled: true, allowedUserIds: ['1'] } },
+      policy: { mode: 'auto' },
+      executor: { maxWorkers: 3 },
+    })
+    expect(resolved.stateDir).toBe('/tmp/superagent')
+    expect(resolved.policy.mode).toBe('auto')
+    expect(resolved.sources.telegram.enabled).toBe(true)
+    expect(resolved.sources.telegram.allowedUserIds).toEqual(['1'])
+    expect(resolved.sources.github.enabled).toBe(false)
+    expect(resolved.sources.github.repositories).toEqual([])
+    expect(resolved.policy.rules).toEqual([])
+    expect(resolved.executor.maxWorkers).toBe(3)
+    expect(resolved.quiet.minChars).toBe(100)
+
+    expect(() => Config({ policy: { mode: 'bogus' } })).toThrow()
+
+    // Cordis validates through the Standard Schema entry point, not by calling
+    // the schema object itself.
+    const validated = Config['~standard'].validate({ stateDir: '/tmp/x' })
+    expect(validated.issues).toBeUndefined()
+    expect(validated.value?.stateDir).toBe('/tmp/x')
+    expect(validated.value?.policy?.mode).toBe('observe')
+  })
+})
+
 describe('guardian version gate', () => {
   it('degrades on a DSH version outside the supported range and never imports the engine', async () => {
     const start = vi.fn()

@@ -1,13 +1,15 @@
 /**
  * Main plugin entry — the failure-isolation guardian.
  *
- * This module performs no optional runtime import at load time: it imports
- * only types and Node built-ins, and every optional dependency (the engine,
- * the host's version helper) is loaded through a guarded dynamic `import()`
- * inside `apply()`. That way a broken engine build, a missing host service
- * after a DSH upgrade, or an incompatible Node/DSH version can never make the
- * DSH host fail to boot: the guardian reports a clear degraded status, writes
- * it under the state directory when it can, and stops.
+ * Load-time imports are deliberately minimal: Node built-ins plus schemastery
+ * (a declared peer dependency, used synchronously to export `Config`, which
+ * the Loader and the Settings page read before `apply()` runs). Everything
+ * else — the engine and the host version helper — is loaded through a guarded
+ * dynamic `import()` inside `apply()`. That way a broken engine build, a
+ * missing host service after a DSH upgrade, or an incompatible Node/DSH
+ * version can never make the DSH host fail to boot: the guardian reports a
+ * clear degraded status, writes it under the state directory when it can, and
+ * stops.
  *
  * The real application lives in `engine.ts` and is loaded on demand.
  *
@@ -28,6 +30,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join } from 'node:path'
 
 import type { Context } from '@deepseek-ai/cordis'
+import Schema from '@deepseek-ai/schemastery'
 
 /** Plugin name; also the loader entry id used in `cordis.patch.yml`. */
 export const name = 'dsh-superagent-personal'
@@ -37,6 +40,211 @@ export const name = 'dsh-superagent-personal'
  * engine needs are missing. The engine waits for its own dependencies.
  */
 export const inject: string[] = []
+
+/**
+ * The plugin configuration schema. DSH validates the Loader row's `config`
+ * with it before `apply()`, renders it in Settings, and the panel's setup API
+ * persists through `configEditor` with the same schema. Defaults are safe:
+ * disabled sources, `observe` mode, two workers.
+ *
+ * Unknown keys are preserved by the resolver but dropped by `simplify()`, so
+ * every key the runtime reads is declared here.
+ */
+/**
+ * Typed as a schema-shaped value on purpose: the module's declaration file should
+ * not re-export schemastery's internal `Dict` type (which is not portable across
+ * package managers). Runtime consumers use the value only, and tests cast it.
+ */
+export const Config: unknown = Schema.object({
+  enabled: Schema.boolean().default(true).i18n({
+    en: 'Master switch. Off keeps DSH running and the engine idle.',
+    zh: '总开关。关闭后 DSH 正常运行，引擎不启动。',
+  }),
+  stateDir: Schema.string().default('').i18n({
+    en: 'Absolute directory for the database, lock, secrets and worker checkouts.',
+    zh: '绝对路径：数据库、锁、密钥文件和 Worker 工作目录。',
+  }),
+  sources: Schema.object({
+    telegram: Schema.object({
+      enabled: Schema.boolean().default(false).i18n({
+        en: 'Receive direct messages and allowed group chats.',
+        zh: '接收私聊和允许的群聊消息。',
+      }),
+      tokenEnv: Schema.string().default('').i18n({
+        en: 'Environment variable holding the @BotFather token (alternative to tokenFile).',
+        zh: '保存 @BotFather token 的环境变量名（与 tokenFile 二选一）。',
+      }),
+      tokenFile: Schema.string().default('').i18n({
+        en: 'File holding the bot token; written by the setup wizard with mode 0600.',
+        zh: '保存 bot token 的文件；向导会以 0600 写入。',
+      }),
+      allowedUserIds: Schema.array(Schema.string()).default([]).i18n({
+        en: 'Telegram numeric user ids allowed to start work.',
+        zh: '允许发起工作的 Telegram 数字 user id。',
+      }),
+      chats: Schema.array(Schema.string()).default([]).i18n({
+        en: 'Optional Telegram group chat ids to listen to (mentions only).',
+        zh: '可选：要监听的 Telegram 群 chat id（只处理 @）。',
+      }),
+      pollSeconds: Schema.number().default(60).i18n({
+        en: 'Polling interval in seconds.',
+        zh: '轮询间隔（秒）。',
+      }),
+    }).default({}),
+    github: Schema.object({
+      enabled: Schema.boolean().default(false).i18n({
+        en: 'Receive issue, pull request, comment and CI events.',
+        zh: '接收 Issue、PR、评论和 CI 事件。',
+      }),
+      tokenEnv: Schema.string().default('').i18n({
+        en: 'Environment variable holding the GitHub token (alternative to tokenFile).',
+        zh: '保存 GitHub token 的环境变量名（与 tokenFile 二选一）。',
+      }),
+      tokenFile: Schema.string().default('').i18n({
+        en: 'File holding the GitHub token; written by the setup wizard with mode 0600.',
+        zh: '保存 GitHub token 的文件；向导会以 0600 写入。',
+      }),
+      repositories: Schema.array(Schema.string()).default([]).i18n({
+        en: 'Repositories to watch, as owner/name.',
+        zh: '要监听的仓库列表，格式 owner/name。',
+      }),
+      login: Schema.string().default('').i18n({
+        en: 'GitHub login of the token owner, used to detect @mentions.',
+        zh: 'token 所属账号的 GitHub login，用于识别 @。',
+      }),
+      allowedLogins: Schema.array(Schema.string()).default([]).i18n({
+        en: 'Optional extra logins treated as allowed askers.',
+        zh: '可选：额外允许发起工作的 GitHub login。',
+      }),
+      observeIssues: Schema.boolean().default(false).i18n({
+        en: 'Treat new issues as candidates even without a mention.',
+        zh: '即使没有 @ 也把新 Issue 视为候选。',
+      }),
+      observePulls: Schema.boolean().default(false).i18n({
+        en: 'Treat new pull requests as candidates even without a mention.',
+        zh: '即使没有 @ 也把新 PR 视为候选。',
+      }),
+      observeComments: Schema.boolean().default(false).i18n({
+        en: 'Treat new comments as candidates even without a mention.',
+        zh: '即使没有 @ 也把新评论视为候选。',
+      }),
+      observeCi: Schema.boolean().default(false).i18n({
+        en: 'Treat failing CI on the default branch as a candidate.',
+        zh: '把默认分支的 CI 失败视为候选。',
+      }),
+      pollSeconds: Schema.number().default(60).i18n({
+        en: 'Polling interval in seconds.',
+        zh: '轮询间隔（秒）。',
+      }),
+    }).default({}),
+  }).default({}),
+  policy: Schema.object({
+    mode: Schema.union(['off', 'observe', 'auto']).default('observe').i18n({
+      en: 'off: explicit requests only; observe: record candidates, send nothing; auto: accept matching inferred candidates.',
+      zh: 'off：只接明确请求；observe：记录候选不发送；auto：按规则接受推断候选。',
+    }),
+    rules: Schema.array(
+      Schema.object({
+        id: Schema.string().required().i18n({ en: 'Stable rule id.', zh: '稳定的规则 id。' }),
+        name: Schema.string().required().i18n({ en: 'Rule name.', zh: '规则名称。' }),
+        enabled: Schema.boolean().default(true).i18n({ en: 'Rule switch.', zh: '规则开关。' }),
+        instructions: Schema.string().default('').i18n({
+          en: 'What proactive work this rule allows.',
+          zh: '这条规则允许的主动工作说明。',
+        }),
+      }),
+    ).default([]).i18n({ en: 'Proactive rules used in auto mode.', zh: 'auto 模式下使用的主动规则。' }),
+  }).default({}),
+  executor: Schema.object({
+    model: Schema.string().default('').i18n({
+      en: 'Optional Worker model id; empty uses the profile default.',
+      zh: '可选：Worker 模型 id；留空使用 profile 默认模型。',
+    }),
+    provider: Schema.string().default('').i18n({
+      en: 'Optional Worker model provider.',
+      zh: '可选：Worker 模型 provider。',
+    }),
+    maxWorkers: Schema.number().default(2).i18n({
+      en: 'How many tickets may run at the same time.',
+      zh: '同时运行的 Ticket 数。',
+    }),
+    prepare: Schema.string().default('').i18n({
+      en: 'Optional shell command run in a new ticket directory before the Worker starts.',
+      zh: '可选：Worker 启动前在 Ticket 目录执行的命令。',
+    }),
+    cloneUrl: Schema.string().default('').i18n({
+      en: 'Optional git clone URL for new ticket directories.',
+      zh: '可选：Ticket 目录使用的 git clone URL。',
+    }),
+    clone: Schema.boolean().default(true).i18n({
+      en: 'Clone (or worktree) a checkout for each ticket.',
+      zh: '为每个 Ticket 准备 clone/worktree。',
+    }),
+    defaultRepo: Schema.string().default('').i18n({
+      en: 'Optional default repository for ticket checkouts.',
+      zh: '可选：Ticket 检出使用的默认仓库。',
+    }),
+    prepareTimeoutMs: Schema.number().default(120_000).i18n({
+      en: 'Timeout for the prepare command in milliseconds.',
+      zh: 'prepare 命令超时（毫秒）。',
+    }),
+    gitTimeoutMs: Schema.number().default(120_000).i18n({
+      en: 'Timeout for git operations in milliseconds.',
+      zh: 'git 操作超时（毫秒）。',
+    }),
+  }).default({}),
+  quiet: Schema.object({
+    minChars: Schema.number().default(100).i18n({
+      en: 'Minimum length of an attention message; shorter messages are suppressed.',
+      zh: '打扰消息的最小长度；更短的会被抑制。',
+    }),
+    maxChars: Schema.number().default(0).i18n({
+      en: 'Optional hard cap for outbound messages; 0 uses minChars.',
+      zh: '可选：对外消息硬上限；0 表示使用 minChars。',
+    }),
+    quietHours: Schema.object({
+      from: Schema.string().default('').i18n({ en: 'Start of quiet hours, HH:MM.', zh: '静默时段开始，HH:MM。' }),
+      to: Schema.string().default('').i18n({ en: 'End of quiet hours, HH:MM.', zh: '静默时段结束，HH:MM。' }),
+    }).default({}).i18n({
+      en: 'Optional quiet hours; non-urgent messages wait until they end.',
+      zh: '可选静默时段；非紧急消息延迟到结束后。',
+    }),
+  }).default({}),
+  watchdog: Schema.object({
+    stallMs: Schema.number().default(0).i18n({
+      en: 'Optional stall threshold in milliseconds; 0 uses the runtime default.',
+      zh: '可选停滞阈值（毫秒）；0 使用运行时默认值。',
+    }),
+    escalateMs: Schema.number().default(0).i18n({
+      en: 'Optional escalation threshold in milliseconds.',
+      zh: '可选升级阈值（毫秒）。',
+    }),
+    intervalMs: Schema.number().default(0).i18n({
+      en: 'Optional stall-check interval in milliseconds.',
+      zh: '可选停滞检查间隔（毫秒）。',
+    }),
+    silentMs: Schema.number().default(0).i18n({
+      en: 'Optional silent-worker threshold in milliseconds.',
+      zh: '可选无报告阈值（毫秒）。',
+    }),
+    silentMaxAttempts: Schema.number().default(0).i18n({
+      en: 'Optional number of silent-worker retries.',
+      zh: '可选无报告重试次数。',
+    }),
+  }).default({}),
+  acknowledgeOnAccept: Schema.boolean().default(false).i18n({
+    en: 'Send an acknowledgement when a ticket is accepted.',
+    zh: '接单时发送确认消息。',
+  }),
+  passIntervalMs: Schema.number().default(2_000).i18n({
+    en: 'Engine pass interval in milliseconds.',
+    zh: '引擎轮询间隔（毫秒）。',
+  }),
+  heartbeatIntervalMs: Schema.number().default(30_000).i18n({
+    en: 'Heartbeat interval written under stateDir for the watchdog.',
+    zh: '写入 stateDir、供看门狗读取的心跳间隔（毫秒）。',
+  }),
+})
 
 /** Supported range, mirrored in package.json `engines.dsh`. */
 export const SUPPORTED_DSH = '>=0.2.2-rc.1 <0.3.0'

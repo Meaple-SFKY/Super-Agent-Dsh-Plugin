@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Superagent personal",
-    "description": "Personal always-on agent with Telegram and GitHub sources, Router/Worker tickets and a quiet attention policy. Failure-isolated: if the engine cannot start, DSH keeps booting."
+    "description": "Personal always-on agent with Telegram and GitHub sources, Router/Worker tickets and a quiet attention policy. Configure it from the panel in three steps. Failure-isolated: if the engine cannot start, DSH keeps booting."
   }
 }

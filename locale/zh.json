@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Superagent 个人版",
-    "description": "常驻在线的个人 SuperAgent：Telegram 与 GitHub 来源、Router/Worker 双层执行、安静打扰策略。初始化失败只会降级，不影响 DSH 本体启动。"
+    "description": "常驻在线的个人 SuperAgent：Telegram 与 GitHub 来源、Router/Worker 双层执行、安静打扰策略；在面板里三步完成配置，无需手改 YAML。初始化失败只会降级，不影响 DSH 本体启动。"
   }
 }
