@@ -12,6 +12,7 @@
  */
 
 import { readFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 
 import type {
@@ -38,18 +39,22 @@ const BUILTIN: Record<PromptName, string> = {
 
 const cache = new Map<PromptName, string>()
 
+/** Candidate locations for a markdown prompt, in priority order. */
+function promptCandidates(name: PromptName): URL[] {
+  return [
+    new URL(`./${name}.md`, import.meta.url),
+    new URL(`../../src/prompts/${name}.md`, import.meta.url),
+    new URL(`../src/prompts/${name}.md`, import.meta.url),
+  ]
+}
+
 /**
  * Resolve one markdown prompt. Candidate locations cover source execution
  * (vitest, tsx) and the bundled `lib/` layout; the embedded text is the final
  * fallback so prompt assembly can never fail at runtime.
  */
 function loadMarkdown(name: PromptName): string | undefined {
-  const candidates = [
-    new URL(`./${name}.md`, import.meta.url),
-    new URL(`../../src/prompts/${name}.md`, import.meta.url),
-    new URL(`../src/prompts/${name}.md`, import.meta.url),
-  ]
-  for (const candidate of candidates) {
+  for (const candidate of promptCandidates(name)) {
     try {
       const text = readFileSync(fileURLToPath(candidate), 'utf8')
       if (text.trim().length > 0) return text
@@ -58,6 +63,30 @@ function loadMarkdown(name: PromptName): string | undefined {
     }
   }
   return undefined
+}
+
+/**
+ * Preload every prompt once during startup, asynchronously, so the first
+ * model step never performs blocking file I/O. Failures fall back to the
+ * embedded text; prompt assembly can never throw.
+ */
+export async function preloadPrompts(): Promise<void> {
+  for (const name of ['router', 'admission', 'worker'] as const) {
+    if (cache.has(name)) continue
+    let loaded: string | undefined
+    for (const candidate of promptCandidates(name)) {
+      try {
+        const text = await readFile(fileURLToPath(candidate), 'utf8')
+        if (text.trim().length > 0) {
+          loaded = text
+          break
+        }
+      } catch {
+        // try the next location
+      }
+    }
+    cache.set(name, loaded ?? BUILTIN[name])
+  }
 }
 
 /** Load a prompt by name; the result is cached and never empty. */

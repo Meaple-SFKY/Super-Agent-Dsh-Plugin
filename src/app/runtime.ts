@@ -52,6 +52,7 @@ import { Watchdog } from './watchdog.js'
 import { registerApi, API_VERSION, type ApiActionRequest, type ApiActionValue, type ApiDeps, type ApiState } from './api.js'
 import { registerRouterTools } from '../tools/router.js'
 import { registerWorkerTools } from '../tools/worker.js'
+import { preloadPrompts } from '../prompts/index.js'
 import type { ToolDeps } from '../tools/shared.js'
 import type { AppLogger } from './support.js'
 import { errorMessage, nowIso, runSafely, safeString, withTimeout } from './support.js'
@@ -432,6 +433,14 @@ export class Runtime {
     }
     this.paused = this.readPaused()
     this.policy = new MutablePolicy(buildPolicy(config, this.paused))
+
+    // Load role prompts off the first model step's path; failures fall back to
+    // the embedded copies and never block startup.
+    try {
+      await preloadPrompts()
+    } catch (error) {
+      this.logger.warn('could not preload role prompts; embedded prompts will be used', { error: errorMessage(error) })
+    }
 
     const effects = createEffects({
       store: this.store,
