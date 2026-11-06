@@ -40,7 +40,12 @@ tests/              单元、适配器、集成、恢复测试
 
 ## 状态
 
-M0（脚手架与契约）进行中。后续按 docs/000-architecture.md §12 的里程碑推进，每个里程碑提交并推送。
+已实现并在本机安装（DSH Desktop 0.2.2-rc.1，profile `desktop`）：
+
+- 插件 `dsh-superagent-personal` 已安装并 `ready`，管理 API、面板入口、心跳、看门狗脚本均已验证；
+- Telegram / GitHub 两个来源已实现并通过假服务 E2E，等待操作者提供 bot token 与 fine-grained PAT 后启用；
+- 全量检查：`./scripts/pnpmw check`（22 个测试文件 / 279 个测试 + 构建）；失败隔离、崩溃恢复、安静打扰均有独立 QA 测试覆盖，见 [docs/verification.md](docs/verification.md)；
+- 安装与账号步骤见 [SETUP.md](SETUP.md)，架构见 [docs/000-architecture.md](docs/000-architecture.md)。
 
 ## License
 
