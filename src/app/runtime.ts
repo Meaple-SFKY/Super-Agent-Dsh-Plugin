@@ -12,6 +12,7 @@
  * optional Telegram notice), and `stop()` always completes.
  */
 
+import { existsSync } from 'node:fs'
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
@@ -50,6 +51,7 @@ import { Executor } from './executor.js'
 import { Assessor } from './assessor.js'
 import { Watchdog } from './watchdog.js'
 import { registerApi, API_VERSION, type ApiActionRequest, type ApiActionValue, type ApiDeps, type ApiState } from './api.js'
+import { SetupService, type ConfigEditorLike } from './setup.js'
 import { registerRouterTools } from '../tools/router.js'
 import { registerWorkerTools } from '../tools/worker.js'
 import { preloadPrompts } from '../prompts/index.js'
@@ -343,6 +345,9 @@ export class Runtime {
   private releaseLock?: () => Promise<void>
   private apiDispose?: () => void
   private apiDeps?: ApiDeps
+  private setupService?: SetupService
+  /** Serialized heartbeat writes; awaited during shutdown so teardown is clean. */
+  private heartbeatQueue: Promise<void> = Promise.resolve()
 
   private readonly timers = new Set<ReturnType<typeof setInterval>>()
   private stopped = false
@@ -411,6 +416,7 @@ export class Runtime {
       this.apiDeps = {
         state: () => this.buildState(),
         action: request => this.handleAction(request),
+        ...(this.setupService ? { setup: this.setupService } : {}),
         logger: this.logger,
       }
     }
@@ -535,6 +541,21 @@ export class Runtime {
     })
 
     this.sources = new SourcesManager(this.health, this.logger)
+
+    // Setup wizard backend (docs/002): token files, account state, configEditor.
+    this.setupService = new SetupService({
+      stateDir: config.stateDir,
+      kv: this.store.kv,
+      logger: this.logger,
+      plugin: () => ({ status: this.effectiveStatus(), detail: this.statusDetail ?? null }),
+      currentConfig: () => this.config as unknown as Record<string, unknown>,
+      validateConfig: candidate => validateConfig(candidate).problem?.error,
+      configEditor: () => this.ctx.get('configEditor') as ConfigEditorLike | undefined,
+      hostEntry: () => (this.ctx as unknown as { fiber?: { entry?: unknown } }).fiber?.entry,
+      redact: redactDetail,
+    })
+    // A fresh runtime means the previous setup edit already restarted us.
+    this.setupService.markRestarted()
 
     // Effects handlers (the reply handler belongs to the Outbox).
     this.installEffectHandlers()
@@ -947,6 +968,23 @@ export class Runtime {
     this.engine!.sources.bindThread(ticketId, { key: thread, source: 'github' }, true)
   }
 
+  /**
+   * Wizard-written secrets live in `<stateDir>/secrets/`; when the config does
+   * not name a token source, fall back to that file if it exists (the
+   * environment-variable path stays untouched otherwise).
+   */
+  private withDefaultSecretFile(kind: 'telegram' | 'github', config: Record<string, unknown>): Record<string, unknown> {
+    if (typeof config.tokenFile === 'string' && config.tokenFile.length > 0) return config
+    if (typeof config.tokenEnv === 'string' && config.tokenEnv.length > 0) return config
+    const candidate = join(this.config!.stateDir, 'secrets', kind === 'telegram' ? 'telegram-token' : 'github-token')
+    try {
+      if (existsSync(candidate)) return { ...config, tokenFile: candidate }
+    } catch {
+      // fall through: sources will report the missing token
+    }
+    return config
+  }
+
   private async createSources(): Promise<void> {
     if (this.overrides.sources) {
       for (const entry of this.overrides.sources) this.sources!.add(entry.id, entry.source)
@@ -963,7 +1001,7 @@ export class Runtime {
         const create = module.createSource ?? module.kind?.create
         if (!create) throw new Error('telegram source module exports no create function')
         const source = create(
-          { ...sources.telegram, commands: this.telegramCommands() },
+          { ...this.withDefaultSecretFile('telegram', { ...sources.telegram }), commands: this.telegramCommands() },
           this.sourceContext('telegram'),
         )
         this.sources!.add('telegram', source)
@@ -980,7 +1018,10 @@ export class Runtime {
         }
         const create = module.createSource ?? module.kind?.create
         if (!create) throw new Error('github source module exports no create function')
-        const source = create({ ...sources.github, callbacks: this.githubCallbacks() }, this.sourceContext('github'))
+        const source = create(
+          { ...this.withDefaultSecretFile('github', { ...sources.github }), callbacks: this.githubCallbacks() },
+          this.sourceContext('github'),
+        )
         this.sources!.add('github', source)
       } catch (error) {
         this.health.fail('sources:github', error)
@@ -1142,7 +1183,7 @@ export class Runtime {
       sources: this.sources?.healthSnapshot().map(source => ({ id: source.id, health: source.health })) ?? [],
     }
     const text = safeString(body)
-    void (async () => {
+    const write = async (): Promise<void> => {
       for (const name of ['superagent-heartbeat.json', 'heartbeat.json']) {
         const target = join(stateDir, name)
         const temp = `${target}.${process.pid}.tmp`
@@ -1158,7 +1199,8 @@ export class Runtime {
           }
         }
       }
-    })().catch(() => undefined)
+    }
+    this.heartbeatQueue = this.heartbeatQueue.then(write, write).catch(() => undefined)
   }
 
   // -- lock ----------------------------------------------------------------

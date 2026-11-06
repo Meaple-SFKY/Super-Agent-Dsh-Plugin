@@ -15,6 +15,14 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { IsoTime } from '../core/model.js'
+import {
+  SETUP_CONFIG_PATH,
+  SETUP_GITHUB_PATH,
+  SETUP_PERMISSIONS_PATH,
+  SETUP_STATE_PATH,
+  SETUP_TELEGRAM_PATH,
+  type SetupApi,
+} from './setup.js'
 
 export const API_PREFIX = '/superagent/api'
 export const API_STATE_PATH = `${API_PREFIX}/state`
@@ -80,6 +88,8 @@ export interface ApiActionValue {
 export interface ApiDeps {
   state(): ApiState | Promise<ApiState>
   action(request: ApiActionRequest): ApiActionValue | Promise<ApiActionValue>
+  /** Setup wizard (docs/002); absent on hosts without a web server. */
+  setup?: SetupApi
   logger?: { warn(message: string, extra?: Record<string, unknown>): void }
 }
 
@@ -199,8 +209,10 @@ export function parseActionRequest(body: unknown): ApiActionRequest {
 }
 
 /**
- * Register the two management routes. Returns a disposer; a missing web
- * server is reported and treated as "no panel on this profile".
+ * Register the management routes (state/action + the setup wizard routes).
+ * Returns a disposer; a missing web server is reported and treated as
+ * "no panel on this profile". Every route enforces the same fence and the
+ * handlers never throw.
  */
 export function registerApi(ctx: Context, deps: ApiDeps): () => void {
   const webServer = ctx.get('webServer') as WebServerLike | undefined
@@ -217,48 +229,119 @@ export function registerApi(ctx: Context, deps: ApiDeps): () => void {
     }
   }
 
-  register(API_STATE_PATH, async (req, res) => {
-    try {
-      if (!isLoopback(req) || !hasApiHeader(req)) {
-        sendForbidden(res)
-        return
-      }
-      if (req.method !== 'GET' && req.method !== 'HEAD') {
-        sendJson(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      const state = await deps.state()
-      sendJson(res, 200, state)
-    } catch (error) {
-      deps.logger?.warn('state endpoint failed', { error: String(error) })
-      sendJson(res, 500, { ok: false, error: 'internal error' })
-    }
-  })
-
-  register(API_ACTION_PATH, async (req, res) => {
-    try {
-      if (!isLoopback(req) || !hasApiHeader(req)) {
-        sendForbidden(res)
-        return
-      }
-      if (req.method !== 'POST') {
-        sendJson(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      let request: ApiActionRequest
+  /**
+   * Wrap a route: fence (loopback + header), method check, and a final
+   * catch-all so a handler can never reject into the host request pipeline.
+   */
+  const guarded = (
+    methods: string[],
+    run: (req: IncomingMessage, res: ServerResponse) => Promise<void>,
+  ): ((req: IncomingMessage, res: ServerResponse) => Promise<void>) => {
+    return async (req, res) => {
       try {
-        request = parseActionRequest(await readJsonBody(req))
+        if (!isLoopback(req) || !hasApiHeader(req)) {
+          sendForbidden(res)
+          return
+        }
+        if (!methods.includes(req.method ?? '')) {
+          sendJson(res, 405, { ok: false, error: 'method not allowed' })
+          return
+        }
+        await run(req, res)
       } catch (error) {
-        sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) })
-        return
+        deps.logger?.warn('management endpoint failed', {
+          path: req.url ?? '',
+          error: error instanceof Error ? error.message : String(error),
+        })
+        sendJson(res, 500, { ok: false, error: 'internal error' })
       }
+    }
+  }
+
+  register(API_STATE_PATH, guarded(['GET', 'HEAD'], async (_req, res) => {
+    const state = await deps.state()
+    sendJson(res, 200, state)
+  }))
+
+  register(API_ACTION_PATH, guarded(['POST'], async (req, res) => {
+    let request: ApiActionRequest
+    try {
+      request = parseActionRequest(await readJsonBody(req))
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) })
+      return
+    }
+    try {
       const result = await deps.action(request)
       sendJson(res, 200, result)
     } catch (error) {
-      deps.logger?.warn('action endpoint failed', { error: String(error) })
+      // The action contract answers failures with {ok:false,error}, not a 5xx.
+      deps.logger?.warn('action failed', { error: error instanceof Error ? error.message : String(error) })
       sendJson(res, 200, { ok: false, error: error instanceof Error ? error.message : String(error) })
     }
-  })
+  }))
+
+  const setup = deps.setup
+  if (setup) {
+    register(SETUP_STATE_PATH, guarded(['GET', 'HEAD'], async (_req, res) => {
+      const result = await setup.state()
+      sendJson(res, result.status, result.body)
+    }))
+
+    register(SETUP_PERMISSIONS_PATH, guarded(['GET', 'HEAD'], async (_req, res) => {
+      const result = setup.permissions()
+      sendJson(res, result.status, result.body)
+    }))
+
+    register(SETUP_TELEGRAM_PATH, guarded(['POST'], async (req, res) => {
+      let body: unknown
+      try {
+        body = await readJsonBody(req)
+      } catch (error) {
+        sendJson(res, 400, { ok: false, error: 'invalid_body', description: error instanceof Error ? error.message : String(error) })
+        return
+      }
+      const result = await setup.saveTelegram(body)
+      sendJson(res, result.status, result.body)
+    }))
+
+    register(SETUP_GITHUB_PATH, guarded(['POST'], async (req, res) => {
+      let body: unknown
+      try {
+        body = await readJsonBody(req)
+      } catch (error) {
+        sendJson(res, 400, { ok: false, error: 'invalid_body', description: error instanceof Error ? error.message : String(error) })
+        return
+      }
+      const result = await setup.saveGithub(body)
+      sendJson(res, result.status, result.body)
+    }))
+
+    register(SETUP_CONFIG_PATH, guarded(['PUT', 'POST'], async (req, res) => {
+      let body: unknown
+      try {
+        body = await readJsonBody(req)
+      } catch (error) {
+        sendJson(res, 400, { ok: false, error: 'invalid_body', description: error instanceof Error ? error.message : String(error) })
+        return
+      }
+      const prepared = setup.prepareConfig(body)
+      if (prepared.result.body.ok !== true || prepared.patch === undefined) {
+        sendJson(res, prepared.result.status, prepared.result.body)
+        return
+      }
+      // Answer before the configEditor edit: a non-volatile config change
+      // restarts this plugin fiber, which would kill an unflushed response.
+      sendJson(res, 200, prepared.result.body)
+      try {
+        setup.commitConfigSoon(prepared.patch)
+      } catch (error) {
+        deps.logger?.warn('could not schedule the setup config commit', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }))
+  }
 
   return () => {
     for (const dispose of disposers.splice(0).reverse()) {
