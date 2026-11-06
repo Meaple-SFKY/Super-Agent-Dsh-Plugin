@@ -115,6 +115,9 @@ export interface EngineLogger {
   warn(message: string, extra?: Record<string, unknown>): void
 }
 
+/** Language of the short messages the Engine writes to a person. */
+export type EngineLanguage = 'zh' | 'en'
+
 type Adapter<T> = T | (() => T)
 
 /** Cancels a queued effect; `src/app/effects.ts` implements it. */
@@ -142,6 +145,8 @@ export interface EngineDeps {
   executor?: Adapter<ExecutorPort>
   /** Send an acknowledgement Channel write on accept. Quiet by default. */
   acknowledgeOnAccept?: boolean
+  /** Language of the Engine's own user-facing messages. Defaults to `zh`. */
+  language?: EngineLanguage
   /** Upper bound of a quiet-policy message. Defaults to 100 characters. */
   maxMessageChars?: number
   /** Fallback Eval deadline when the Policy value is not usable. */
@@ -193,6 +198,7 @@ export class Engine implements EnginePort {
   private readonly logger?: EngineLogger
   private readonly executorAdapter: Adapter<ExecutorPort> | undefined
   private readonly acknowledgeOnAccept: boolean
+  private readonly language: EngineLanguage
   private readonly maxMessageChars: number
   private readonly fallbackTimeoutMs: number
   private commandedPause = false
@@ -208,6 +214,7 @@ export class Engine implements EnginePort {
     this.logger = deps.logger
     this.executorAdapter = deps.executor
     this.acknowledgeOnAccept = deps.acknowledgeOnAccept ?? false
+    this.language = deps.language === 'en' ? 'en' : 'zh'
     this.maxMessageChars = deps.maxMessageChars ?? DEFAULT_MESSAGE_CHARS
     this.fallbackTimeoutMs = deps.evalTimeoutMs ?? DEFAULT_EVAL_TIMEOUT_MS
     this.commandedPause = this.store.kv.get<boolean>('pause.commanded') === true
@@ -1292,7 +1299,7 @@ export class Engine implements EnginePort {
         ticketId: ticket.id,
         purpose: 'acknowledgement',
         channel: primary.channel,
-        text: truncate(`On it: ${title}`, this.maxMessageChars),
+        text: truncate(this.text({ zh: `收到，开始处理：${title}`, en: `On it: ${title}` }), this.maxMessageChars),
         markdown: 'plain',
         at: now,
       })
@@ -1540,15 +1547,22 @@ export class Engine implements EnginePort {
 
   private readyText(report: Report): string {
     const url = report.pullRequest?.url
-    return url === undefined ? `Ready: ${report.summary}` : `Ready: ${report.summary} ${url}`
+    const summary = url === undefined ? report.summary : `${report.summary} ${url}`
+    return this.text({ zh: `已完成，请验收：${summary}`, en: `Ready for review: ${summary}` })
   }
 
   private blockedText(report: Report): string {
-    return `Needs a decision: ${report.question ?? report.summary}`
+    const question = report.question ?? report.summary
+    return this.text({ zh: `需要你决定：${question}`, en: `Need your decision: ${question}` })
   }
 
   private failedText(report: Report): string {
-    return `Failed: ${report.summary}`
+    return this.text({ zh: `出了点问题：${report.summary}`, en: `Something went wrong: ${report.summary}` })
+  }
+
+  /** Pick the user-facing wording for the configured language. */
+  private text(message: { zh: string; en: string }): string {
+    return this.language === 'en' ? message.en : message.zh
   }
 
   private describeChanges(changes: string[], policy: Policy): string {

@@ -1,8 +1,22 @@
 import { describe, expect, it } from 'vitest'
 
-import { effectPayload, makeHarness, makeTrigger } from './core-fixtures.js'
-import type { DeliveryPayload, LaunchPayload, RelayPayload } from '../src/core/engine.js'
+import {
+  FakeClock,
+  MutablePolicy,
+  RecordingEffects,
+  RecordingExecutor,
+  RecordingOutbox,
+  effectPayload,
+  makeHarness,
+  makePolicy,
+  makeTrigger,
+  silentLogger,
+} from './core-fixtures.js'
+import type { Harness } from './core-fixtures.js'
+import { createEngine } from '../src/core/engine.js'
+import type { DeliveryPayload, EngineLanguage, LaunchPayload, RelayPayload } from '../src/core/engine.js'
 import type { Ticket } from '../src/core/model.js'
+import { createMemoryStore } from '../src/app/store.js'
 
 function acceptTrigger(harness: ReturnType<typeof makeHarness>, triggerId: string, text = 'do the thing'): Ticket {
   harness.engine.sources.receive(makeTrigger({ id: triggerId, text }))
@@ -14,6 +28,33 @@ function acceptTrigger(harness: ReturnType<typeof makeHarness>, triggerId: strin
   })
   expect(result.ticket).toBeDefined()
   return result.ticket!
+}
+
+
+/** A harness whose Engine is built with an explicit language (and limits). */
+function localizedHarness(
+  language?: EngineLanguage,
+  options: { acknowledgeOnAccept?: boolean; maxMessageChars?: number } = {},
+): Harness {
+  const store = createMemoryStore()
+  const clock = new FakeClock()
+  const policy = new MutablePolicy(makePolicy())
+  const effects = new RecordingEffects()
+  const outbox = new RecordingOutbox()
+  const executor = new RecordingExecutor()
+  const engine = createEngine({
+    store,
+    clock,
+    policy,
+    effects,
+    outbox,
+    executor,
+    logger: silentLogger,
+    ...(language === undefined ? {} : { language }),
+    ...(options.acknowledgeOnAccept === undefined ? {} : { acknowledgeOnAccept: options.acknowledgeOnAccept }),
+    ...(options.maxMessageChars === undefined ? {} : { maxMessageChars: options.maxMessageChars }),
+  })
+  return { store, clock, policy, effects, outbox, executor, engine }
 }
 
 function startAssignment(harness: ReturnType<typeof makeHarness>, ticket: Ticket, sessionId = 'worker-1') {
@@ -363,5 +404,119 @@ describe('reply', () => {
     })
     expect(harness.outbox.messages).toHaveLength(1)
     expect(harness.outbox.messages[0]?.id).toBe('msg_manual')
+  })
+})
+
+describe('language', () => {
+  it('writes Chinese user-facing messages by default', () => {
+    const harness = localizedHarness()
+    const ticket = acceptTrigger(harness, 'tr_1')
+    const assignment = startAssignment(harness, ticket)
+
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: {
+        kind: 'ready',
+        summary: 'opened a pull request',
+        pullRequest: { repo: 'owner/repo', number: 7, url: 'https://example.test/pull/7' },
+        at: harness.clock.now(),
+      },
+    })
+    harness.clock.advance(1_000)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: { kind: 'blocked', summary: 'cannot choose a database', question: '用哪个数据库？', at: harness.clock.now() },
+    })
+    harness.clock.advance(1_000)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: { kind: 'failed', summary: '编译失败', at: harness.clock.now() },
+    })
+
+    expect(harness.outbox.messages.map(message => message.purpose)).toEqual(['result', 'attention', 'attention'])
+    expect(harness.outbox.messages[0]?.text).toBe('已完成，请验收：opened a pull request https://example.test/pull/7')
+    expect(harness.outbox.messages[1]?.text).toBe('需要你决定：用哪个数据库？')
+    expect(harness.outbox.messages[2]?.text).toBe('出了点问题：编译失败')
+  })
+
+  it('writes English user-facing messages when configured', () => {
+    const harness = localizedHarness('en')
+    const ticket = acceptTrigger(harness, 'tr_1')
+    const assignment = startAssignment(harness, ticket)
+
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: {
+        kind: 'ready',
+        summary: 'opened a pull request',
+        pullRequest: { repo: 'owner/repo', number: 7, url: 'https://example.test/pull/7' },
+        at: harness.clock.now(),
+      },
+    })
+    harness.clock.advance(1_000)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: { kind: 'blocked', summary: 'cannot choose', question: 'Which database?', at: harness.clock.now() },
+    })
+    harness.clock.advance(1_000)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: { kind: 'failed', summary: 'the build is red', at: harness.clock.now() },
+    })
+
+    expect(harness.outbox.messages[0]?.text).toBe(
+      'Ready for review: opened a pull request https://example.test/pull/7',
+    )
+    expect(harness.outbox.messages[1]?.text).toBe('Need your decision: Which database?')
+    expect(harness.outbox.messages[2]?.text).toBe('Something went wrong: the build is red')
+  })
+
+  it('localizes the acknowledgement when it is enabled', () => {
+    const chinese = localizedHarness(undefined, { acknowledgeOnAccept: true })
+    acceptTrigger(chinese, 'tr_1')
+    expect(chinese.outbox.messages[0]?.purpose).toBe('acknowledgement')
+    expect(chinese.outbox.messages[0]?.text).toBe('收到，开始处理：do the thing')
+
+    const english = localizedHarness('en', { acknowledgeOnAccept: true })
+    acceptTrigger(english, 'tr_1')
+    expect(english.outbox.messages[0]?.text).toBe('On it: do the thing')
+  })
+
+  it('truncates localized messages to the configured limit', () => {
+    const harness = localizedHarness('zh', { maxMessageChars: 24 })
+    const ticket = acceptTrigger(harness, 'tr_1')
+    const assignment = startAssignment(harness, ticket)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: { kind: 'ready', summary: 'x'.repeat(200), at: harness.clock.now() },
+    })
+
+    const text = harness.outbox.messages[0]?.text ?? ''
+    expect(text).toHaveLength(24)
+    expect(text.endsWith('…')).toBe(true)
+    expect(text.startsWith('已完成，请验收：')).toBe(true)
+  })
+
+  it('keeps English messages within the same limit', () => {
+    const harness = localizedHarness('en', { maxMessageChars: 30 })
+    const ticket = acceptTrigger(harness, 'tr_1')
+    const assignment = startAssignment(harness, ticket)
+    harness.engine.executor.report({
+      ticketId: ticket.id,
+      assignmentId: assignment.id,
+      report: { kind: 'blocked', summary: 'y'.repeat(200), question: 'z'.repeat(200), at: harness.clock.now() },
+    })
+
+    const text = harness.outbox.messages[0]?.text ?? ''
+    expect(text).toHaveLength(30)
+    expect(text.startsWith('Need your decision: ')).toBe(true)
+    expect(text.endsWith('…')).toBe(true)
   })
 })
