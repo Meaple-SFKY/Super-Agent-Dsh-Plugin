@@ -1,0 +1,13 @@
+#!/bin/sh
+# Run pnpm with the DSH-bundled runtime when pnpm is not on PATH.
+set -e
+if command -v pnpm >/dev/null 2>&1; then
+  exec pnpm "$@"
+fi
+NODE_BIN="${DSH_NODE_BIN:-$HOME/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin}"
+PNPM_JS="${DSH_PNPM_JS:-$HOME/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/pnpm/bin/pnpm.mjs}"
+if [ -x "$NODE_BIN/node" ] && [ -f "$PNPM_JS" ]; then
+  exec "$NODE_BIN/node" "$PNPM_JS" "$@"
+fi
+echo "pnpm not found: install pnpm or set DSH_NODE_BIN / DSH_PNPM_JS" >&2
+exit 127

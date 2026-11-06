@@ -1,0 +1,13 @@
+node_modules/
+lib/
+artifacts/
+.artifacts/
+state/
+*.log
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store
+research/
+coverage/

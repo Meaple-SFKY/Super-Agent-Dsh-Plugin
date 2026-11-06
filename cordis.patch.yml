@@ -1,0 +1,5 @@
+# The bundle layer: inserts the single Superagent plugin row. The profile
+# supplies its configuration (stateDir, sources, policy) in its own patch.
+- insert:
+    - id: dsh-superagent-personal
+      name: dsh-superagent-personal
