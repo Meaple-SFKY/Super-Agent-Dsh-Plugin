@@ -110,13 +110,30 @@ export class FakeAgent {
   status: 'idle' | 'running' = 'idle'
   disposeCalls = 0
   readonly options: Record<string, unknown>
-  readonly model = { current: () => undefined, select: () => undefined }
+  modelSelection: unknown
+  readonly modelSelections: unknown[] = []
+  readonly model: { current: () => unknown; select: (selection: unknown) => void }
 
-  constructor(id: SessionId, ctx: FakeAgentContext, options: Record<string, unknown> = {}) {
+  constructor(
+    id: SessionId,
+    ctx: FakeAgentContext,
+    options: Record<string, unknown> = {},
+    initialModel?: unknown,
+    onSelect?: (selection: unknown) => void,
+  ) {
     this.id = id
     this.session = { id }
     this.ctx = ctx
     this.options = options
+    this.modelSelection = initialModel
+    this.model = {
+      current: () => this.modelSelection,
+      select: (selection: unknown) => {
+        this.modelSelection = selection
+        this.modelSelections.push(selection)
+        onSelect?.(selection)
+      },
+    }
   }
 
   followup(message: FakeMessage): void {
@@ -168,7 +185,9 @@ export class FakeAgent {
 export class FakeAgentRegistry {
   readonly live = new Map<string, FakeAgent>()
   readonly persisted = new Set<string>()
-  readonly created: Array<{ sessionId: string; setup?: boolean; cwd?: string }> = []
+  /** Durable model selections keyed by session id (survives {@link restart}). */
+  readonly selections = new Map<string, unknown>()
+  readonly created: Array<{ sessionId: string; setup?: boolean; cwd?: string; agentOptions?: Record<string, unknown> }> = []
   readonly resumed: Array<{ sessionId: string; setup?: boolean }> = []
   readonly handles: Array<{ agent: FakeAgent; dispose: () => Promise<void> }> = []
   private readonly presets: FakeAgentPresets | undefined
@@ -193,8 +212,19 @@ export class FakeAgentRegistry {
   }): Promise<{ agent: Agent; dispose: () => Promise<void> }> {
     const sessionId = String(options.sessionId)
     if (this.live.has(sessionId)) throw new Error(`agent ${sessionId} already live`)
-    const agent = new FakeAgent(brandSessionId(sessionId), new FakeAgentContext(this.presets), options.agentOptions ?? {})
-    this.created.push({ sessionId, setup: options.setup !== undefined, ...(options.meta?.cwd ? { cwd: options.meta.cwd } : {}) })
+    const agent = new FakeAgent(
+      brandSessionId(sessionId),
+      new FakeAgentContext(this.presets),
+      options.agentOptions ?? {},
+      this.selections.get(sessionId),
+      selection => this.selections.set(sessionId, selection),
+    )
+    this.created.push({
+      sessionId,
+      setup: options.setup !== undefined,
+      ...(options.meta?.cwd ? { cwd: options.meta.cwd } : {}),
+      ...(options.agentOptions ? { agentOptions: options.agentOptions as Record<string, unknown> } : {}),
+    })
     await options.setup?.(agent.ctx as unknown as Context, agent as unknown as Agent)
     this.live.set(sessionId, agent)
     this.persisted.add(sessionId)
@@ -216,7 +246,13 @@ export class FakeAgentRegistry {
       const existing = this.live.get(sessionId)!
       return { agent: existing as unknown as Agent, dispose: async () => undefined }
     }
-    const agent = new FakeAgent(brandSessionId(sessionId), new FakeAgentContext(this.presets))
+    const agent = new FakeAgent(
+      brandSessionId(sessionId),
+      new FakeAgentContext(this.presets),
+      {},
+      this.selections.get(sessionId),
+      selection => this.selections.set(sessionId, selection),
+    )
     this.resumed.push({ sessionId, setup: options.setup !== undefined })
     await options.setup?.(agent.ctx as unknown as Context, agent as unknown as Agent)
     this.live.set(sessionId, agent)
@@ -349,7 +385,15 @@ export class FakeRootContext {
   }
 }
 
-export function createFakeHost(options: { presets?: boolean; webServer?: boolean; logger?: RecordingLogger } = {}): FakeHost {
+export function createFakeHost(
+  options: {
+    presets?: boolean
+    webServer?: boolean
+    logger?: RecordingLogger
+    /** Simulate the DSH `agentDefaultModel` service. */
+    defaultModel?: { provider: string; model: string; reasoningEffort?: string }
+  } = {},
+): FakeHost {
   const logger = options.logger ?? new RecordingLogger()
   const presets = new FakeAgentPresets()
   const agents = new FakeAgentRegistry(options.presets === false ? undefined : presets)
@@ -360,6 +404,9 @@ export function createFakeHost(options: { presets?: boolean; webServer?: boolean
     sessionPersistence: persistence,
     ...(options.presets === false ? {} : { agentPresets: presets }),
     ...(options.webServer === false ? {} : { webServer }),
+    ...(options.defaultModel
+      ? { agentDefaultModel: { currentSelection: () => ({ ...options.defaultModel }) } }
+      : {}),
   }
   const ctx = new FakeRootContext(services, logger)
   const host: FakeHost = {

@@ -17,6 +17,7 @@ import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import type { Context } from '@deepseek-ai/cordis'
+import type { AgentOptions } from '@deepseek-ai/dsh-agent'
 import type {
   AcceptMode,
   Assignment,
@@ -350,6 +351,7 @@ export class Runtime {
   private heartbeatQueue: Promise<void> = Promise.resolve()
 
   private readonly timers = new Set<ReturnType<typeof setInterval>>()
+  private modelWarned = false
   private stopped = false
   private stopping?: Promise<void>
   private passBusy = false
@@ -484,9 +486,7 @@ export class Runtime {
       kv: this.store.kv,
       now: () => this.clock.now(),
       presetIds: { router: 'superagent-router', worker: 'superagent-worker' },
-      ...(config.executor?.model
-        ? { agentOptions: { ...(config.executor.provider ? { provider: config.executor.provider } : {}), model: config.executor.model } }
-        : {}),
+      defaultModel: () => this.defaultAgentOptions(),
       maxWorkers: config.executor?.maxWorkers ?? 2,
       createTimeoutMs: 60_000,
       decorate: (agentCtx, info) => this.decorateAgent(agentCtx, info),
@@ -624,6 +624,65 @@ export class Runtime {
   }
 
   // -- wiring --------------------------------------------------------------
+
+  /**
+   * The model route for new Router/Worker sessions.
+   *
+   * Order: explicit `executor.provider`/`executor.model` from the plugin config,
+   * then the DSH default model (`agentDefaultModel.currentSelection()`). A DSH
+   * AgentSession starts with no model selection of its own, so passing this as
+   * `agentOptions` is what makes the first turn runnable.
+   */
+  private defaultAgentOptions(): AgentOptions | undefined {
+    const executor = this.config?.executor
+    if (executor?.model) {
+      return {
+        ...(executor.provider ? { provider: executor.provider } : {}),
+        model: executor.model,
+      }
+    }
+    const service = this.ctx.get('agentDefaultModel') as
+      | { currentSelection?: () => unknown }
+      | undefined
+    if (!service || typeof service.currentSelection !== 'function') {
+      this.warnNoModel('the DSH agentDefaultModel service is unavailable')
+      return undefined
+    }
+    try {
+      const selection = service.currentSelection() as
+        | { provider?: unknown; model?: unknown; reasoningEffort?: unknown }
+        | undefined
+      if (
+        selection &&
+        typeof selection.provider === 'string' &&
+        selection.provider.length > 0 &&
+        typeof selection.model === 'string' &&
+        selection.model.length > 0
+      ) {
+        return {
+          provider: selection.provider,
+          model: selection.model,
+          ...(selection.reasoningEffort !== undefined
+            ? { reasoningEffort: selection.reasoningEffort as AgentOptions['reasoningEffort'] }
+            : {}),
+        }
+      }
+      this.warnNoModel('agentDefaultModel.currentSelection() returned no provider/model')
+    } catch (error) {
+      this.warnNoModel(`agentDefaultModel.currentSelection() failed: ${errorMessage(error)}`)
+    }
+    return undefined
+  }
+
+  private warnNoModel(reason: string): void {
+    if (this.modelWarned) return
+    this.modelWarned = true
+    this.logger.warn(
+      'no default model is available for SuperAgent sessions: set executor.provider/executor.model in the plugin ' +
+        'configuration or configure a default model in DSH settings, otherwise the first Router/Worker turn fails',
+      { reason },
+    )
+  }
 
   private decorateAgent(agentCtx: Context, info: SessionInfo): void {
     const store = this.store

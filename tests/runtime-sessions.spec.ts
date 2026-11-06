@@ -334,3 +334,138 @@ describe('Executor', () => {
     expect(Object.isFrozen(message) || Object.isFrozen(message.content)).toBe(true)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Model fallback (task-16): sessions must get a provider/model route
+// ---------------------------------------------------------------------------
+
+import type { Context } from '@deepseek-ai/cordis'
+import { Runtime, type RuntimeConfig } from '../src/app/runtime.js'
+import { createMemoryStore } from '../src/app/store.js'
+
+function quietLogger(): RecordingLogger {
+  return new RecordingLogger()
+}
+
+function makeSessions(host: ReturnType<typeof createFakeHost>, store: ReturnType<typeof makeHarness>['store'], logger: RecordingLogger, options: { defaultModel?: () => { provider: string; model: string } | undefined } = {}): Sessions {
+  return new Sessions({
+    agents: host.agents as unknown as HostAgentRegistry,
+    presets: host.presets as never,
+    persistence: host.persistence as never,
+    logger,
+    kv: store.kv,
+    createTimeoutMs: 2_000,
+    ...(options.defaultModel ? { defaultModel: options.defaultModel } : {}),
+  })
+}
+
+describe('model fallback for new sessions (task-16)', () => {
+  it('passes the resolved default model to new router and worker sessions', async () => {
+    const host = createFakeHost({ defaultModel: { provider: 'deepseek', model: 'deepseek-chat' } })
+    const harness = makeHarness()
+    const sessions = makeSessions(host, harness.store, quietLogger(), {
+      defaultModel: () => ({ provider: 'deepseek', model: 'deepseek-chat' }),
+    })
+    await sessions.ensureRouter(tempDir())
+    await sessions.ensureWorker('t_model', tempDir())
+
+    expect(host.agents.created.find(entry => entry.sessionId === 'superagent-router')?.agentOptions).toEqual({
+      provider: 'deepseek',
+      model: 'deepseek-chat',
+    })
+    expect(host.agents.created.find(entry => entry.sessionId === 'superagent-worker-t_model')?.agentOptions).toEqual({
+      provider: 'deepseek',
+      model: 'deepseek-chat',
+    })
+  })
+
+  it('repairs a resumed session that has no durable model selection', async () => {
+    const host = createFakeHost({ defaultModel: { provider: 'deepseek', model: 'deepseek-chat' } })
+    const harness = makeHarness()
+    const dir = tempDir()
+    const sessions = makeSessions(host, harness.store, quietLogger(), {
+      defaultModel: () => ({ provider: 'deepseek', model: 'deepseek-chat' }),
+    })
+    await sessions.ensureWorker('t_resume_model', dir)
+    const sessionId = 'superagent-worker-t_resume_model'
+
+    // Simulate a session created by an older build, before the fallback existed.
+    host.agents.selections.delete(sessionId)
+    host.agents.restart()
+    const restarted = makeSessions(host, harness.store, quietLogger(), {
+      defaultModel: () => ({ provider: 'deepseek', model: 'deepseek-chat' }),
+    })
+    await restarted.ensureWorker('t_resume_model', dir)
+
+    const agent = host.agents.liveAgent(sessionId)!
+    expect(agent.modelSelection).toEqual({ provider: 'deepseek', model: 'deepseek-chat' })
+    expect(agent.modelSelections).toHaveLength(1)
+    expect(host.agents.resumed.some(entry => entry.sessionId === sessionId)).toBe(true)
+  })
+
+  it('never overwrites a durable model selection on resume', async () => {
+    const host = createFakeHost({ defaultModel: { provider: 'deepseek', model: 'deepseek-chat' } })
+    const harness = makeHarness()
+    const dir = tempDir()
+    const sessions = makeSessions(host, harness.store, quietLogger(), {
+      defaultModel: () => ({ provider: 'deepseek', model: 'deepseek-chat' }),
+    })
+    await sessions.ensureWorker('t_keep_model', dir)
+    const sessionId = 'superagent-worker-t_keep_model'
+    host.agents.selections.set(sessionId, { provider: 'other', model: 'other-model' })
+    host.agents.restart()
+
+    const restarted = makeSessions(host, harness.store, quietLogger(), {
+      defaultModel: () => ({ provider: 'deepseek', model: 'deepseek-chat' }),
+    })
+    await restarted.ensureWorker('t_keep_model', dir)
+    const agent = host.agents.liveAgent(sessionId)!
+    expect(agent.modelSelection).toEqual({ provider: 'other', model: 'other-model' })
+    expect(agent.modelSelections).toHaveLength(0)
+  })
+
+  it('warns clearly and still creates the session when no model route exists', async () => {
+    const host = createFakeHost()
+    const harness = makeHarness()
+    const logger = quietLogger()
+    const sessions = makeSessions(host, harness.store, logger, { defaultModel: () => undefined })
+    const router = await sessions.ensureRouter(tempDir())
+    expect(String(router.id)).toBe('superagent-router')
+    expect(host.agents.created.find(entry => entry.sessionId === 'superagent-router')?.agentOptions).toBeUndefined()
+    expect(logger.text()).toContain('no provider/model')
+  })
+
+  it('prefers an explicit executor model over the host default, and uses the host default otherwise', async () => {
+    const stateDirs: string[] = []
+    const boot = async (executor: NonNullable<RuntimeConfig['executor']>): Promise<{ runtime: Runtime; host: ReturnType<typeof createFakeHost> }> => {
+      const stateDir = tempDir()
+      stateDirs.push(stateDir)
+      const host = createFakeHost({ defaultModel: { provider: 'host', model: 'host-model' } })
+      const runtime = new Runtime(host.ctx as unknown as Context, {
+        stateDir,
+        sources: { telegram: { enabled: false }, github: { enabled: false } },
+        policy: { mode: 'observe' },
+        executor,
+        passIntervalMs: 60_000,
+        heartbeatIntervalMs: 60_000,
+        watchdog: { intervalMs: 60_000 },
+      }, { store: createMemoryStore(), sources: [], skipLock: true })
+      await runtime.ready
+      return { runtime, host }
+    }
+
+    const explicit = await boot({ provider: 'deepseek', model: 'explicit-model' })
+    expect(explicit.host.agents.created.find(entry => entry.sessionId === 'superagent-router')?.agentOptions).toEqual({
+      provider: 'deepseek',
+      model: 'explicit-model',
+    })
+    await explicit.runtime.stop()
+
+    const fallback = await boot({})
+    expect(fallback.host.agents.created.find(entry => entry.sessionId === 'superagent-router')?.agentOptions).toEqual({
+      provider: 'host',
+      model: 'host-model',
+    })
+    await fallback.runtime.stop()
+  })
+})

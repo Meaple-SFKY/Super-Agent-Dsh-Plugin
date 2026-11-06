@@ -96,8 +96,15 @@ export interface SessionsOptions {
   now?: () => IsoTime
   /** Preset ids declared by the bundle patch. */
   presetIds?: { router: string; worker: string }
-  /** Route used when the preset does not pin a model. */
+  /** Route used when the preset does not pin a model (explicit executor config). */
   agentOptions?: AgentOptions
+  /**
+   * Fallback route resolver for new sessions: the host default model
+   * (`agentDefaultModel.currentSelection()`) or an explicit executor model.
+   * A new AgentSession has no model selection of its own, so without this the
+   * first turn fails with "has no provider/model".
+   */
+  defaultModel?: () => AgentOptions | undefined | Promise<AgentOptions | undefined>
   /** Deadline for one create/resume call. */
   createTimeoutMs?: number
   /** Deadline for one whenIdle/dispose call during stop. */
@@ -242,6 +249,57 @@ export class Sessions {
     return this.bindings.get(sessionId)
   }
 
+  /**
+   * Resolve the fallback route for a new session. Explicit `agentOptions`
+   * (executor config) wins over the host default resolver.
+   */
+  private async resolveFallbackRoute(info: SessionInfo): Promise<AgentOptions | undefined> {
+    if (this.options.agentOptions) return this.options.agentOptions
+    if (!this.options.defaultModel) return undefined
+    try {
+      const route = await this.options.defaultModel()
+      if (route && typeof route.provider === 'string' && typeof route.model === 'string') return route
+    } catch (error) {
+      this.logger.warn('could not resolve the default model route', { error: errorMessage(error) })
+    }
+    this.warnOnce(
+      `no-model:${info.role}`,
+      `no provider/model is available for the ${info.role} session: set executor.model in the plugin ` +
+        'configuration or configure a default model in DSH settings. The session may fail its first turn.',
+    )
+    return undefined
+  }
+
+  /**
+   * A resumed session created before the fallback existed has no durable model
+   * selection. Record the fallback once, so a later turn can run; an existing
+   * durable selection is never overwritten.
+   */
+  private ensureDurableSelection(agent: Agent, fallback: AgentOptions | undefined, resumed: boolean): void {
+    // New sessions get the route through agentOptions; only a resumed session
+    // created before the fallback existed (no durable selection) needs a repair.
+    if (!resumed) return
+    if (!fallback || typeof fallback.provider !== 'string' || typeof fallback.model !== 'string') return
+    try {
+      const model = (agent as unknown as { model?: { current?: () => unknown; select?: (selection: unknown) => void } }).model
+      if (!model || typeof model.select !== 'function') return
+      if (typeof model.current === 'function' && model.current() !== undefined) return
+      model.select({
+        provider: fallback.provider,
+        model: fallback.model,
+        ...(fallback.reasoningEffort !== undefined ? { reasoningEffort: fallback.reasoningEffort } : {}),
+      })
+      this.logger.info('recorded the default model selection on a session without one', {
+        sessionId: String(agent.id),
+      })
+    } catch (error) {
+      this.logger.warn('could not record a fallback model selection', {
+        sessionId: String(agent.id),
+        error: errorMessage(error),
+      })
+    }
+  }
+
   // -- creation ------------------------------------------------------------
 
   /** Create or resume the long-lived Router session. Idempotent. */
@@ -298,6 +356,7 @@ export class Sessions {
   private async openSession(info: SessionInfo, prompt?: () => { name: string; text: string }): Promise<WorkerRecord> {
     const timeoutMs = this.options.createTimeoutMs ?? 60_000
     const sessionId = info.sessionId
+    const fallbackRoute = await this.resolveFallbackRoute(info)
     const setup = async (agentCtx: Context, agent: Agent): Promise<void> => {
       await this.mountPreset(agentCtx, info)
       this.registerPrompt(agentCtx, info, prompt)
@@ -320,7 +379,9 @@ export class Sessions {
       const resumeOptions: ResumeAgentOptions = {
         resumeSessionId: sessionId,
         setup,
-        ...(this.options.agentOptions ? { agentOptions: this.options.agentOptions } : {}),
+        // A fallback route never overrides a durable model selection; the loop
+        // prefers the recorded selection. It only rescues sessions that have none.
+        ...(fallbackRoute ? { agentOptions: fallbackRoute } : {}),
       }
       handle = await withTimeout(
         this.options.agents.resume(resumeOptions),
@@ -333,7 +394,7 @@ export class Sessions {
         sessionId,
         ...(info.cwd ? { meta: { cwd: info.cwd } } : {}),
         setup,
-        ...(this.options.agentOptions ? { agentOptions: this.options.agentOptions } : {}),
+        ...(fallbackRoute ? { agentOptions: fallbackRoute } : {}),
       }
       handle = await withTimeout(
         this.options.agents.create(createOptions),
@@ -349,6 +410,7 @@ export class Sessions {
       disposers: [],
       resumed: persisted,
     }
+    this.ensureDurableSelection(record.agent, fallbackRoute, persisted)
     this.watch(record)
     return record
   }
