@@ -14,6 +14,7 @@ drift, and persist its own state.
 | Live contracts | `cordis_inspect_query` host `Service.listService` / `Event.listEvents` | authoritative for the running process |
 | Reference implementation | github.com/deepseek-ai/dsh-superagent-prototype (MIT), built for `0.2.1-alpha.2` | `src/index.ts`, `src/app/{runtime,sessions,role-models}.ts`, `src/executor/dsh.ts`, `src/client/index.tsx`, `cordis.patch.yml`, `tsdown.config.ts` |
 | In-runtime skill docs | `…/dsh-agent-preset/skills/cordis-plugin-development/references/*.md` + `templates/` | first-party instructions for third-party bundles |
+| **Compile-verified types** | `docs/dsh-types-verified.md` (probe: `research/typecheck-probe.ts`) | every signature below that also appears there was checked with `tsc` against the installed `0.2.2-rc.1` packages; that document wins on disagreement |
 
 Line numbers refer to the extracted copies in `research/vendor/dsh/node_modules/@deepseek-ai/`
 (tools: `research/asar-ls.mjs`, `research/asar-extract.mjs` — read-only asar access).
@@ -53,9 +54,12 @@ wholesale (never deep-merged).
       name: dsh-superagent
     - id: dsh-superagent-worker-preset
       name: '@deepseek-ai/dsh-agent-preset'
-      config: { id: dsh-superagent-worker, name: 执行器, order: 90,
-                description: Dedicated to executor Sessions; not selectable by hand.,
-                plugins: [{ id: tool-fs, name: '@deepseek-ai/dsh-tool-fs' }] }
+      config:                                   # one row per preset
+        id: dsh-superagent-worker
+        name: 执行器
+        description: Dedicated to executor Sessions; not selectable by hand.
+        order: 90
+        plugins: [{ id: tool-fs, name: '@deepseek-ai/dsh-tool-fs' }]
 ```
 
 - Groups: `name: cordis:group` + `group: true` with `config:` = nested row list (later patches may insert by id);
@@ -168,8 +172,10 @@ interface AgentHandle { agent: Agent; dispose(): Promise<void> }
 ### 2.2 The live `Agent`
 
 The **published** interface is minimal (`api-catalog.js:5417`): `interface Agent { readonly id: SessionId }`.
-The runtime object is `ReactLoopAgent` (`dsh-agent-loop/lib/index.js:510`), surface merged in by that package's
-module augmentation (add `import type {} from '@deepseek-ai/dsh-agent-loop'` if TS only sees the base package):
+The runtime object is `ReactLoopAgent` (`dsh-agent-loop/lib/index.js:510`), and the surface is merged into `Agent` by
+**`@deepseek-ai/dsh-agent` itself** (`lib/types/runtime-types.d.ts`, `declare module './types.ts'`), loaded through the
+package's root entry — so `import type { Agent } from '@deepseek-ai/dsh-agent'` is enough. Import it from the
+`/types` subpath and you get the bare `{ id }` interface (verified by compilation: see `docs/dsh-types-verified.md` §5.1):
 
 ```ts
 agent.id; agent.session; agent.ctx; agent.status            // 'idle' | 'running'
@@ -205,7 +211,7 @@ async function ensure(id: SessionId, cwd: string, preset: string): Promise<Agent
 }
 ```
 
-`SessionCreateRequest = { workspaceId? , cwd?, sessionId?, agentPreset? }` (workspace xor cwd);
+`SessionCreateRequest = { workspaceId?, cwd?, sessionId?, agentPreset? }` (workspace xor cwd);
 `resolveAgent` errors: `session/not-found | session/agent-busy | session/writer-held | gateway/internal`.
 Mint ids with `SessionId(string)` (`@deepseek-ai/dsh-session`); the prototype uses deterministic `worker-<ticketId>`
 so session → ticket is a string derivation. Rename: `ctx.sessionController.rename({ sessionId, title })`.
@@ -541,7 +547,7 @@ error path: logged, non-fatal, features silently gone. Make even that case harml
 ```js
 export async function apply(ctx, config) {
   const { getDshRuntimeVersion } = await import('@deepseek-ai/dsh-app-boot')
-  const semver = await import('semver')
+  const semver = await import('semver')             // declare `semver` as a real dependency
   const running = getDshRuntimeVersion()
   if (!semver.satisfies(running, '>=0.2.2-rc.1 <0.3.0', { includePrerelease: true })) {
     ctx.logger.warn('dsh-superagent: unsupported dsh %s — staying inert', running)
@@ -672,7 +678,8 @@ dsh-superagent/
 ```ts
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
-import type {} from '@deepseek-ai/dsh-agent-loop'      // augments Agent with session/ctx/cancel/whenIdle
+import type { Agent } from '@deepseek-ai/dsh-agent'    // root import: augmented with session/ctx/cancel/whenIdle
+import type {} from '@deepseek-ai/dsh-agent-preset'   // ctx.agentPresets augmentation
 import type {} from '@deepseek-ai/dsh-settings'
 import Schema from '@deepseek-ai/schemastery'
 import { Runtime } from './app/runtime.ts'
@@ -688,7 +695,7 @@ export const Config = Schema.object({
 
 export async function apply(ctx: Context, config): Promise<void> {
   const { getDshRuntimeVersion } = await import('@deepseek-ai/dsh-app-boot')
-  const semver = await import('semver')
+  const semver = await import('semver')             // declare `semver` as a real dependency
   const running = getDshRuntimeVersion()
   if (!semver.satisfies(running, '>=0.2.2-rc.1 <0.3.0', { includePrerelease: true })) {
     ctx.logger.warn('dsh-superagent: unsupported dsh %s — inert', running); return
@@ -723,7 +730,7 @@ export class Runtime extends Service {
   }
   async stop(): Promise<void> {
     this.stopped.abort()
-    const ours = this.ctx.agents.list().filter(isOurs)
+    const ours = this.ctx.agents.list()                 // narrow to the sessions this plugin owns
     for (const agent of ours) agent.cancel({ kind: 'user' }, { keepInbox: true })
     await Promise.allSettled(ours.map(agent => agent.whenIdle()))
     // then dispose per-agent registrations, close the store, release the directory lock
@@ -745,9 +752,9 @@ user configures it in Settings.
    `@deepseek-ai/dsh-*@0.2.2-rc.1` types and typecheck before writing production code.
 2. **Client slot ids are source-derived, not live-verified** (`Slots.listSubTree` timed out without an attached page).
    Slot *props* in particular are unverified.
-3. **`Agent` is augmented out-of-band** — `dsh-agent` publishes `{ id }` only; the rest comes from
-   `@deepseek-ai/dsh-agent-loop` augmentation. A missing `import type {} from '…/dsh-agent-loop'` makes correct code
-   fail to compile.
+3. **`Agent` is augmented inside `dsh-agent`** — the published `types.d.ts` interface is `{ id }` only, but the
+   package's root entry loads `runtime-types.d.ts`, which merges `session`/`ctx`/`steer`/`cancel`/`whenIdle` in.
+   Import `Agent` from the package root, never from `@deepseek-ai/dsh-agent/types` (that yields the bare interface).
 4. **`ModelSelection` is not exported as a standalone type** in the catalog; treat it as
    `{ provider: string; model: string; reasoningEffort?: ReasoningEffortId }`.
 5. **`requestBody` modes other than `'buffered'`** (for `ctx.connection.fetch.register`) are not exercised in shipped
