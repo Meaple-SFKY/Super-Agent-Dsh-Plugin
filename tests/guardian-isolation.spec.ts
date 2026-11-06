@@ -226,6 +226,10 @@ describe('guardian Config schema', () => {
     expect(resolved.sources.github.collaborators).toEqual([])
     expect(resolved.sources.github.operatorTokenFile).toBe('')
     expect(resolved.sources.github.acceptInvitations).toBe('allowlist')
+    // MMAgent v1 is usable out of the box: the native bridge is on by default
+    // and can be disabled per profile.
+    expect(resolved.sources.native.enabled).toBe(true)
+    expect(resolved.sources.native.port).toBe(47_821)
     expect(resolved.executor.gitSshKeyFile).toBe('')
     expect(resolved.executor.gitName).toBe('')
     expect(resolved.executor.gitEmail).toBe('')
@@ -492,6 +496,23 @@ describe('Config ↔ source contract', () => {
     expect(missing).toEqual([])
   })
 
+  it('defaults the native bridge on for MMAgent, and can turn it off', async () => {
+    const guardian = await loadGuardian()
+    const Config = guardian.Config as unknown as (value: unknown) => Record<string, any>
+    expect(Config({}).sources.native).toEqual({ enabled: true, port: 47_821 })
+    expect(Config({ sources: { native: { enabled: false } } }).sources.native.enabled).toBe(false)
+    expect(Config({ sources: { native: { port: 0 } } }).sources.native.port).toBe(0)
+    expect(() => Config({ sources: { native: { port: 70_000 } } })).toThrow()
+  })
+
+  it('exposes every native source field in the Config schema', async () => {
+    const source = await sourceFields('src/sources/native.ts', 'NativeSourceConfig')
+    const schema = await schemaFields('    native: Schema.object({')
+    const ignored = new Set(['bridge', 'maxBodyBytes', 'requestsPerSecond', 'inboxLimit'])
+    const missing = source.filter(field => !ignored.has(field) && !schema.includes(field))
+    expect(missing).toEqual([])
+  })
+
   it('defaults the notification/polling knobs and no longer advertises quietHours', async () => {
     const guardian = await loadGuardian()
     const Config = guardian.Config as unknown as (value: unknown) => Record<string, any>
@@ -504,6 +525,10 @@ describe('Config ↔ source contract', () => {
     expect(resolved.sources.github.maxTextChars).toBe(16_000)
     expect(resolved.sources.github.adaptivePolling).toBe(true)
     expect(resolved.sources.github.acceptInvitations).toBe('allowlist')
+    // MMAgent v1 is usable out of the box: the native bridge is on by default
+    // and can be disabled per profile.
+    expect(resolved.sources.native.enabled).toBe(true)
+    expect(resolved.sources.native.port).toBe(47_821)
     expect('quietHours' in resolved.quiet).toBe(false)
   })
 })

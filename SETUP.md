@@ -285,6 +285,15 @@ node scripts/watchdog.mjs --state-dir "$HOME/.dsh/state/superagent" --dry-run
 | `executor.prepare` | — | 新 Ticket 目录里先跑的命令（如 `git worktree add`） |
 | `quiet.maxChars` | 100 | attention 消息的最大长度，超出截断 |
 | `quiet.minChars` | — | `maxChars` 的旧别名，不建议使用 |
+| `sources.native.enabled` | `true` | MMAgent Mac App 的本地桥（127.0.0.1 HTTP + SSE）；关掉则不监听 |
+| `sources.native.port` | `47821` | 本地桥首选端口；被占用时自动换端口，实际端口以 discovery 文件为准 |
+
+### MMAgent Native 桥（默认开启）
+
+- 插件启动后在 `<stateDir>/native.json`（**0600**）写 `{version,port,token,pid,startedAt}`；Mac App 读它拿端口和 token（token 每次启动轮换，不要缓存）。
+- 服务只绑 `127.0.0.1`，默认端口 **47821**（被占用会自动换端口，App 不要写死）；接口前缀 `/superagent/native/v1`，除 SSE 外都要求 `x-mmagent-token`/Bearer。
+- 停止/重启时 discovery 文件会被删除；App 连不上或 401 时重新读文件即可。
+- 不想让本机 App 连接时，把 `sources.native.enabled` 设为 `false`（不影响 Telegram/GitHub）。
 
 运行时环境变量：
 

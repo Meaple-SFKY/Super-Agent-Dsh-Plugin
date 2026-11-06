@@ -221,6 +221,16 @@ export const Config: unknown = Schema.object({
         zh: '轮询间隔（秒）。',
       }),
     }).default({}),
+    native: Schema.object({
+      enabled: Schema.boolean().default(true).i18n({
+        en: 'Local MMAgent bridge: loopback HTTP + SSE on 127.0.0.1. Writes <stateDir>/native.json for the app.',
+        zh: '本地 MMAgent 桥：127.0.0.1 上的 HTTP + SSE，并在 <stateDir>/native.json 写发现文件。',
+      }),
+      port: Schema.number().default(47_821).min(0).max(65_535).i18n({
+        en: 'Preferred loopback port (0 picks a free port; an occupied port falls through to the next candidate).',
+        zh: '首选 loopback 端口（0 自动选择；被占用时尝试后续端口）。',
+      }),
+    }).default({}),
   }).default({}),
   policy: Schema.object({
     mode: Schema.union(['off', 'observe', 'auto']).default('observe').i18n({

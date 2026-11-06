@@ -16,6 +16,7 @@ import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { AgentOptions } from '@deepseek-ai/dsh-agent'
@@ -45,6 +46,15 @@ import type {
   Store,
 } from '../core/ports.js'
 import { createEngine } from '../core/engine.js'
+import { makeTrigger } from '../sources/kind.js'
+import type {
+  NativeBridge,
+  NativeActionResult,
+  NativeReplyResult,
+  NativeState,
+  NativeTaskResult,
+  NativeTicketDetail,
+} from '../sources/native.js'
 import { createEffects } from './effects.js'
 import { createOutbox } from './outbox.js'
 import { openStore } from './store.js'
@@ -75,6 +85,13 @@ export interface TelegramSourceConfig {
   [key: string]: unknown
 }
 
+export interface NativeSourceConfig {
+  enabled?: boolean
+  /** Preferred loopback port; 0 lets the OS choose (default 47821). */
+  port?: number
+  [key: string]: unknown
+}
+
 export interface GithubSourceConfig {
   enabled?: boolean
   tokenEnv?: string
@@ -99,7 +116,7 @@ export interface GithubSourceConfig {
 export interface RuntimeConfig {
   stateDir: string
   enabled?: boolean
-  sources?: { telegram?: TelegramSourceConfig; github?: GithubSourceConfig }
+  sources?: { telegram?: TelegramSourceConfig; github?: GithubSourceConfig; native?: NativeSourceConfig }
   policy?: { mode?: AcceptMode; rules?: Array<{ id: string; name: string; enabled?: boolean; instructions: string }> }
   /** Router session model override (falls back to the DSH default model). */
   router?: { provider?: string; model?: string; reasoningEffort?: string }
@@ -156,6 +173,10 @@ export function validateConfig(raw: unknown): { config?: RuntimeConfig; problem?
   }
   if (config.language !== undefined && config.language !== 'zh' && config.language !== 'en') {
     return { problem: { error: 'configuration.language must be zh or en' } }
+  }
+  const nativePort = config.sources?.native?.port
+  if (nativePort !== undefined && (!Number.isInteger(nativePort) || nativePort < 0 || nativePort > 65_535)) {
+    return { problem: { error: 'configuration.sources.native.port must be an integer 0..65535' } }
   }
   const operatorTokenFile = config.sources?.github?.operatorTokenFile
   if (operatorTokenFile !== undefined && typeof operatorTokenFile === 'string' && operatorTokenFile.trim().length > 0) {
@@ -407,6 +428,9 @@ function buildPolicy(config: RuntimeConfig, paused: boolean): Policy {
       allowed: (telegram.allowedUserIds ?? []).map(id => ({ id, name: id })),
       ...(telegram.chats ? { chats: telegram.chats } : {}),
     }
+  }
+  if (config.sources?.native?.enabled === true) {
+    sources.native = { allowed: [{ id: 'local', name: 'MMAgent' }] }
   }
   if (github) {
     sources.github = {
@@ -1523,6 +1547,205 @@ export class Runtime {
         this.health.fail('sources:github', error)
         this.logger.error('github source is unavailable', { error: errorMessage(error) })
       }
+    }
+    if (sources.native?.enabled === true) {
+      try {
+        const module = (await import('../sources/native.js')) as unknown as {
+          createSource?: (config: Record<string, unknown>, ctx: Record<string, unknown>) => SourceLike
+        }
+        const create = module.createSource
+        if (!create) throw new Error('native source module exports no create function')
+        const source = create(
+          { ...(sources.native as Record<string, unknown>), bridge: this.nativeBridge() },
+          this.sourceContext('native'),
+        )
+        this.sources!.add('native', source)
+      } catch (error) {
+        this.health.fail('sources:native', error)
+        this.logger.error('native source is unavailable', { error: errorMessage(error) })
+      }
+    }
+  }
+
+  /** Native bridge for the MMAgent app: projections + task/reply/action commands. */
+  private nativeBridge(): NativeBridge {
+    const store = () => this.store!
+    const engine = () => this.engine!
+    const stageOf = (ticket: Ticket): string => {
+      const latest = ticket.assignments[ticket.assignments.length - 1]
+      if (latest?.state === 'running') return 'working'
+      if (latest?.state === 'pending') return 'queued'
+      if (ticket.waitingForPerson) return 'waiting'
+      return ticket.state
+    }
+    const summary = (ticket: Ticket): NativeTicketDetail extends never ? never : {
+      id: string
+      title: string
+      stage: string
+      lastReport: string | null
+      at: IsoTime
+    } => ({
+      id: ticket.id,
+      title: ticket.title,
+      stage: stageOf(ticket),
+      lastReport: ticket.latestReport?.kind ?? null,
+      at: ticket.updatedAt,
+    })
+    const findTicket = (thread: string): Ticket | undefined =>
+      [...store().tickets.open(), ...store().read.recentTickets(100)].find(candidate =>
+        candidate.channels.some(channel => channel.thread === thread) ||
+        candidate.origin.triggerId === thread,
+      )
+    const now = (): IsoTime => this.clock.now()
+    const nativeMeta = (): { version: string; port: number; pid: number; startedAt: IsoTime } => {
+      let port = this.config?.sources?.native?.port ?? 47_821
+      let startedAt = this.startedAt ?? now()
+      try {
+        const raw = JSON.parse(readFileSync(join(this.config!.stateDir, 'native.json'), 'utf8')) as {
+          port?: number
+          startedAt?: string
+        }
+        if (typeof raw.port === 'number') port = raw.port
+        if (typeof raw.startedAt === 'string') startedAt = raw.startedAt
+      } catch {
+        // discovery not written yet
+      }
+      return { version: '1.0.0', port, pid: process.pid, startedAt }
+    }
+    return {
+      state: async () => {
+        const base = this.buildState()
+        const active: NativeState['tickets']['active'] = []
+        const attention: NativeState['tickets']['attention'] = []
+        for (const ticket of store().tickets.open()) {
+          active.push(summary(ticket))
+          const report = ticket.latestReport
+          if (report && (report.kind === 'blocked' || report.kind === 'ready' || report.kind === 'failed')) {
+            attention.push(summary(ticket))
+          }
+        }
+        const history = store()
+          .read.recentTickets(50)
+          .filter(ticket => ticket.ends !== undefined)
+          .map(summary)
+        return {
+          ok: true,
+          plugin: base.plugin,
+          paused: base.paused,
+          native: nativeMeta(),
+          tickets: { active, attention, history },
+          sources: base.sources,
+          health: base.health,
+        }
+      },
+      ticket: (ticketId: string): NativeTicketDetail | undefined => {
+        const ticket = store().tickets.get(ticketId)
+        if (!ticket) return undefined
+        const latest = ticket.latestReport
+        const files = (latest?.files ?? []).map(file => ({
+          path: file.path,
+          ...(file.name ? { name: file.name } : {}),
+          ...(file.kind ? { kind: file.kind } : {}),
+          ...(file.caption ? { caption: file.caption } : {}),
+        }))
+        return {
+          id: ticket.id,
+          title: ticket.title,
+          state: ticket.state,
+          stage: stageOf(ticket),
+          source: ticket.channels[0]?.source ?? 'native',
+          thread: ticket.channels[0]?.thread ?? '',
+          createdAt: ticket.createdAt,
+          updatedAt: ticket.updatedAt,
+          ...(ticket.waitingForPerson !== undefined ? { waitingForPerson: ticket.waitingForPerson } : {}),
+          inputs: ticket.inputs.map(input => ({
+            id: input.id,
+            kind: input.kind,
+            at: input.at,
+            ...(input.person !== undefined ? { person: input.person } : {}),
+            ...(input.text !== undefined ? { text: input.text } : {}),
+            ...(input.readAt !== undefined ? { readAt: input.readAt } : {}),
+          })),
+          reports: latest
+            ? [
+                {
+                  kind: latest.kind,
+                  summary: latest.summary,
+                  at: latest.at,
+                  ...(latest.question ? { question: latest.question } : {}),
+                },
+              ]
+            : [],
+          files,
+          attachments: files,
+          assignments: ticket.assignments.map(assignment => ({
+            id: assignment.id,
+            state: assignment.state,
+            createdAt: assignment.createdAt,
+            ...(assignment.startedAt ? { startedAt: assignment.startedAt } : {}),
+            ...(assignment.endedAt ? { endedAt: assignment.endedAt } : {}),
+            ...(assignment.sessionId ? { sessionId: assignment.sessionId } : {}),
+          })),
+          ...(ticket.ends ? { ends: { reason: String(ticket.ends.reason ?? ''), at: ticket.ends.at } } : {}),
+        }
+      },
+      createTask: async ({ text, clientTaskId }: { text: string; clientTaskId?: string }): Promise<NativeTaskResult> => {
+        const thread = `native:task:${randomUUID()}`
+        const triggerId = `tr_native_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+        const trigger = makeTrigger(triggerId, 'native', {
+          kind: 'message',
+          at: now(),
+          thread: { key: thread, source: 'native', label: 'MMAgent' },
+          actor: { id: 'local', name: 'MMAgent' },
+          addressed: 'direct',
+          text,
+          channel: { source: 'native', thread, to: thread },
+          meta: { native: true, ...(clientTaskId ? { clientTaskId } : {}) },
+        })
+        const disposition = engine().sources.receive(trigger)
+        if (disposition !== 'stored' && disposition !== 'duplicate') {
+          return { ok: false, threadId: thread, triggerId, error: String(disposition) }
+        }
+        this.requestWake()
+        const deadline = Date.now() + 1_500
+        while (Date.now() < deadline) {
+          const ticket = findTicket(thread)
+          if (ticket) return { ok: true, ticketId: ticket.id, threadId: thread, triggerId }
+          await new Promise(resolve => setTimeout(resolve, 25))
+        }
+        return { ok: true, threadId: thread, triggerId }
+      },
+      reply: async (ticketId: string, text: string): Promise<NativeReplyResult> => {
+        const ticket = store().tickets.get(ticketId)
+        if (!ticket) return { ok: false, error: `ticket ${ticketId} not found` }
+        const channel = ticket.channels.find(entry => entry.source === 'native')
+        const thread = channel?.thread ?? `native:task:${ticketId}`
+        const triggerId = `tr_native_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+        const trigger = makeTrigger(triggerId, 'native', {
+          kind: 'message',
+          at: now(),
+          thread: { key: thread, source: 'native', label: ticket.title },
+          actor: { id: 'local', name: 'MMAgent' },
+          addressed: 'direct',
+          text,
+          channel: { source: 'native', thread, to: thread },
+          meta: { native: true, ticketId },
+        })
+        const disposition = engine().sources.receive(trigger)
+        if (disposition !== 'stored' && disposition !== 'duplicate') {
+          return { ok: false, error: String(disposition) }
+        }
+        this.requestWake()
+        return { ok: true, triggerId }
+      },
+      action: async (ticketId: string, action: 'ack' | 'retry' | 'stop'): Promise<NativeActionResult> => {
+        const ticket = store().tickets.get(ticketId)
+        if (!ticket) return { ok: false, error: `ticket ${ticketId} not found` }
+        if (action === 'ack') return { ok: true, result: `acknowledged ${ticketId}` }
+        const result = await this.handleAction({ action, ticketId })
+        this.requestWake()
+        return { ok: result.ok, ...(result.result ? { result: result.result } : {}), ...(result.error ? { error: result.error } : {}) }
+      },
     }
   }
 
