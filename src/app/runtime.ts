@@ -51,9 +51,15 @@ import type {
   NativeBridge,
   NativeActionResult,
   NativeReplyResult,
+  NativeSetupBridge,
+  NativeSetupConfigResult,
+  NativeSetupResult,
   NativeState,
   NativeTaskResult,
   NativeTicketDetail,
+  NativeTicketListItem,
+  NativeTicketPage,
+  NativeTicketQuery,
 } from '../sources/native.js'
 import { createEffects } from './effects.js'
 import { createOutbox } from './outbox.js'
@@ -64,7 +70,14 @@ import { Executor } from './executor.js'
 import { Assessor } from './assessor.js'
 import { Watchdog } from './watchdog.js'
 import { registerApi, API_HEADER, API_VERSION, type ApiActionRequest, type ApiActionValue, type ApiDeps, type ApiState } from './api.js'
-import { SetupService, type ConfigEditorLike, type LlmLike, type ProcessResult, type WatchdogScriptName } from './setup.js'
+import {
+  SetupService,
+  type ConfigEditorLike,
+  type LlmLike,
+  type ProcessResult,
+  type SetupDeps,
+  type WatchdogScriptName,
+} from './setup.js'
 import { registerRouterTools } from '../tools/router.js'
 import { registerWorkerTools } from '../tools/worker.js'
 import { preloadPrompts } from '../prompts/index.js'
@@ -577,6 +590,8 @@ export interface RuntimeOverrides {
   scriptPath?: (name: 'watchdog.mjs' | 'install-launchd.sh' | 'uninstall.sh') => string | undefined
   /** Test seam: LaunchAgent plist path used for the installed check. */
   watchdogPlistPath?: () => string
+  /** Test seam: override individual SetupService dependencies (helpers, editor, ssh-keygen). */
+  setupDeps?: Partial<SetupDeps>
 }
 
 interface EffectStat {
@@ -867,6 +882,7 @@ export class Runtime {
         const resolved = resolveGitIdentity(this.config?.executor, this.config?.sources?.github?.login)
         return { name: resolved.gitName ?? '', email: resolved.gitEmail ?? '', sshKeyFile: resolved.gitSshKeyFile ?? '' }
       },
+      ...this.overrides.setupDeps,
     })
     // A fresh runtime means the previous setup edit already restarted us.
     this.setupService.markRestarted()
@@ -1571,6 +1587,56 @@ export class Runtime {
     }
   }
 
+  /** Setup wizard bridge: forwards to the one SetupService (no duplicated logic). */
+  private nativeSetupBridge(): NativeSetupBridge {
+    const setup = () => this.setupService!
+    return {
+      state: async (): Promise<NativeSetupResult> => {
+        const result = await setup().state()
+        return { status: result.status, body: result.body }
+      },
+      saveTelegram: async (body: unknown): Promise<NativeSetupResult> => {
+        const result = await setup().saveTelegram(body)
+        return { status: result.status, body: result.body }
+      },
+      saveGithub: async (body: unknown): Promise<NativeSetupResult> => {
+        const result = await setup().saveGithub(body)
+        return { status: result.status, body: result.body }
+      },
+      saveOperatorToken: async (body: unknown): Promise<NativeSetupResult> => {
+        const result = await setup().saveOperatorToken(body)
+        const payload: Record<string, unknown> = { ...result.body }
+        if (payload.ok === true && typeof payload.operatorTokenFile === 'string' && payload.removed !== true) {
+          payload.restarting = setup().persistOperatorTokenFile(payload.operatorTokenFile)
+        }
+        return { status: result.status, body: payload }
+      },
+      generateSshKey: async (): Promise<NativeSetupResult> => {
+        const result = await setup().generateGithubSshKey()
+        const payload: Record<string, unknown> = { ...result.body }
+        if (payload.ok === true && typeof payload.keyFile === 'string') {
+          payload.restarting = setup().persistGitSshKey(payload.keyFile)
+        }
+        return { status: result.status, body: payload }
+      },
+      listModels: async (): Promise<NativeSetupResult> => {
+        const result = await setup().listModels()
+        return { status: result.status, body: result.body }
+      },
+      prepareConfig: async (body: unknown): Promise<NativeSetupConfigResult> => {
+        const prepared = await setup().prepareConfig(body)
+        return {
+          status: prepared.result.status,
+          body: prepared.result.body,
+          ...(prepared.patch !== undefined ? { patch: prepared.patch } : {}),
+        }
+      },
+      commitConfig: (patch: unknown): void => {
+        setup().commitConfigSoon(patch as never)
+      },
+    }
+  }
+
   /** Native bridge for the MMAgent app: projections + task/reply/action commands. */
   private nativeBridge(): NativeBridge {
     const store = () => this.store!
@@ -1614,7 +1680,7 @@ export class Runtime {
       } catch {
         // discovery not written yet
       }
-      return { version: '1.0.0', port, pid: process.pid, startedAt }
+      return { version: '1.1.0', port, pid: process.pid, startedAt }
     }
     return {
       state: async () => {
@@ -1754,6 +1820,73 @@ export class Runtime {
         this.requestWake()
         return { ok: true, triggerId }
       },
+      tickets: async (options: NativeTicketQuery): Promise<NativeTicketPage> => {
+        const limit = Math.min(Math.max(options.limit ?? 30, 1), 100)
+        const status = options.status ?? 'all'
+        const attentionKinds = new Set(['blocked', 'ready', 'failed'])
+        const summarize = (ticket: Ticket): NativeTicketListItem => {
+          const latest = ticket.assignments[ticket.assignments.length - 1]
+          const stage = ticket.ends
+            ? 'ended'
+            : latest?.state === 'running'
+              ? 'working'
+              : latest?.state === 'pending'
+                ? 'queued'
+                : ticket.waitingForPerson
+                  ? 'waiting'
+                  : 'open'
+          const channel = ticket.channels[0]
+          return {
+            id: ticket.id,
+            title: ticket.title,
+            state: ticket.state,
+            stage,
+            source: channel?.source ?? 'native',
+            thread: channel?.thread ?? '',
+            lastReport: ticket.latestReport?.kind ?? null,
+            createdAt: ticket.createdAt,
+            updatedAt: ticket.updatedAt,
+            ...(ticket.ends ? { endsAt: ticket.ends.at } : {}),
+          }
+        }
+        // The store exposes a bounded recent-window query; 2 000 tickets is the
+        // documented search depth for the native history screen.
+        const all = store().read.recentTickets(2_000)
+        let needle: string | undefined
+        if (options.query !== undefined && options.query.trim().length > 0) needle = options.query.trim().toLowerCase()
+        const filtered = all.filter(ticket => {
+          const ends = ticket.ends !== undefined
+          const attention = ends ? false : attentionKinds.has(ticket.latestReport?.kind ?? '')
+          if (status === 'history' && !ends) return false
+          if (status === 'active' && (ends || attention)) return false
+          if (status === 'attention' && (ends || !attention)) return false
+          if (options.source !== undefined && !ticket.channels.some(channel => channel.source === options.source)) return false
+          if (needle !== undefined) {
+            const haystack = [
+              ticket.id,
+              ticket.title,
+              ticket.latestReport?.summary ?? '',
+              ticket.latestReport?.question ?? '',
+              ...ticket.inputs.map(input => input.text ?? ''),
+            ]
+              .join('\n')
+              .toLowerCase()
+            if (!haystack.includes(needle)) return false
+          }
+          return true
+        })
+        const total = filtered.length
+        let pageItems = filtered
+        if (options.before !== undefined) {
+          const [at, id] = options.before.split('|')
+          if (at && id) pageItems = filtered.filter(ticket => ticket.updatedAt < at || (ticket.updatedAt === at && ticket.id < id))
+        }
+        const page = pageItems.slice(0, limit)
+        const last = page[page.length - 1]
+        const nextBefore = pageItems.length > limit && last ? `${last.updatedAt}|${last.id}` : undefined
+        return { items: page.map(summarize), total, ...(nextBefore ? { nextBefore } : {}) }
+      },
+      setup: this.nativeSetupBridge(),
       action: async (ticketId: string, action: 'ack' | 'retry' | 'stop'): Promise<NativeActionResult> => {
         const ticket = store().tickets.get(ticketId)
         if (!ticket) return { ok: false, error: `ticket ${ticketId} not found` }

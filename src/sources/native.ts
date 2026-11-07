@@ -33,7 +33,7 @@ import { makeTrigger, type Source, type SourceContext } from './kind.js'
 export const NATIVE_SOURCE = 'native'
 export const NATIVE_API_PREFIX = '/superagent/native/v1'
 export const NATIVE_DISCOVERY_FILE = 'native.json'
-export const NATIVE_VERSION = '1.0.0'
+export const NATIVE_VERSION = '1.1.0'
 export const NATIVE_DEFAULT_PORT = 47821
 export const NATIVE_INBOX_FILE = 'native-inbox.jsonl'
 
@@ -53,6 +53,34 @@ export interface NativeTicketSummary {
   stage: string
   lastReport: string | null
   at: IsoTime
+}
+
+export interface NativeTicketListItem {
+  id: string
+  title: string
+  state: string
+  stage: string
+  source: string
+  thread: string
+  lastReport: string | null
+  createdAt: IsoTime
+  updatedAt: IsoTime
+  endsAt?: IsoTime
+}
+
+export interface NativeTicketQuery {
+  query?: string
+  status?: 'all' | 'attention' | 'active' | 'history'
+  source?: string
+  /** Cursor from a previous page's `nextBefore` (`<updatedAt>|<id>`). */
+  before?: string
+  limit?: number
+}
+
+export interface NativeTicketPage {
+  items: NativeTicketListItem[]
+  nextBefore?: string
+  total: number
 }
 
 export interface NativeTicketDetail {
@@ -116,6 +144,33 @@ export interface NativeActionResult {
   error?: string
 }
 
+/** One setup action result, matching the setup HTTP API status/body contract. */
+export interface NativeSetupResult {
+  status: number
+  body: Record<string, unknown>
+}
+
+/** Config preparation result; `patch` is committed after the response is sent. */
+export interface NativeSetupConfigResult extends NativeSetupResult {
+  patch?: unknown
+}
+
+/**
+ * Setup wizard surface backed by the runtime's `SetupService` (token validation,
+ * 0600 secret writes, configEditor persistence). The Source only forwards
+ * authenticated HTTP bodies and never sees a secret it did not just receive.
+ */
+export interface NativeSetupBridge {
+  state(): Promise<NativeSetupResult>
+  saveTelegram(body: unknown): Promise<NativeSetupResult>
+  saveGithub(body: unknown): Promise<NativeSetupResult>
+  saveOperatorToken(body: unknown): Promise<NativeSetupResult>
+  generateSshKey(): Promise<NativeSetupResult>
+  listModels(): Promise<NativeSetupResult>
+  prepareConfig(body: unknown): Promise<NativeSetupConfigResult>
+  commitConfig(patch: unknown): void
+}
+
 /** Everything the HTTP layer needs from the runtime; implemented in {@link Runtime}. */
 export interface NativeBridge {
   state(): NativeState | Promise<NativeState>
@@ -127,6 +182,8 @@ export interface NativeBridge {
   }): Promise<NativeTaskResult>
   reply(ticketId: string, text: string): Promise<NativeReplyResult>
   action(ticketId: string, action: 'ack' | 'retry' | 'stop'): Promise<NativeActionResult>
+  tickets?(options: NativeTicketQuery): Promise<NativeTicketPage>
+  setup?: NativeSetupBridge
 }
 
 export interface NativeSourceConfig {
@@ -391,6 +448,47 @@ export class NativeSource implements Source {
         this.json(response, result.ok ? 200 : 400, result)
         return
       }
+      if (path === `${NATIVE_API_PREFIX}/tickets` && method === 'GET') {
+        if (!this.bridge.tickets) {
+          this.json(response, 501, { ok: false, error: 'tickets_unavailable' })
+          return
+        }
+        const statusParam = url.searchParams.get('status') ?? 'all'
+        if (!['all', 'attention', 'active', 'history'].includes(statusParam)) {
+          this.json(response, 400, { ok: false, error: 'invalid_status', description: 'status must be all, attention, active or history' })
+          return
+        }
+        const sourceParam = url.searchParams.get('source') ?? undefined
+        if (sourceParam !== undefined && !/^[a-z][a-z0-9_-]{0,31}$/i.test(sourceParam)) {
+          this.json(response, 400, { ok: false, error: 'invalid_source' })
+          return
+        }
+        const limitRaw = url.searchParams.get('limit')
+        const limit = limitRaw === null ? 30 : Number(limitRaw)
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+          this.json(response, 400, { ok: false, error: 'invalid_limit', description: 'limit must be an integer 1..100' })
+          return
+        }
+        const query = (url.searchParams.get('query') ?? '').trim().slice(0, 200)
+        const before = url.searchParams.get('before') ?? undefined
+        if (before !== undefined && !/^[^|]+\|.+$/.test(before)) {
+          this.json(response, 400, { ok: false, error: 'invalid_before', description: 'before must be an opaque nextBefore cursor' })
+          return
+        }
+        const page = await this.bridge.tickets({
+          status: statusParam as 'all' | 'attention' | 'active' | 'history',
+          ...(query ? { query } : {}),
+          ...(sourceParam ? { source: sourceParam } : {}),
+          ...(before ? { before } : {}),
+          limit,
+        })
+        this.json(response, 200, { ok: true, ...page })
+        return
+      }
+      if (path.startsWith(`${NATIVE_API_PREFIX}/setup`)) {
+        await this.handleSetup(path, method, request, response)
+        return
+      }
       const ticketMatch = /^\/superagent\/native\/v1\/tickets\/([^/]+)(\/reply)?$/.exec(path)
       if (ticketMatch) {
         const ticketId = decodeURIComponent(ticketMatch[1]!)
@@ -432,6 +530,68 @@ export class NativeSource implements Source {
         // response already closed
       }
     }
+  }
+
+  private async handleSetup(
+    path: string,
+    method: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const setup = this.bridge.setup
+    if (!setup) {
+      this.json(response, 501, { ok: false, error: 'setup_unavailable', description: 'this host exposes no setup service' })
+      return
+    }
+    const base = `${NATIVE_API_PREFIX}/setup`
+    if (path === `${base}/state` && (method === 'GET' || method === 'HEAD')) {
+      const result = await setup.state()
+      this.json(response, result.status, result.body)
+      return
+    }
+    if (path === `${base}/models` && (method === 'GET' || method === 'HEAD')) {
+      const result = await setup.listModels()
+      this.json(response, result.status, result.body)
+      return
+    }
+    if (path === `${base}/telegram` && method === 'POST') {
+      const body = await this.readJson(request)
+      const result = await setup.saveTelegram(body)
+      this.json(response, result.status, result.body)
+      return
+    }
+    if (path === `${base}/github` && method === 'POST') {
+      const body = await this.readJson(request)
+      const result = await setup.saveGithub(body)
+      this.json(response, result.status, result.body)
+      return
+    }
+    if (path === `${base}/github/operator` && method === 'POST') {
+      const body = await this.readJson(request)
+      const result = await setup.saveOperatorToken(body)
+      this.json(response, result.status, result.body)
+      return
+    }
+    if (path === `${base}/github/ssh-key` && method === 'POST') {
+      const result = await setup.generateSshKey()
+      this.json(response, result.status, result.body)
+      return
+    }
+    if (path === `${base}/config` && (method === 'PUT' || method === 'POST')) {
+      const body = await this.readJson(request)
+      const result = await setup.prepareConfig(body)
+      this.json(response, result.status, result.body)
+      // The configEditor restart must happen after the response is flushed.
+      if (result.body.ok === true && result.patch !== undefined) {
+        try {
+          setup.commitConfig(result.patch)
+        } catch (error) {
+          this.ctx.logger.warn('could not schedule the native setup config commit', { error: describe(error) })
+        }
+      }
+      return
+    }
+    this.json(response, 404, { ok: false, error: 'not_found' })
   }
 
   private authorized(request: IncomingMessage): boolean {
