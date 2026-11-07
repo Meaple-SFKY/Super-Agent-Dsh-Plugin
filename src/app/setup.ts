@@ -168,6 +168,8 @@ export interface SetupState {
   restartRequired: boolean
   /** True once the wizard persisted a config (or a pre-existing token setup). */
   onboardingComplete: boolean
+  /** Last async config-persistence failure (diagnostic, sanitized). */
+  configError?: string
 }
 
 /** HTTP-ready result returned by every setup operation. */
@@ -266,6 +268,8 @@ export interface SetupDeps {
   validateConfig: (candidate: unknown) => string | undefined
   /** DSH configuration service; absent on leaner hosts (→ 501). */
   configEditor: () => ConfigEditorLike | undefined
+  /** Run a config-editor mutation outside the plugin's inherited HMR context. */
+  runOutsideHmr?: <T>(operation: () => Promise<T>) => Promise<T>
   /** The Loader entry of this plugin (`ctx.fiber.entry`), read at commit time. */
   hostEntry: () => unknown
   /** Current user-facing language (from the running config). */
@@ -473,6 +477,7 @@ export class SetupService implements SetupApi {
   private readonly deps: SetupDeps
   private readonly logger: AppLogger
   private commit?: Promise<void>
+  private lastConfigError: string | undefined
   private readonly timeoutMs: number
 
   constructor(deps: SetupDeps) {
@@ -1060,6 +1065,7 @@ export class SetupService implements SetupApi {
       permissions: this.permissions().body.permissions as SetupPermission[],
       restartRequired,
       onboardingComplete,
+      ...(this.lastConfigError === undefined ? {} : { configError: this.lastConfigError }),
     }
     return { status: 200, body: state as unknown as Record<string, unknown> }
   }
@@ -1646,7 +1652,8 @@ export class SetupService implements SetupApi {
   commitConfigSoon(patch: SetupConfigPatch): void {
     const run = (): void => {
       this.commit = this.applyConfig(patch).catch((error: unknown) => {
-        this.logger.error('could not persist the setup configuration', { error: this.sanitize(errorMessage(error)) })
+        this.lastConfigError = this.sanitize(errorMessage(error))
+        this.logger.error('could not persist the setup configuration', { error: this.lastConfigError })
       })
     }
     const schedule = this.deps.schedule ?? ((fn: () => void) => {
@@ -1690,12 +1697,20 @@ export class SetupService implements SetupApi {
     if (!editor || entry === undefined) {
       throw new SetupError(501, 'config_editor_unavailable', 'the DSH configEditor service is unavailable')
     }
-    await editor.edit(entry, current => {
-      const base = this.deps.currentConfig() ?? {}
-      return deepMerge(deepMerge(base, current ?? {}), patch as Record<string, unknown>)
-    })
-    // The wizard completed: remember it so a restart does not show it again.
-    await this.writeSetupComplete()
+    const persist = async (): Promise<void> => {
+      await editor.edit(entry, current => {
+        const base = this.deps.currentConfig() ?? {}
+        return deepMerge(deepMerge(base, current ?? {}), patch as Record<string, unknown>)
+      })
+      // The wizard completed: remember it so a restart does not show it again.
+      await this.writeSetupComplete()
+    }
+    // A plugin request inherits the HMR transaction context that loaded the
+    // plugin; configEditor.edit starts its own exclusive transaction and rejects
+    // a nested one. Step outside that inherited context for the mutation.
+    if (this.deps.runOutsideHmr) await this.deps.runOutsideHmr(persist)
+    else await persist()
+    this.lastConfigError = undefined
     this.logger.info('setup configuration persisted; the plugin will restart')
   }
 

@@ -868,6 +868,12 @@ export class Runtime {
       currentConfig: () => this.config as unknown as Record<string, unknown>,
       validateConfig: candidate => validateConfig(candidate).problem?.error,
       configEditor: () => this.ctx.get('configEditor') as ConfigEditorLike | undefined,
+      runOutsideHmr: <T,>(operation: () => Promise<T>): Promise<T> => {
+        const hmr = this.ctx.get('hmr') as
+          | { executing?: { exit?: (fn: () => Promise<T>) => Promise<T> } }
+          | undefined
+        return hmr?.executing?.exit ? hmr.executing.exit(operation) : operation()
+      },
       hostEntry: () => (this.ctx as unknown as { fiber?: { entry?: unknown } }).fiber?.entry,
       redact: redactDetail,
       language: () => this.language,
