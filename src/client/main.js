@@ -166,6 +166,46 @@ function build(require) {
     'setup.subtitle': '三步连接来源，一步保存生效。保存后插件会自动重启，无需重启 DSH。',
     'setup.progress': '已完成 {done}/{total}',
     'setup.step.telegram': 'Telegram',
+    'setup.step.entry': 'Interaction entry',
+    'entry.title': 'Interaction entry',
+    'entry.desc': 'How people reach SuperAgent. Pick at least one: Telegram needs a bot token; MMAgent uses the local bridge.',
+    'entry.telegram': 'Telegram',
+    'entry.telegramHint': 'Talk to the bot on Telegram; requires an @BotFather token.',
+    'entry.native': 'MMAgent',
+    'entry.nativeHint': 'The local MMAgent app over the 127.0.0.1 bridge; no token needed.',
+    'entry.github': 'GitHub',
+    'entry.configured': 'Configured',
+    'entry.notConfigured': 'Not configured',
+    'entry.available': 'Available',
+    'entry.disabled': 'Disabled',
+    'entry.error': 'Error',
+    'entry.atLeastOne': 'Select at least one interaction entry.',
+    'entry.atLeastOneShort': 'None selected',
+    'entry.nativeOnly': 'Using MMAgent only',
+    'entry.nativeOnlyHint': 'Telegram setup will be skipped; you can re-enable it later in Settings.',
+    'entry.skipTelegram': 'Skip Telegram, use MMAgent only',
+    'overview.entries': 'Interaction entry',
+    'finish.entries': 'Interaction entry',
+    'setup.step.entry': '交互入口',
+    'entry.title': '交互入口',
+    'entry.desc': '选择人和 SuperAgent 交互的入口，至少选一个；Telegram 需要 bot token，MMAgent 使用本机桥接。',
+    'entry.telegram': 'Telegram',
+    'entry.telegramHint': '通过 Telegram bot 收发消息；需要 @BotFather 的 token。',
+    'entry.native': 'MMAgent',
+    'entry.nativeHint': '本机 MMAgent 应用通过 127.0.0.1 桥接；不需要 token。',
+    'entry.github': 'GitHub',
+    'entry.configured': '已配置',
+    'entry.notConfigured': '未配置',
+    'entry.available': '可用',
+    'entry.disabled': '已关闭',
+    'entry.error': '异常',
+    'entry.atLeastOne': '至少选择一个交互入口。',
+    'entry.atLeastOneShort': '未选择',
+    'entry.nativeOnly': '仅使用 MMAgent',
+    'entry.nativeOnlyHint': '将跳过 Telegram 配置；之后可以随时在设置里重新启用。',
+    'entry.skipTelegram': '跳过 Telegram，仅用 MMAgent',
+    'overview.entries': '交互入口',
+    'finish.entries': '交互入口',
     'setup.step.github': 'GitHub',
     'setup.step.behavior': '行为',
     'setup.step.finish': '完成',
@@ -349,6 +389,8 @@ function build(require) {
     'permission.restart.title': '配置变更后需要重启插件',
     'permission.restart.detail': '保存配置会重启插件（DSH 配置不是 volatile 的）；向导会轮询 setup/state 直到插件重新就绪。',
     'permissions.title': '权限与安全边界',
+    'permissions.entries': '交互入口',
+    'permissions.entriesHint': '当前人与 SuperAgent 交互的入口；可在设置向导第 1 步修改。',
     'permissions.subtitle': 'SuperAgent 只做你明确允许的事；以下是它需要和不需要的系统权限。',
     'permissions.githubIdentity': 'GitHub 身份',
     'permissions.githubIdentityDetail': '使用专用 bot 账号时，commits/PRs 由 bot 账号发起，你的个人账号只需作为 collaborator（接受仓库邀请，并出现在 allowedLogins 中）。向导会为 bot 生成 SSH 密钥并复制公钥到 bot 账号；私钥留在本机。',
@@ -678,6 +720,8 @@ function build(require) {
     'permission.restart.title': 'Restart required after setup changes',
     'permission.restart.detail': 'Saving configuration restarts the plugin (non-volatile DSH config). The wizard polls setup/state until the plugin is ready again.',
     'permissions.title': 'Permissions and boundaries',
+    'permissions.entries': 'Interaction entry',
+    'permissions.entriesHint': 'How people currently reach SuperAgent; change it in step 1 of the setup wizard.',
     'permissions.subtitle': 'SuperAgent does only what you allow. Here is what it needs — and what it does not.',
     'permissions.githubIdentity': 'GitHub identity',
     'permissions.githubIdentityDetail': 'With a dedicated bot account, commits and pull requests are authored by the bot; your personal account only needs to be a collaborator (accept the repository invite and appear in allowedLogins). The wizard generates the bot SSH key and you paste its public key into the bot account; the private key stays local.',
@@ -956,22 +1000,29 @@ function build(require) {
     const accounts = setup && typeof setup === 'object' ? setup.accounts : undefined
     const telegram = accounts && typeof accounts.telegram === 'object' ? accounts.telegram : {}
     const github = accounts && typeof accounts.github === 'object' ? accounts.github : {}
+    const native = accounts && typeof accounts.native === 'object' ? accounts.native : {}
     const repositories = listOf(github.repositories).map(repoEntry).filter(Boolean)
     return {
       telegram,
       github,
+      native,
       repositories,
     }
   }
 
   function isSetupConfigured(setup) {
     const { telegram, github } = normalizeSetupAccounts(setup)
-    return telegram.configured === true || github.configured === true
+    // The runtime persists an explicit `setup-complete.json` marker after the
+    // first successful config write. It is the only durable "onboarding done"
+    // signal for the native-only flow (native is enabled by default, so
+    // accounts.native cannot decide this).
+    const onboardingComplete = setup && typeof setup === 'object' && setup.onboardingComplete === true
+    return onboardingComplete || telegram.configured === true || github.configured === true
   }
 
   function expectedAccounts(wizard) {
     return {
-      telegram: wizard.telegram.status === 'validated' && wizard.telegram.skipped !== true,
+      telegram: wizard.entry && wizard.entry.telegram !== false && wizard.telegram.status === 'validated' && wizard.telegram.skipped !== true,
       github: wizard.github.status === 'validated' && wizard.github.skipped !== true,
     }
   }
@@ -987,6 +1038,9 @@ function build(require) {
     return {
       open: false,
       step: 0,
+      // Onboarding defaults both entries on (existing installs already have
+      // Telegram and the local MMAgent bridge enabled by default).
+      entry: { telegram: true, native: true },
       telegram: { status: 'idle', token: '', botUsername: '', tokenFile: '', richText: true, files: true, keyboards: true, error: '', skipped: false },
       github: { status: 'idle', token: '', login: '', tokenFile: '', repositories: [], selected: [], allowSelf: false, operator: '', personalToken: '', operatorTokenConfigured: false, operatorTokenFile: '', operatorError: '', acceptInvitations: 'allowlist', sshKeyFile: '', sshKeyPublic: '', sshKeyGenerated: false, sshKeyExisting: false, sshKeyGenerating: false, sshKeyRestarting: false, sshKeyError: '', error: '', skipped: false },
       behavior: { allowedUserIds: '', mode: 'observe', maxWorkers: 2, language: 'zh', routerModel: '', workerModel: '' },
@@ -1009,7 +1063,7 @@ function build(require) {
 
   function wizardFromSetup(setup) {
     const base = defaultWizard()
-    const { telegram, github, repositories } = normalizeSetupAccounts(setup)
+    const { telegram, github, native, repositories } = normalizeSetupAccounts(setup)
     const git = setup && typeof setup === 'object' && setup.git && typeof setup.git === 'object' ? setup.git : {}
     const existing = repositories.map(repo => repo.fullName).filter(Boolean)
     const configured = telegram.configured === true || github.configured === true
@@ -1020,6 +1074,7 @@ function build(require) {
       // token again; the wizard only restarts at step 0 via "Reconfigure".
       step: configured ? 3 : 0,
       finish: configured ? { status: 'done', error: '', elapsed: 0 } : base.finish,
+      entry: { telegram: telegram.enabled !== false, native: native.enabled !== false },
       telegram: {
         ...base.telegram,
         status: telegram.configured === true ? 'validated' : 'idle',
@@ -1060,11 +1115,11 @@ function build(require) {
     }
   }
 
-  const WIZARD_STEPS = ['telegram', 'github', 'behavior', 'finish']
+  const WIZARD_STEPS = ['entry', 'github', 'behavior', 'finish']
 
   function stepLabels(t) {
     return [
-      t('setup.step.telegram'),
+      t('setup.step.entry'),
       t('setup.step.github'),
       t('setup.step.behavior'),
       t('setup.step.finish'),
@@ -1083,7 +1138,13 @@ function build(require) {
   }
 
   function canAdvance(step, wizard) {
-    if (step === 0) return wizard.telegram.status === 'validated' || wizard.telegram.skipped === true
+    if (step === 0) {
+      const telegramSelected = wizard.entry ? wizard.entry.telegram !== false : true
+      const nativeSelected = wizard.entry ? wizard.entry.native !== false : true
+      if (!telegramSelected && !nativeSelected) return false
+      if (!telegramSelected) return true
+      return wizard.telegram.status === 'validated' || wizard.telegram.skipped === true
+    }
     if (step === 1) {
       if (wizard.github.skipped === true) return true
       return (
@@ -1097,7 +1158,7 @@ function build(require) {
       if (!['off', 'observe', 'auto'].includes(wizard.behavior.mode)) return false
       const workers = asNumber(wizard.behavior.maxWorkers, 0)
       if (workers < 1 || workers > MAX_WORKERS) return false
-      if (wizard.telegram.status === 'validated' && parseUserIds(wizard.behavior.allowedUserIds).length === 0) return false
+      if (wizard.entry && wizard.entry.telegram !== false && wizard.telegram.status === 'validated' && parseUserIds(wizard.behavior.allowedUserIds).length === 0) return false
       return true
     }
     return true
@@ -1108,14 +1169,16 @@ function build(require) {
     if (!['off', 'observe', 'auto'].includes(wizard.behavior.mode)) return t('behavior.errorMode')
     const workers = asNumber(wizard.behavior.maxWorkers, 0)
     if (workers < 1 || workers > MAX_WORKERS) return t('behavior.workersHint')
-    if (wizard.telegram.status === 'validated' && parseUserIds(wizard.behavior.allowedUserIds).length === 0) {
+    if (wizard.entry && wizard.entry.telegram !== false && wizard.telegram.status === 'validated' && parseUserIds(wizard.behavior.allowedUserIds).length === 0) {
       return t('behavior.errorUsers')
     }
     return ''
   }
 
   function buildConfig(wizard) {
-    const telegramEnabled = wizard.telegram.status === 'validated' && wizard.telegram.skipped !== true
+    const entryTelegram = wizard.entry ? wizard.entry.telegram !== false : true
+    const entryNative = wizard.entry ? wizard.entry.native !== false : true
+    const telegramEnabled = entryTelegram && wizard.telegram.status === 'validated' && wizard.telegram.skipped !== true
     const githubEnabled = wizard.github.status === 'validated' && wizard.github.skipped !== true
     const telegram = { enabled: telegramEnabled }
     if (telegramEnabled) {
@@ -1154,9 +1217,13 @@ function build(require) {
       executor.model = worker.model
       if (worker.reasoningEffort) executor.reasoningEffort = worker.reasoningEffort
     }
+    // Deselecting Telegram writes an explicit disabled block so switching from
+    // "both" to "MMAgent only" really turns Telegram off; the existing token
+    // stays on disk/config through the merge (no token is written here).
+    const sources = { telegram: entryTelegram ? telegram : { enabled: false }, github, native: { enabled: entryNative } }
     const config = {
       language: isLanguage(wizard.behavior.language) ? wizard.behavior.language : 'zh',
-      sources: { telegram, github },
+      sources,
       policy: { mode: wizard.behavior.mode },
       executor,
     }
@@ -1626,6 +1693,13 @@ function build(require) {
   background: var(--dsw-alias-toast-bg); color: var(--dsw-alias-toast-label);
   animation: sa-fade .18s ease-out;
 }
+.sa-entry-card { display: flex; align-items: flex-start; gap: 10px; padding: 14px; border: 0.5px solid var(--dsw-alias-border-l1); border-radius: var(--dsw-radius-lg); background: var(--dsw-alias-bg-layer-2); cursor: pointer; }
+.sa-entry-card.is-selected { border-color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-interactive-bg-active); }
+.sa-entry-card input { margin-top: 3px; flex: 0 0 auto; }
+.sa-entry-icon { flex: 0 0 auto; margin-top: 1px; color: var(--dsw-alias-label-secondary); }
+.sa-entry-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; flex: 1 1 auto; }
+.sa-entry-title { font-size: 13.5px; font-weight: 600; color: var(--dsw-alias-label-primary); }
+.sa-alert-note { margin-top: 10px; color: var(--dsw-alias-state-error-primary); font-size: 12.5px; line-height: 18px; }
 .sa-stages { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; margin: 4px 0 0; padding: 0; }
 .sa-stage { display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 999px; border: 0.5px solid var(--dsw-alias-border-l1); color: var(--dsw-alias-label-tertiary); font-size: 11.5px; line-height: 16px; }
 .sa-stage-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dsw-alias-border-l2); flex: 0 0 auto; }
@@ -1697,6 +1771,8 @@ function build(require) {
     globe: ['M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z', 'M3.4 12h17.2', 'M12 3a14 14 0 0 1 0 18 14 14 0 0 1 0-18Z'],
     copy: ['M9 9h9.5A1.5 1.5 0 0 1 20 10.5v9A1.5 1.5 0 0 1 18.5 21h-9A1.5 1.5 0 0 1 8 19.5v-9A1.5 1.5 0 0 1 9.5 9Z', 'M16 9V4.5A1.5 1.5 0 0 0 14.5 3h-9A1.5 1.5 0 0 0 4 4.5v9A1.5 1.5 0 0 0 5.5 15H8'],
     arrowRight: ['M4.5 12h15', 'M13.5 6l6 6-6 6'],
+    route: ['M5 19c0-5 4-8 9-8h5', 'm16 8 3 3-3 3', 'M5 5v14'],
+    monitor: ['M3 5h18v10H3z', 'M8 21h8', 'M12 15v6'],
   }
 
   function Icon(props) {
@@ -2428,6 +2504,45 @@ function build(require) {
 
     const kindTone = kind => (kind === 'ready' ? 'ok' : kind === 'failed' ? 'error' : 'warn')
 
+    const accounts = setupData && setupData.accounts && typeof setupData.accounts === 'object' ? setupData.accounts : {}
+    const sourceHealth = new Map(sources.map(source => [source && source.id, source]))
+    const entryDefs = [
+      { id: 'telegram', label: t('entry.telegram'), icon: 'telegram', account: accounts.telegram },
+      { id: 'github', label: t('entry.github'), icon: 'github', account: accounts.github },
+      { id: 'native', label: t('entry.native'), icon: 'monitor', account: accounts.native },
+    ]
+
+    function entryRow(def) {
+      const runtime = sourceHealth.get(def.id)
+      const account = def.account && typeof def.account === 'object' ? def.account : {}
+      const health = runtime && runtime.health
+      const configured =
+        def.id === 'native'
+          ? account.enabled === true
+          : account.configured === true
+      const disabled = account.enabled === false
+      const tone = disabled ? 'idle' : health === 'ready' || configured ? 'ok' : health === 'error' ? 'error' : 'plain'
+      const label = health === 'ready'
+        ? t('entry.available')
+        : health === 'error'
+          ? t('entry.error')
+          : disabled
+            ? t('entry.disabled')
+            : configured
+              ? t('entry.available')
+              : t('entry.notConfigured')
+      return h(
+        'div',
+        { className: 'sa-row', key: def.id },
+        h(Dot, { tone: tone === 'plain' ? 'idle' : tone === 'idle' ? 'idle' : tone === 'error' ? 'error' : 'ok' }),
+        h('div', { className: 'sa-rowmain' },
+          h('div', { className: 'sa-rowtitle sa-inline' }, h(Icon, { name: def.icon, size: 14 }), h('span', null, def.label)),
+          runtime && runtime.detail ? h(ExpandableDetail, { t, text: runtime.detail, clamp: 2, threshold: 120 }) : null,
+        ),
+        h(Pill, { tone: tone === 'plain' ? 'plain' : tone === 'idle' ? 'plain' : tone }, label),
+      )
+    }
+
     function sourceRow(source, index) {
       return h(
         'div',
@@ -2645,10 +2760,11 @@ function build(require) {
         h(
           Card,
           null,
-          h(CardHead, { icon: 'globe', title: t('overview.sources'), count: sources.length ? `(${sources.length})` : undefined }),
-          sources.length === 0
-            ? h(EmptyState, { icon: 'globe', title: t('overview.noSources'), hint: t('overview.noSourcesHint') })
-            : h('div', { className: 'sa-list' }, sources.map(sourceRow)),
+          h(CardHead, { icon: 'route', title: t('overview.entries'), count: entryDefs.length ? `(${entryDefs.length})` : undefined }),
+          h('div', { className: 'sa-list' },
+            entryDefs.map(entryRow),
+            sources.filter(source => !['telegram', 'github', 'native'].includes(source && source.id)).map(sourceRow),
+          ),
         ),
         h(
           Card,
@@ -2731,7 +2847,75 @@ function build(require) {
       onSetWizard(current => ({ ...current, behavior: { ...current.behavior, ...patch } }))
     }
 
-    // -- step 1: Telegram ----------------------------------------------------
+    // -- step 1: interaction entry (Telegram / MMAgent) ---------------------
+
+    function toggleEntry(key) {
+      onSetWizard(current => {
+        const entry = { ...(current.entry || { telegram: true, native: true }) }
+        const next = { ...entry, [key]: !entry[key] }
+        // At least one interaction entry is required.
+        if (!next.telegram && !next.native) return current
+        const telegram =
+          key === 'telegram' && !next.telegram
+            ? { ...current.telegram, status: 'idle', error: '', skipped: false }
+            : current.telegram
+        return { ...current, entry: next, telegram }
+      })
+    }
+
+    function entryCard(key, icon, titleKey, hintKey, selected) {
+      const setupData = setup.data || {}
+      const accounts = setupData.accounts && typeof setupData.accounts === 'object' ? setupData.accounts : {}
+      const account = accounts[key] && typeof accounts[key] === 'object' ? accounts[key] : {}
+      const configured =
+        key === 'telegram' ? account.configured === true : account.enabled === true
+      return h(
+        'label',
+        { className: `sa-entry-card${selected ? ' is-selected' : ''}` },
+        h('input', {
+          type: 'checkbox',
+          checked: selected,
+          onChange: () => toggleEntry(key),
+          'aria-label': t(titleKey),
+        }),
+        h('span', { className: 'sa-entry-icon' }, h(Icon, { name: icon, size: 18 })),
+        h(
+          'span',
+          { className: 'sa-entry-text' },
+          h('span', { className: 'sa-entry-title' }, t(titleKey)),
+          h('span', { className: 'sa-hint' }, t(hintKey)),
+        ),
+        h(Pill, { tone: configured ? 'ok' : 'plain' }, configured ? t('entry.configured') : t('entry.notConfigured')),
+      )
+    }
+
+    function entryStep() {
+      const entry = wizard.entry || { telegram: true, native: true }
+      const noneSelected = !entry.telegram && !entry.native
+      return h(
+        'div',
+        { className: 'sa-fade' },
+        h(
+          Card,
+          { variant: 'flat' },
+          h(CardHead, { icon: 'route', title: t('entry.title'), subtitle: t('entry.desc') }),
+          h(
+            'div',
+            { className: 'sa-grid sa-grid--two' },
+            entryCard('telegram', 'telegram', 'entry.telegram', 'entry.telegramHint', entry.telegram),
+            entryCard('native', 'monitor', 'entry.native', 'entry.nativeHint', entry.native),
+          ),
+          noneSelected ? h('div', { className: 'sa-alert-note', role: 'alert' }, t('entry.atLeastOne')) : null,
+        ),
+        entry.telegram
+          ? telegramStep()
+          : h(
+              Alert,
+              { tone: 'info', title: t('entry.nativeOnly') },
+              h('div', null, t('entry.nativeOnlyHint')),
+            ),
+      )
+    }
 
     function telegramStep() {
       const validated = telegram.status === 'validated'
@@ -3361,6 +3545,14 @@ function build(require) {
       const summary = h(
         'div',
         { className: 'sa-summary' },
+        h(SummaryRow, { label: t('finish.entries'), onEdit: () => onEditStep(0), editLabel: t('common.edit') },
+          h('span', { className: 'sa-inline' },
+            wizard.entry && wizard.entry.telegram !== false ? h(Pill, { tone: 'plain' }, t('entry.telegram')) : null,
+            wizard.entry && wizard.entry.native !== false ? h(Pill, { tone: 'plain' }, t('entry.native')) : null,
+            !(wizard.entry && (wizard.entry.telegram !== false || wizard.entry.native !== false))
+              ? t('entry.atLeastOneShort')
+              : null,
+          )),
         h(SummaryRow, { label: t('finish.telegram'), onEdit: () => onEditStep(0), editLabel: t('common.edit') },
           telegram.status === 'validated'
             ? h('span', { className: 'sa-inline' }, h(Icon, { name: 'bot', size: 13 }), `@${telegram.botUsername || 'bot'}`)
@@ -3486,11 +3678,16 @@ function build(require) {
     // -- footer --------------------------------------------------------------
 
     const stepContent =
-      step === 0 ? telegramStep() : step === 1 ? githubStep() : step === 2 ? behaviorStep() : finishStep()
+      step === 0 ? entryStep() : step === 1 ? githubStep() : step === 2 ? behaviorStep() : finishStep()
 
     const canContinue = step < 3 && canAdvance(step, wizard)
     const showSkip =
-      (step === 0 && telegram.status !== 'validated' && telegram.skipped !== true) ||
+      (step === 0 &&
+        wizard.entry &&
+        wizard.entry.telegram !== false &&
+        wizard.entry.native !== false &&
+        telegram.status !== 'validated' &&
+        telegram.skipped !== true) ||
       (step === 1 && github.status !== 'validated' && github.skipped !== true)
 
     return h(
@@ -3521,7 +3718,7 @@ function build(require) {
           ? h(Button, { variant: 'ghost', onClick: () => setStep(step - 1) }, `← ${t('common.back')}`)
           : null,
         h('span', { className: 'sa-spacer' }),
-        showSkip && step === 0 ? h(Button, { variant: 'ghost', onClick: onSkipTelegram }, t('telegram.skip')) : null,
+        showSkip && step === 0 ? h(Button, { variant: 'ghost', onClick: onSkipTelegram }, t('entry.skipTelegram')) : null,
         showSkip && step === 1 ? h(Button, { variant: 'ghost', onClick: onSkipGithub }, t('github.skip')) : null,
         step < 3
           ? h(Button, {
@@ -3541,7 +3738,7 @@ function build(require) {
   // -- permissions ------------------------------------------------------------
 
   function PermissionsView(props) {
-    const { t, permissions, watchdog, watchdogBusy, watchdogNote, onRefresh, onToggleWatchdog } = props
+    const { t, permissions, watchdog, watchdogBusy, watchdogNote, onRefresh, onToggleWatchdog, entry } = props
     const payload = permissions.data
     const runtimeEntries =
       payload && Array.isArray(payload.permissions)
@@ -3611,6 +3808,21 @@ function build(require) {
         ),
         h('div', { style: { marginLeft: 'auto' } },
           h(Button, { size: 'sm', icon: 'refresh', onClick: onRefresh }, t('common.refresh'))),
+      ),
+      h(
+        Card,
+        { variant: 'flat' },
+        h(CardHead, { icon: 'route', title: t('permissions.entries') }),
+        h(
+          'div',
+          { className: 'sa-inline' },
+          entry && entry.telegram !== false ? h(Pill, { tone: 'ok' }, t('entry.telegram')) : null,
+          entry && entry.native !== false ? h(Pill, { tone: 'ok' }, t('entry.native')) : null,
+          !(entry && (entry.telegram !== false || entry.native !== false))
+            ? h(Pill, { tone: 'warn' }, t('entry.atLeastOneShort'))
+            : null,
+        ),
+        h('div', { className: 'sa-hint', style: { marginTop: 6 } }, t('permissions.entriesHint')),
       ),
       h('div', { className: 'sa-grid sa-grid--two' }, staticItems.map(itemCard)),
       h(
@@ -4017,7 +4229,15 @@ function build(require) {
     }
 
     function skipTelegram() {
-      setWizard(current => ({ ...current, telegram: { ...current.telegram, skipped: true, error: '' }, step: Math.min(3, current.step + 1) }))
+      // Skipping the Telegram entry means "use MMAgent only": deselect Telegram
+      // and continue. The native entry is already selected (the skip button is
+      // only shown when both entries are on).
+      setWizard(current => ({
+        ...current,
+        entry: { ...(current.entry || { telegram: true, native: true }), telegram: false },
+        telegram: { ...current.telegram, status: 'idle', skipped: true, error: '' },
+        step: Math.min(3, current.step + 1),
+      }))
     }
 
     function skipGithub() {
@@ -4078,7 +4298,12 @@ function build(require) {
         const elapsed = Math.max(0, Math.round((Date.now() - startedAt) / 1000))
         const ready = poll.ok && poll.data && poll.data.plugin && poll.data.plugin.status === 'ready'
         const pending = poll.ok && poll.data && poll.data.restartRequired === true
-        if (ready && !pending && accountsMatch(poll.data, expected)) {
+        // Runtime writes setup-complete.json only after the configEditor write
+        // succeeds. Wait for that flag when the Host exposes it, so a native-only
+        // install is durably marked complete before the wizard closes.
+        const onboarding = poll.ok && poll.data ? poll.data.onboardingComplete : undefined
+        const onboardingReady = onboarding === undefined || onboarding === true
+        if (ready && !pending && onboardingReady && accountsMatch(poll.data, expected)) {
           setWizard(wizardState => ({ ...wizardState, finish: { status: 'done', error: '', elapsed } }))
           void setup.refresh()
           void dashboard.refresh()
@@ -4144,6 +4369,7 @@ function build(require) {
         watchdogNote,
         onRefresh: () => void permissions.refresh(),
         onToggleWatchdog: enabled => void toggleWatchdog(enabled),
+        entry: wizard.entry,
       })
     } else {
       content = h(OverviewView, {

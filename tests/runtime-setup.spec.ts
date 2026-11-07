@@ -1525,3 +1525,179 @@ describe('operator PAT removal (task-52)', () => {
     expect(result.body).toMatchObject({ ok: true, operatorTokenConfigured: false })
   })
 })
+
+describe('native bridge in setup state and config (task-65)', () => {
+  function nativeAccount(state: Record<string, unknown>): Record<string, unknown> {
+    const accounts = state.accounts as { native?: Record<string, unknown> }
+    return accounts.native ?? {}
+  }
+
+  it('exposes accounts.native enabled/configured/port with sensible defaults', async () => {
+    const harness = makeHarness()
+    const state = (await harness.service.state()).body as Record<string, unknown>
+    expect(accountsNative(state)).toEqual({ enabled: true, configured: false, port: 47_821 })
+  })
+
+  it('reflects the discovery port once native.json exists', async () => {
+    const harness = makeHarness()
+    writeFileSync(join(harness.stateDir, 'native.json'), JSON.stringify({ port: 50_001, version: '1.0.0' }), {
+      mode: 0o600,
+    })
+    const state = (await harness.service.state()).body as Record<string, unknown>
+    expect(accountsNative(state)).toMatchObject({ enabled: true, configured: true, port: 50_001 })
+  })
+
+  it('reflects sources.native.enabled and the configured port', async () => {
+    const harness = makeHarness()
+    const githubConfig = harness.config.sources as Record<string, Record<string, unknown>>
+    githubConfig.native = { enabled: false, port: 49_999 }
+    const state = (await harness.service.state()).body as Record<string, unknown>
+    expect(accountsNative(state)).toMatchObject({ enabled: false, port: 49_999 })
+  })
+
+  it('accepts sources.native in PUT config and persists it through configEditor', async () => {
+    const harness = makeHarness()
+    const prepared = await harness.service.prepareConfig({
+      config: { sources: { native: { enabled: false, port: 49_999 } } },
+    })
+    expect(prepared.result.status).toBe(200)
+    expect(prepared.result.body).toEqual({ ok: true, restarting: true })
+    expect((prepared.patch?.sources as Record<string, unknown>).native).toEqual({ enabled: false, port: 49_999 })
+
+    harness.service.commitConfigSoon(prepared.patch!)
+    runScheduled(harness)
+    await harness.service.waitForCommit()
+    expect((harness.editor.calls[0]!.next.sources as Record<string, unknown>).native).toEqual({
+      enabled: false,
+      port: 49_999,
+    })
+
+    // Re-enabling works the same way.
+    const again = await harness.service.prepareConfig({ config: { sources: { native: { enabled: true } } } })
+    expect(again.result.status).toBe(200)
+    expect((again.patch?.sources as Record<string, unknown>).native).toEqual({ enabled: true })
+  })
+
+  it('rejects malformed native config patches', async () => {
+    const harness = makeHarness()
+    expect(
+      (await harness.service.prepareConfig({ config: { sources: { native: { enabled: 'yes' } } } })).result.status,
+    ).toBe(400)
+    expect(
+      (await harness.service.prepareConfig({ config: { sources: { native: { port: 70_000 } } } })).result.status,
+    ).toBe(400)
+    expect(
+      (await harness.service.prepareConfig({ config: { sources: { native: { port: -1 } } } })).result.status,
+    ).toBe(400)
+  })
+
+  it('starts/stops the native Source from the config and reports it in the Overview sources list', async () => {
+    const stateDir = tempStateDir()
+    const boot = async (enabled: boolean) => {
+      const host = createFakeHost()
+      const store = createMemoryStore()
+      const runtime = new Runtime(
+        host.ctx as unknown as Context,
+        {
+          stateDir,
+          sources: {
+            telegram: { enabled: false },
+            github: { enabled: false },
+            native: { enabled, port: 0 },
+          },
+          policy: { mode: 'observe' },
+          passIntervalMs: 60_000,
+          heartbeatIntervalMs: 60_000,
+          watchdog: { intervalMs: 60_000 },
+        },
+        { store, skipLock: true },
+      )
+      await runtime.ready
+      const deadline = Date.now() + 2_000
+      while (
+        Date.now() < deadline &&
+        !runtime.buildState().sources.some(entry => entry.id === 'native' && entry.health === 'ready')
+      ) {
+        await new Promise(resolve => setTimeout(resolve, 20))
+      }
+      return runtime
+    }
+
+    const enabledRuntime = await boot(true)
+    try {
+      const sources = enabledRuntime.buildState().sources
+      expect(sources.find(entry => entry.id === 'native')).toMatchObject({ id: 'native', health: 'ready' })
+    } finally {
+      await enabledRuntime.stop()
+    }
+
+    const disabledRuntime = await boot(false)
+    try {
+      expect(disabledRuntime.buildState().sources.some(entry => entry.id === 'native')).toBe(false)
+    } finally {
+      await disabledRuntime.stop()
+    }
+  })
+})
+
+function accountsNative(state: Record<string, unknown>): Record<string, unknown> {
+  const accounts = state.accounts as { native?: Record<string, unknown> } | undefined
+  return accounts?.native ?? {}
+}
+
+describe('onboarding completion marker (task-65 follow-up)', () => {
+  it('is false before the wizard persists anything', async () => {
+    const harness = makeHarness()
+    const state = (await harness.service.state()).body as { onboardingComplete: boolean }
+    expect(state.onboardingComplete).toBe(false)
+    expect(existsSync(join(harness.stateDir, 'setup-complete.json'))).toBe(false)
+  })
+
+  it('writes setup-complete.json 0600 only after a successful config persistence', async () => {
+    const harness = makeHarness()
+    const prepared = await harness.service.prepareConfig({ config: { sources: { native: { enabled: true } } } })
+    expect(prepared.result.status).toBe(200)
+    // Scheduling is not persistence: the marker must not exist yet.
+    expect(existsSync(join(harness.stateDir, 'setup-complete.json'))).toBe(false)
+    expect(((await harness.service.state()).body as { onboardingComplete: boolean }).onboardingComplete).toBe(false)
+
+    harness.service.commitConfigSoon(prepared.patch!)
+    runScheduled(harness)
+    await harness.service.waitForCommit()
+
+    const markerPath = join(harness.stateDir, 'setup-complete.json')
+    expect(existsSync(markerPath)).toBe(true)
+    expect(statSync(markerPath).mode & 0o777).toBe(0o600)
+    const marker = JSON.parse(readFileSync(markerPath, 'utf8')) as Record<string, unknown>
+    expect(typeof marker.completedAt).toBe('string')
+    const state = (await harness.service.state()).body as { onboardingComplete: boolean }
+    expect(state.onboardingComplete).toBe(true)
+  })
+
+  it('treats a legacy token-configured install as onboarded', async () => {
+    const harness = makeHarness()
+    mkdirSync(join(harness.stateDir, 'secrets'), { recursive: true, mode: 0o700 })
+    writeFileSync(join(harness.stateDir, 'secrets', 'telegram-token'), '123:legacy', { mode: 0o600 })
+    const state = (await harness.service.state()).body as { accounts: { telegram: { configured: boolean } }; onboardingComplete: boolean }
+    expect(state.accounts.telegram.configured).toBe(true)
+    expect(state.onboardingComplete).toBe(true)
+    expect(existsSync(join(harness.stateDir, 'setup-complete.json'))).toBe(false)
+  })
+
+  it('does not mark onboarding complete when the config editor fails', async () => {
+    const failingEditor = {
+      calls: [] as Array<{ entry: unknown; next: Record<string, unknown> }>,
+      async edit(): Promise<void> {
+        throw new Error('editor rejected the change')
+      },
+    }
+    const harness = makeHarness({}, { editor: failingEditor })
+    const prepared = await harness.service.prepareConfig({ config: { policy: { mode: 'auto' } } })
+    expect(prepared.result.status).toBe(200)
+    harness.service.commitConfigSoon(prepared.patch!)
+    runScheduled(harness)
+    await harness.service.waitForCommit()
+    expect(existsSync(join(harness.stateDir, 'setup-complete.json'))).toBe(false)
+    expect(((await harness.service.state()).body as { onboardingComplete: boolean }).onboardingComplete).toBe(false)
+  })
+})

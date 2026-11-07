@@ -178,6 +178,10 @@ export function validateConfig(raw: unknown): { config?: RuntimeConfig; problem?
   if (nativePort !== undefined && (!Number.isInteger(nativePort) || nativePort < 0 || nativePort > 65_535)) {
     return { problem: { error: 'configuration.sources.native.port must be an integer 0..65535' } }
   }
+  const nativeEnabled = config.sources?.native?.enabled
+  if (nativeEnabled !== undefined && typeof nativeEnabled !== 'boolean') {
+    return { problem: { error: 'configuration.sources.native.enabled must be a boolean' } }
+  }
   const operatorTokenFile = config.sources?.github?.operatorTokenFile
   if (operatorTokenFile !== undefined && typeof operatorTokenFile === 'string' && operatorTokenFile.trim().length > 0) {
     if (!operatorTokenFile.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(operatorTokenFile)) {

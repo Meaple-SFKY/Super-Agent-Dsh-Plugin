@@ -66,6 +66,15 @@ export interface SetupAccountTelegram {
   tokenFile?: string
 }
 
+export interface SetupAccountNative {
+  /** mirror of `sources.native.enabled` (default true: MMAgent out of the box) */
+  enabled: boolean
+  /** `<stateDir>/native.json` exists (the app can connect right now) */
+  configured: boolean
+  /** advertised port: discovery port when present, otherwise the configured/preferred port */
+  port: number
+}
+
 export interface SetupAccountGithub {
   configured: boolean
   enabled: boolean
@@ -154,9 +163,11 @@ export interface SetupState {
   /** Optional login-item watchdog state (installed/running). */
   watchdog: SetupWatchdogState
   plugin: { status: string; detail: string | null }
-  accounts: { telegram: SetupAccountTelegram; github: SetupAccountGithub }
+  accounts: { telegram: SetupAccountTelegram; github: SetupAccountGithub; native: SetupAccountNative }
   permissions: SetupPermission[]
   restartRequired: boolean
+  /** True once the wizard persisted a config (or a pre-existing token setup). */
+  onboardingComplete: boolean
 }
 
 /** HTTP-ready result returned by every setup operation. */
@@ -289,6 +300,8 @@ const KV_TELEGRAM = 'superagent.setup.telegram'
 const KV_GITHUB = 'superagent.setup.github'
 const KV_OPERATOR = 'superagent.setup.githubOperator'
 const KV_RESTART = 'superagent.setup.restartPending'
+/** Written after the setup wizard successfully persists the config. */
+const SETUP_COMPLETE_FILE = 'setup-complete.json'
 const MAX_TOKEN_CHARS = 512
 const DEFAULT_TIMEOUT_MS = 15_000
 
@@ -469,6 +482,33 @@ export class SetupService implements SetupApi {
   }
 
   /** Clear the "restart pending" marker once a fresh runtime is up. */
+  /** Write the onboarding marker after a successful config persistence (0600, best effort). */
+  private async writeSetupComplete(): Promise<void> {
+    const path = join(this.deps.stateDir, SETUP_COMPLETE_FILE)
+    const body = JSON.stringify({ completedAt: new Date().toISOString(), version: 1 }, null, 2)
+    const temp = `${path}.tmp-${process.pid}`
+    try {
+      await mkdir(this.deps.stateDir, { recursive: true, mode: 0o700 })
+      await writeFile(temp, body, { mode: 0o600 })
+      await chmod(temp, 0o600)
+      await rename(temp, path)
+      await chmod(path, 0o600)
+    } catch (error) {
+      this.logger.warn('could not write the onboarding marker', { error: this.sanitize(errorMessage(error)) })
+    }
+  }
+
+  /** Marker file exists, or a pre-marker install already has working tokens. */
+  private async isOnboardingComplete(legacyConfigured: boolean): Promise<boolean> {
+    if (legacyConfigured) return true
+    try {
+      await stat(join(this.deps.stateDir, SETUP_COMPLETE_FILE))
+      return true
+    } catch {
+      return false
+    }
+  }
+
   markRestarted(): void {
     try {
       this.deps.kv.delete(KV_RESTART)
@@ -929,6 +969,8 @@ export class SetupService implements SetupApi {
     const sources = isRecord(config.sources) ? config.sources : {}
     const telegramConfig = isRecord(sources.telegram) ? sources.telegram : {}
     const githubConfig = isRecord(sources.github) ? sources.github : {}
+    const nativeConfig = isRecord(sources.native) ? sources.native : {}
+    const nativePort = await this.nativePort(nativeConfig)
     const telegramFile = this.configTokenFile(telegramConfig, 'telegram')
     const githubFile = this.configTokenFile(githubConfig, 'github')
     const telegramConfigured = await this.fileConfigured(telegramFile)
@@ -974,6 +1016,7 @@ export class SetupService implements SetupApi {
 
     const models = this.deps.models?.() ?? { router: null, worker: null, default: null }
     const watchdog = await this.probeWatchdog()
+    const onboardingComplete = await this.isOnboardingComplete(telegramConfigured || githubConfigured)
 
     const state: SetupState = {
       ok: true,
@@ -984,6 +1027,11 @@ export class SetupService implements SetupApi {
       watchdog,
       plugin: this.deps.plugin(),
       accounts: {
+        native: {
+          enabled: nativeConfig.enabled !== false,
+          configured: await this.fileConfigured(join(this.deps.stateDir, 'native.json')),
+          port: nativePort,
+        },
         telegram: {
           configured: telegramConfigured,
           enabled: telegramConfig.enabled !== false,
@@ -1011,6 +1059,7 @@ export class SetupService implements SetupApi {
       },
       permissions: this.permissions().body.permissions as SetupPermission[],
       restartRequired,
+      onboardingComplete,
     }
     return { status: 200, body: state as unknown as Record<string, unknown> }
   }
@@ -1140,6 +1189,19 @@ export class SetupService implements SetupApi {
   /** Default file for the personal PAT used to invite/accept repositories. */
   defaultOperatorTokenFile(): string {
     return join(this.deps.stateDir, 'secrets', 'github-operator-token')
+  }
+
+  /** Port the app should use: native.json when written, else the configured/preferred port. */
+  private async nativePort(nativeConfig: Record<string, unknown>): Promise<number> {
+    try {
+      const raw = JSON.parse(await readFile(join(this.deps.stateDir, 'native.json'), 'utf8')) as { port?: unknown }
+      if (typeof raw.port === 'number' && Number.isInteger(raw.port) && raw.port > 0) return raw.port
+    } catch {
+      // discovery not written yet
+    }
+    return typeof nativeConfig.port === 'number' && Number.isInteger(nativeConfig.port) && nativeConfig.port > 0
+      ? nativeConfig.port
+      : 47_821
   }
 
   /** Path of the configured (or default) operator PAT. */
@@ -1530,6 +1592,19 @@ export class SetupService implements SetupApi {
         }
       }
     }
+    const native = (patch.sources as Record<string, unknown> | undefined)?.native
+    if (native !== undefined) {
+      if (!isRecord(native)) throw new SetupError(400, 'invalid_config', 'sources.native must be a JSON object')
+      if (native.enabled !== undefined && typeof native.enabled !== 'boolean') {
+        throw new SetupError(400, 'invalid_config', 'sources.native.enabled must be a boolean')
+      }
+      if (
+        native.port !== undefined &&
+        (typeof native.port !== 'number' || !Number.isInteger(native.port) || native.port < 0 || native.port > 65_535)
+      ) {
+        throw new SetupError(400, 'invalid_config', 'sources.native.port must be an integer 0..65535')
+      }
+    }
     const mode = (patch.policy as Record<string, unknown> | undefined)?.mode
     if (mode !== undefined && mode !== 'off' && mode !== 'observe' && mode !== 'auto') {
       throw new SetupError(400, 'invalid_config', 'policy.mode must be off, observe or auto')
@@ -1619,6 +1694,8 @@ export class SetupService implements SetupApi {
       const base = this.deps.currentConfig() ?? {}
       return deepMerge(deepMerge(base, current ?? {}), patch as Record<string, unknown>)
     })
+    // The wizard completed: remember it so a restart does not show it again.
+    await this.writeSetupComplete()
     this.logger.info('setup configuration persisted; the plugin will restart')
   }
 

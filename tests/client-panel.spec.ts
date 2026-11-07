@@ -27,6 +27,7 @@ interface LoaderEntry {
 
 interface Wizard {
   step: number
+  entry: { telegram: boolean; native: boolean }
   telegram: {
     status: string
     token: string
@@ -94,7 +95,7 @@ interface Internals {
   stepLabels: (t: (key: string) => string) => string[]
   stepStates: (wizard: Wizard) => string[]
   canAdvance: (step: number, wizard: Wizard) => boolean
-  buildOperatorRequest: (wizard: Wizard) => { personalToken: string; repositories: string[]; botLogin: string } | undefined
+  buildOperatorRequest: (wizard: Wizard) => { token: string; repositories: string[]; botLogin: string } | undefined
   applyOperatorResult: (wizard: Wizard, result: unknown) => Wizard
   buildModelProviders: (payload: unknown) => Array<{ id: string; name: string; models: Array<{ value: string; label: string }> }>
   encodeModelSelection: (selection: unknown) => string
@@ -115,7 +116,7 @@ interface Internals {
     language: string
     router?: { provider: string; model: string; reasoningEffort?: string }
     sources: {
-      telegram: {
+      telegram?: {
         enabled: boolean
         tokenFile?: string
         allowedUserIds?: string[]
@@ -123,6 +124,7 @@ interface Internals {
         files?: boolean
         keyboards?: boolean
       }
+      native: { enabled: boolean }
       github: {
         enabled: boolean
         tokenFile?: string
@@ -434,7 +436,7 @@ describe('src/client/main.js', () => {
     expect(source).toContain('@media (max-width: 900px)')
     // Tab roots use the shared class; only the four wizard step bodies keep the
     // bare animation class (they are single cards inside the page rhythm).
-    expect((source.match(/className: 'sa-fade'/g) ?? []).length).toBe(4)
+    expect((source.match(/className: 'sa-fade'/g) ?? []).length).toBe(5)
     expect(source).not.toMatch(/style: \{ display: 'flex', flexDirection: 'column', gap: (12|16|20|24|28|32) \}/)
   })
 
@@ -585,6 +587,7 @@ describe('setup wizard state machine', () => {
             files: false,
             keyboards: true,
           },
+          native: { enabled: false },
           github: {
             configured: true,
             enabled: true,
@@ -614,6 +617,7 @@ describe('setup wizard state machine', () => {
     expect(internals.stepStates(configured)).toEqual(['done', 'done', 'done', 'done'])
     expect(configured.telegram.botUsername).toBe('demo_bot')
     expect(configured.telegram.richText).toBe(false)
+    expect(configured.entry).toEqual({ telegram: true, native: false })
     expect(configured.telegram.files).toBe(false)
     expect(configured.telegram.keyboards).toBe(true)
     expect(configured.github.status).toBe('validated')
@@ -638,6 +642,9 @@ describe('setup wizard state machine', () => {
     })
     expect(internals.isSetupConfigured(setupState({ accounts: { telegram: { configured: true }, github: {} } }))).toBe(true)
     expect(internals.isSetupConfigured(setupState())).toBe(false)
+    // Runtime's setup-complete marker makes a native-only install "configured".
+    expect(internals.isSetupConfigured(setupState({ onboardingComplete: true, accounts: { native: { enabled: true } } }))).toBe(true)
+    expect(internals.isSetupConfigured(setupState({ onboardingComplete: false }))).toBe(false)
     expect(internals.wizardFromSetup(setupState()).behavior.language).toBe('zh')
   })
 
@@ -776,6 +783,74 @@ describe('setup wizard state machine', () => {
 
     wizard.github = { ...wizard.github, acceptInvitations: 'nonsense' }
     expect(internals.buildConfig(wizard).sources.github.acceptInvitations).toBe('allowlist')
+  })
+
+  it('selects Telegram/MMAgent entries and gates step one accordingly', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    const wizard = baseWizard(module)
+    expect(wizard.entry).toEqual({ telegram: true, native: true })
+
+    wizard.entry = { telegram: false, native: true }
+    wizard.telegram = { ...wizard.telegram, status: 'idle' }
+    expect(internals.canAdvance(0, wizard)).toBe(true)
+
+    wizard.entry = { telegram: true, native: false }
+    expect(internals.canAdvance(0, wizard)).toBe(false)
+    wizard.telegram = { ...wizard.telegram, status: 'validated' }
+    expect(internals.canAdvance(0, wizard)).toBe(true)
+
+    wizard.entry = { telegram: true, native: true }
+    wizard.telegram = { ...wizard.telegram, status: 'idle' }
+    expect(internals.canAdvance(0, wizard)).toBe(false)
+    wizard.telegram = { ...wizard.telegram, status: 'validated' }
+    expect(internals.canAdvance(0, wizard)).toBe(true)
+
+    wizard.entry = { telegram: false, native: false }
+    expect(internals.canAdvance(0, wizard)).toBe(false)
+  })
+
+  it('treats onboardingComplete as completion for a native-only install', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    const nativeOnly = setupState({
+      onboardingComplete: true,
+      accounts: { telegram: { configured: false, enabled: false }, github: { configured: false }, native: { enabled: true } },
+    })
+    expect(internals.isSetupConfigured(nativeOnly)).toBe(true)
+    // Without the marker, a native-only install has no durable completion hint.
+    expect(internals.isSetupConfigured(setupState({ accounts: { native: { enabled: true } } }))).toBe(false)
+  })
+
+  it('writes telegram/native enablement from the selected entries', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+
+    const nativeOnly = validatedWizard(module)
+    nativeOnly.entry = { telegram: false, native: true }
+    const nativeConfig = internals.buildConfig(nativeOnly)
+    expect(nativeConfig.sources.native).toEqual({ enabled: true })
+    // Explicit disabled block so switching "both" -> "MMAgent only" really
+    // turns Telegram off; the old token stays on disk/config via merge.
+    expect(nativeConfig.sources.telegram).toEqual({ enabled: false })
+    expect(nativeConfig.sources.telegram?.tokenFile).toBeUndefined()
+    expect(JSON.stringify(nativeConfig)).not.toContain('telegram-token')
+
+    const both = internals.buildConfig(validatedWizard(module))
+    expect(both.sources.native).toEqual({ enabled: true })
+    expect(both.sources.telegram?.enabled).toBe(true)
+    expect(both.sources.telegram?.tokenFile).toBe('/tmp/superagent/secrets/telegram-token')
+
+    const telegramOnly = validatedWizard(module)
+    telegramOnly.entry = { telegram: true, native: false }
+    const telegramConfig = internals.buildConfig(telegramOnly)
+    expect(telegramConfig.sources.native).toEqual({ enabled: false })
+    expect(telegramConfig.sources.telegram?.enabled).toBe(true)
+
+    const skipped = validatedWizard(module)
+    skipped.entry = { telegram: false, native: true }
+    skipped.telegram = { ...skipped.telegram, skipped: true }
+    expect(internals.buildConfig(skipped).sources.telegram).toEqual({ enabled: false })
   })
 
   it('gates each step on its verification result', async () => {
@@ -1036,6 +1111,55 @@ describe('permissions localization', () => {
   })
 })
 
+describe('interaction entry overview', () => {
+  it('shows Telegram, GitHub and MMAgent entry status without a Telegram offline alarm', async () => {
+    const module = await loadModule()
+    const internals = internalsOf(module)
+    const react = renderableReact()
+    const t = (key: string) => key
+
+    react.reset()
+    const tree = JSON.stringify(
+      internals.views.OverviewView({
+        t,
+        state: {
+          data: {
+            plugin: { status: 'ready', detail: null, version: '0.1.1' },
+            paused: false,
+            sources: [{ id: 'native', health: 'ready', detail: null, at: '2026-01-01T00:00:00.000Z' }],
+            tickets: { active: [], attention: [] },
+            health: [],
+          },
+          error: '',
+          loading: false,
+          at: '2026-01-01T00:00:00.000Z',
+        },
+        setup: {
+          data: {
+            accounts: {
+              telegram: { configured: true, enabled: true, botUsername: 'demo_bot' },
+              github: { configured: true, enabled: true, login: 'agent' },
+              native: { enabled: true },
+            },
+          },
+        },
+        busy: '',
+        note: null,
+        onAction: () => undefined,
+        onRefresh: () => undefined,
+        onOpenSetup: () => undefined,
+        onOpenDetail: () => undefined,
+      }),
+    )
+    expect(tree).toContain('overview.entries')
+    expect(tree).toContain('entry.telegram')
+    expect(tree).toContain('entry.github')
+    expect(tree).toContain('entry.native')
+    expect(tree).toContain('entry.available')
+    expect(tree).not.toContain('overview.offlineTitle')
+  })
+})
+
 describe('ticket detail and eight stages', () => {
   it('maps runtime stages onto eight read-only labels', async () => {
     const module = await loadModule()
@@ -1111,6 +1235,12 @@ describe('ticket detail and eight stages', () => {
     expect(source).toContain('60000, onSetup')
     expect(source).toContain('SafeView')
     expect(source).toContain('overview.detail')
+    expect(source).toContain('function entryStep()')
+    expect(source).toContain("entryCard('telegram'")
+    expect(source).toContain("entryCard('native'")
+    expect(source).toContain('entry.skipTelegram')
+    expect(source).toContain('onboardingComplete')
+    expect(source).toContain('onboardingReady')
   })
 })
 
